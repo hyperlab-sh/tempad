@@ -111,7 +111,8 @@ const SEEDS: Seed[] = [
 
 const WIDE = ["w1", "w2", "w3", "null-stamp"];
 const SCHEMA_BEFORE_STEP = 22;
-const SCHEMA_WITH_STEP = 23;
+// A full open migrates to the head schema, past the step at 23.
+const SCHEMA_HEAD = 24;
 
 function seed(database: Database): void {
   database.exec(`
@@ -275,7 +276,7 @@ describe("commit dates with offsets of +-15:00 or more", () => {
   test("reopening rewrites nothing, does not write, and never scans again", () => {
     seededBeforeStep();
     const first = openDatabase(path);
-    expect(userVersion(first)).toBe(SCHEMA_WITH_STEP);
+    expect(userVersion(first)).toBe(SCHEMA_HEAD);
     const once = snapshot(first);
     const version = dataVersion(first);
 
@@ -312,7 +313,7 @@ describe("commit dates with offsets of +-15:00 or more", () => {
     restored.exec(`PRAGMA user_version = ${SCHEMA_BEFORE_STEP}`);
     restored.close();
     const repaired = openDatabase(path);
-    expect(userVersion(repaired)).toBe(SCHEMA_WITH_STEP);
+    expect(userVersion(repaired)).toBe(SCHEMA_HEAD);
     expect(
       repaired.query("SELECT authored_at FROM gh_commits WHERE sha = 'late'").get() as Row,
     ).toEqual({ authored_at: "2026-09-07T16:30:00.000Z" } as Row);
@@ -339,7 +340,7 @@ describe("commit dates with offsets of +-15:00 or more", () => {
 
     // The next open does the work, once, and bumps the version with it.
     const database = openDatabase(path);
-    expect(userVersion(database)).toBe(SCHEMA_WITH_STEP);
+    expect(userVersion(database)).toBe(SCHEMA_HEAD);
     expect(
       (database.query("SELECT authored_at FROM gh_commits WHERE sha = 'w1'").get() as Row)
         .authored_at,
@@ -354,7 +355,7 @@ describe("commit dates with offsets of +-15:00 or more", () => {
     old.close();
 
     const database = openDatabase(path);
-    expect(userVersion(database)).toBe(SCHEMA_WITH_STEP);
+    expect(userVersion(database)).toBe(SCHEMA_HEAD);
     for (const row of snapshot(database)) {
       const original = SEEDS.find((candidate) => candidate.sha === row.sha) as Seed;
       expect(row.authored_at).toBe(expectedText(original.authoredAt));

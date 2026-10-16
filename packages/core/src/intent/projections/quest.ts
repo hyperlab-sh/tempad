@@ -24,6 +24,7 @@ export const questProjection: Projection = {
       state_reason TEXT,
       merged_into TEXT,
       deviates_from_stint_id TEXT,
+      deviates_from_quest_id TEXT,
       branched_at TEXT,
       trigger TEXT,
       branch_kind TEXT,
@@ -109,19 +110,22 @@ export const questProjection: Projection = {
             event.subject,
           );
         return;
-      case "quest.branched":
+      case "quest.branched": {
+        const relation = branchRelation(database, event.subject, event.at, payload);
         database
           .query(
-            "UPDATE quests SET deviates_from_stint_id = ?, branched_at = ?, trigger = ?, branch_kind = ? WHERE id = ?",
+            "UPDATE quests SET deviates_from_stint_id = ?, deviates_from_quest_id = ?, branched_at = ?, trigger = ?, branch_kind = ? WHERE id = ?",
           )
           .run(
-            String(payload.deviates_from),
+            relation.stintId,
+            relation.questId,
             String(payload.at ?? event.at),
             String(payload.trigger),
             String(payload.kind),
-            event.subject,
+            relation.sideQuestId,
           );
         return;
+      }
       case "quest.returned":
         database
           .query("UPDATE quests SET returned_at = ? WHERE id = ?")
@@ -173,4 +177,59 @@ export function resolveQuest(database: Database, id: string): string {
     if (!row?.merged_into) return current;
     current = row.merged_into;
   }
+}
+
+interface BranchRelation {
+  /** The side quest: the row the relation is stored on. */
+  sideQuestId: string;
+  /** The stint it deviates from, when the event names one. */
+  stintId: string | null;
+  /** The quest it deviates from, when the event names a quest instead. */
+  questId: string | null;
+}
+
+/**
+ * Reads a `quest.branched` event in any of the three shapes the log holds.
+ * `subject` is always the side quest except in the legacy declare shape.
+ *
+ * - `deviates_from_quest: <quest>`: the side quest (`subject`) deviates from a
+ *   quest. `tempad quest declare --new ... --deviates-from|--origin` writes it,
+ *   as does `quest branch` given a quest id. The distinct field name is the
+ *   marker: no event written before it existed carries it.
+ * - `deviates_from: <stint>`: the side quest deviates from a stint (`quest
+ *   branch` with a stint id, the w5 classifier, `answer --origin current`).
+ * - Legacy declare: before the marker existed, `declareQuest` wrote the pair
+ *   inverted, `subject` = the quest left and `deviates_from` = the new side
+ *   quest's id, in the same call that created it, so the side quest's
+ *   `quest.created` carries the same `at`. That signature (`deviates_from` names
+ *   a quest created at this event's `at`) is read as "that quest deviates from
+ *   `subject`". A stint id never names a quest row, so a stint-shaped event is
+ *   never mistaken for it.
+ * - Any other `deviates_from` that names a quest (a hand-run `quest branch`
+ *   that passed a quest id before it accepted one) is read as `subject`
+ *   deviating from that quest, which is what the flag says.
+ *
+ * Only this projection's own table is consulted: `rebuildAll` replays every
+ * event into one projection before the next, so the stints table is not
+ * populated yet here.
+ */
+function branchRelation(
+  database: Database,
+  subject: string,
+  at: string,
+  payload: Record<string, unknown>,
+): BranchRelation {
+  if (typeof payload.deviates_from_quest === "string") {
+    return { sideQuestId: subject, stintId: null, questId: payload.deviates_from_quest };
+  }
+  const from = typeof payload.deviates_from === "string" ? payload.deviates_from : null;
+  if (from === null) return { sideQuestId: subject, stintId: null, questId: null };
+  const quest = database.query("SELECT created_at FROM quests WHERE id = ?").get(from) as {
+    created_at: string;
+  } | null;
+  if (quest === null) return { sideQuestId: subject, stintId: from, questId: null };
+  if (quest.created_at === at && from !== subject) {
+    return { sideQuestId: from, stintId: null, questId: subject };
+  }
+  return { sideQuestId: subject, stintId: null, questId: from };
 }

@@ -164,7 +164,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
 
   test("a fresh database has no mirror triggers: no stamps, no tombstones", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
-    expect(userVersion(database)).toBe(23);
+    expect(userVersion(database)).toBe(24);
     expect(isMirrorSyncEnabled(database)).toBe(false);
     expect(installedTriggers(database)).toEqual({});
 
@@ -194,7 +194,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
       old.close();
 
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(23);
+      expect(userVersion(database)).toBe(24);
       expect(isMirrorSyncEnabled(database)).toBe(false);
       expect(installedTriggers(database)).toEqual({});
       expect(syncState(database)).toEqual({ ...before, tombstones: [] });
@@ -247,7 +247,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
         old.close();
 
         const database = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(database)).toBe(23);
+        expect(userVersion(database)).toBe(24);
         expect(isMirrorSyncEnabled(database)).toBe(true);
         expect(installedTriggers(database)).toEqual(triggers);
         expect(syncState(database)).toEqual(before);
@@ -502,7 +502,7 @@ describe("offline report output", () => {
       old.close();
 
       const migrated = openDatabase(path, { hostSlug: "test-host" });
-      expect(userVersion(migrated)).toBe(23);
+      expect(userVersion(migrated)).toBe(24);
       expect(render(migrated)).toEqual(before);
       migrated.close();
 
@@ -765,7 +765,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       // The real chain still upgrades it afterwards.
       const upgraded = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(upgraded)).toBe(23);
+      expect(userVersion(upgraded)).toBe(24);
       expect(isMirrorSyncEnabled(upgraded)).toBe(true);
       expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
       upgraded.close();

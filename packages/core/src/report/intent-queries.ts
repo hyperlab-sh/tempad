@@ -57,7 +57,11 @@ export interface SideQuestRow {
   title: string;
   org: string | null;
   project: string | null;
+  /** Outcome of the stint the side quest deviates from, when it names one. */
   fromStintOutcome: string | null;
+  /** The quest it deviates from: the stint's quest, or the quest it names directly. */
+  fromQuestId: string | null;
+  fromQuestTitle: string | null;
   branchedAt: string;
   trigger: string | null;
   kind: string | null;
@@ -377,8 +381,12 @@ export function querySideQuests(database: Database, range: DateRange): SideQuest
     .query(
       `SELECT q.id as id, q.title as title, q.branched_at as branchedAt, q.trigger as trigger,
               q.branch_kind as kind, q.returned_at as returnedAt,
-              (SELECT a.outcome FROM stints a WHERE a.id = q.deviates_from_stint_id) as fromStintOutcome
+              (SELECT a.outcome FROM stints a WHERE a.id = q.deviates_from_stint_id) as fromStintOutcome,
+              parent.id as fromQuestId, parent.title as fromQuestTitle
        FROM quests q
+       LEFT JOIN quests parent ON parent.id = COALESCE(
+         q.deviates_from_quest_id,
+         (SELECT a.quest_id FROM stints a WHERE a.id = q.deviates_from_stint_id))
        WHERE ${conditions.join(" AND ")}
        ORDER BY q.branched_at ASC`,
     )
@@ -390,6 +398,8 @@ export function querySideQuests(database: Database, range: DateRange): SideQuest
     kind: string | null;
     returnedAt: string | null;
     fromStintOutcome: string | null;
+    fromQuestId: string | null;
+    fromQuestTitle: string | null;
   }[];
 
   return rows.map((row) => {
@@ -412,6 +422,8 @@ export function querySideQuests(database: Database, range: DateRange): SideQuest
       org: project?.org ?? null,
       project: project?.project ?? null,
       fromStintOutcome: row.fromStintOutcome,
+      fromQuestId: row.fromQuestId,
+      fromQuestTitle: row.fromQuestTitle,
       branchedAt: row.branchedAt,
       trigger: row.trigger,
       kind: row.kind,
@@ -485,10 +497,7 @@ export function queryQuests(database: Database, range: DateRange): QuestSummaryR
 
   const sideQuestMinutesByQuestId = new Map<string, number>();
   for (const sideQuest of querySideQuests(database, range)) {
-    const origin = database
-      .query("SELECT deviates_from_stint_id as originStintId FROM quests WHERE id = ?")
-      .get(sideQuest.id) as { originStintId: string | null } | null;
-    const parentId = stintRows.find((row) => row.id === origin?.originStintId)?.questId;
+    const parentId = sideQuest.fromQuestId;
     if (!parentId) continue;
     sideQuestMinutesByQuestId.set(
       parentId,

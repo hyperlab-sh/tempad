@@ -459,12 +459,10 @@ interface QuestDependents {
 
 /**
  * Everything live that hangs off a quest. Child quests are found three ways:
- * a side quest branched from one of its stints (`deviates_from_stint_id` of the
- * child names a stint of this quest; the declare path writes the pair inverted,
- * on the parent's row and naming the child's quest id, handled separately),
- * `serves`, and `advances`, which
- * has no column and lives only on the `quest.created` payload. Quests merged
- * into it count as children too.
+ * a side quest that deviates from it (`deviates_from_quest_id` of the child
+ * names this quest, or its `deviates_from_stint_id` names one of this quest's
+ * stints), `serves`, and `advances`, which has no column and lives only on the
+ * `quest.created` payload. Quests merged into it count as children too.
  */
 function questDependents(database: Database, id: string): QuestDependents {
   const stints = (
@@ -488,24 +486,10 @@ function questDependents(database: Database, id: string): QuestDependents {
       .query(
         `SELECT id FROM quests
           WHERE retracted_at IS NULL
-            AND (serves = ? OR merged_into = ?
+            AND (serves = ? OR merged_into = ? OR deviates_from_quest_id = ?
                  OR deviates_from_stint_id IN (SELECT id FROM stints WHERE quest_id = ?))`,
       )
-      .all(id, id, id) as { id: string }[],
-  );
-  // `quest declare --new Y --deviates-from X` stores the pair the wrong way
-  // round: X's row gets `deviates_from_stint_id = Y` (a quest id, not a stint
-  // id). So when a quest's own column names a live quest, that quest is its
-  // child, never its parent. The reverse lookup (`deviates_from_stint_id = id`)
-  // would make X a child of Y and `--force` on Y would retract X.
-  collect(
-    database
-      .query(
-        `SELECT child.id AS id FROM quests AS parent
-           JOIN quests AS child ON child.id = parent.deviates_from_stint_id
-          WHERE parent.id = ? AND child.retracted_at IS NULL`,
-      )
-      .all(id) as { id: string }[],
+      .all(id, id, id, id) as { id: string }[],
   );
   collect(
     database
@@ -865,6 +849,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         "deviates-from": { type: "string" },
         trigger: { type: "string" },
         kind: { type: "string", default: "unknown" },
+        at: { type: "string" },
       },
       strict: true,
       allowPositionals: true,
@@ -872,8 +857,12 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     const id = positionals[0];
     if (!id || !values["deviates-from"] || !values.trigger) {
       console.error(
-        'usage: tempad quest branch <id> --deviates-from <stint-id> --trigger "..." [--kind ...]',
+        'usage: tempad quest branch <id> --deviates-from <quest-id|stint-id> --trigger "..." [--kind ...] [--at <iso>]',
       );
+      return 2;
+    }
+    if (values.at !== undefined && Number.isNaN(Date.parse(values.at))) {
+      console.error(`--at must be an ISO date or timestamp, got ${values.at}`);
       return 2;
     }
     const resolved = resolveExistingQuest(context.database, id);
@@ -881,14 +870,32 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
+    // `--deviates-from` takes either the quest the side quest left or one of
+    // that quest's stints. A quest id is written as `deviates_from_quest`, the
+    // field the quests projection reads as a quest; anything else keeps the
+    // stint-shaped `deviates_from`.
+    const from = values["deviates-from"];
+    let fromQuest: string | null = null;
+    if (questExists(context.database, from)) {
+      fromQuest = resolveExistingQuest(context.database, from);
+      if (!fromQuest) {
+        console.error(unavailableQuestMessage(context.database, from));
+        return 1;
+      }
+      if (fromQuest === resolved) {
+        console.error(`quest ${resolved} cannot deviate from itself`);
+        return 1;
+      }
+    }
     applyIncremental(
       context.database,
       store.append({
         actor: "hero",
         kind: "quest.branched",
         subject: resolved,
+        at: values.at,
         payload: {
-          deviates_from: values["deviates-from"],
+          ...(fromQuest ? { deviates_from_quest: fromQuest } : { deviates_from: from }),
           trigger: values.trigger,
           kind: values.kind,
         },
@@ -1036,11 +1043,15 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       clauses.push("retracted_at IS NULL");
     }
     if (values.unconfirmed) clauses.push("confirmed = 0");
-    if (values.side) clauses.push("deviates_from_stint_id IS NOT NULL");
+    if (values.side) clauses.push("quests.branched_at IS NOT NULL");
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = source
       .query(
-        `SELECT id, title, state, confirmed, retracted_at FROM quests ${where} ORDER BY created_at`,
+        `SELECT id, title, state, confirmed, retracted_at, branched_at,
+                COALESCE(deviates_from_quest_id,
+                         (SELECT quest_id FROM stints WHERE stints.id = quests.deviates_from_stint_id))
+                  AS deviates_from
+           FROM quests ${where} ORDER BY created_at`,
       )
       .all() as {
       id: string;
@@ -1048,11 +1059,15 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       state: string;
       confirmed: number;
       retracted_at: string | null;
+      branched_at: string | null;
+      deviates_from: string | null;
     }[];
     for (const row of rows) {
       const unconfirmed = row.confirmed === 0 ? " [unconfirmed]" : "";
       const retracted = row.retracted_at !== null ? " (retracted)" : "";
-      context.stdout(`${row.id}  ${row.title}  (${row.state})${unconfirmed}${retracted}`);
+      const side =
+        row.branched_at === null ? "" : `  side quest of ${row.deviates_from ?? "unknown"}`;
+      context.stdout(`${row.id}  ${row.title}  (${row.state})${unconfirmed}${retracted}${side}`);
     }
     return 0;
   }
@@ -1647,6 +1662,14 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
       console.error("--kind must be waiting|blocker|curiosity|unknown");
       return 2;
     }
+    // With no earlier stint of the quest being left in this session, the side
+    // quest deviates from that quest itself rather than from no stint at all.
+    const fromStint = originStintId(context.database, trace.stint_id);
+    const leftQuest = (
+      context.database.query("SELECT quest_id FROM stints WHERE id = ?").get(trace.stint_id) as {
+        quest_id: string | null;
+      } | null
+    )?.quest_id;
     applyIncremental(
       context.database,
       store.append({
@@ -1654,7 +1677,9 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
         kind: "quest.branched",
         subject: questId,
         payload: {
-          deviates_from: originStintId(context.database, trace.stint_id),
+          ...(fromStint === null && leftQuest
+            ? { deviates_from_quest: leftQuest }
+            : { deviates_from: fromStint }),
           trigger: values.trigger ?? "unknown",
           kind,
         },

@@ -225,7 +225,7 @@ function render(database: Database, config: LoadedConfig<"tz">, options: ReportO
             ? `back ${localTime(sideQuest.returnedAt, timeZone)}`
             : "not returned";
           lines.push(
-            `- ${sideQuest.title}, branched ${branchTime} from "${sideQuest.fromStintOutcome ?? "unknown"}", trigger: "${sideQuest.trigger ?? "unknown"}", ${returned} (${minutesLabel(sideQuest.minutes)})`,
+            `- ${sideQuest.title}, branched ${branchTime} from "${sideQuest.fromStintOutcome ?? sideQuest.fromQuestTitle ?? "unknown"}", trigger: "${sideQuest.trigger ?? "unknown"}", ${returned} (${minutesLabel(sideQuest.minutes)})`,
           );
         }
       }
