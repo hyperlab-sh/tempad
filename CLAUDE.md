@@ -29,6 +29,7 @@ moon run :test        # same through moon
 - Full words in identifiers (`repository`, not `repo`, in code; `repos/` as a directory name is fine).
 - Environment variables that are required have no defaults; missing ones throw at startup.
 - Tests in `bun test`, colocated as `*.test.ts`. Fixtures under `packages/core/test/fixtures`.
+- Tests that exercise a sliding time window (the GitHub collector reconciles only commits authored after `lastSyncAt` minus 7 days) must build fixture dates relative to `Date.now()`; absolute dates turn into time bombs once the wall clock passes them.
 - Commits: `type(scope): summary`.
 
 ## CLI
