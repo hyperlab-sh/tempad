@@ -598,7 +598,7 @@ describe("races with another process", () => {
 
 describe("reconcile runs once per upgrade", () => {
   test(
-    "only the last pending migration reconciles, never an intermediate one, and an unchanged reopen not at all",
+    "reconcile runs once, at the end of the block from 22, and an unchanged reopen not at all",
     withDirectory((path) => {
       const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
       seedMirrors(old);
@@ -623,13 +623,219 @@ describe("reconcile runs once per upgrade", () => {
       try {
         const upgraded = openDatabase(path, { hostSlug: "host-a" });
         expect(userVersion(upgraded)).toBe(24);
-        // Inside 24's transaction, before its user_version bump.
-        expect(versionsAtReconcile).toEqual([23]);
+        // Once, after 24's SQL, in the transaction that began at 21: nothing
+        // from 22 on is committed until the reconcile has run.
+        expect(versionsAtReconcile).toEqual([21]);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
         upgraded.close();
 
         openDatabase(path, { hostSlug: "host-a" }).close();
         expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        reconcile.mockRestore();
+        load.mockRestore();
+      }
+    }),
+  );
+});
+
+/** What another connection sees while the upgrading one is inside a migration. */
+interface Observation {
+  userVersion: number;
+  triggers: Record<string, string>;
+  write: "blocked" | "committed";
+}
+
+/**
+ * Looks at `path` from a second connection, as a w5 hook or a collector with
+ * the database already open would: the committed version and triggers (a WAL
+ * reader never waits on the writer), then a mirror insert with a 50 ms busy
+ * timeout. A write that commits here, while the triggers are gone, is never
+ * stamped or tombstoned, so it would never push.
+ */
+function observeFromAnotherConnection(path: string): Observation {
+  const other = new Database(path);
+  other.exec("PRAGMA busy_timeout = 50");
+  try {
+    const observation: Observation = {
+      userVersion: userVersion(other),
+      triggers: installedTriggers(other),
+      write: "committed",
+    };
+    try {
+      other
+        .query(
+          "INSERT INTO gh_repos (full_name, org, is_personal, default_branch, project, meta) VALUES ('acme/during-upgrade', 'acme', 0, 'main', 'during', NULL)",
+        )
+        .run();
+    } catch (error) {
+      expect(String(error)).toMatch(/locked|busy/i);
+      observation.write = "blocked";
+    }
+    return observation;
+  } finally {
+    other.close();
+  }
+}
+
+/**
+ * A future migration whose SQL is read inside the upgrading transaction (the
+ * runner reads `sql` only once it holds the write lock), so its getter runs
+ * `observe` after 0022's statements and before the reconcile and commit.
+ */
+function observedMigration(version: number, sql: string, observe: () => void) {
+  return {
+    version,
+    get sql() {
+      observe();
+      return sql;
+    },
+  };
+}
+
+describe("migrations from 22 on apply as one transaction", () => {
+  test(
+    "no commit lands between 0022 and the reconcile: another connection sees v21 with every trigger, and cannot write",
+    withDirectory((path) => {
+      const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
+      seedMirrors(old);
+      old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
+      old.close();
+
+      const observations: Observation[] = [];
+      const chain = [
+        ...migrationFiles.loadMigrations(),
+        observedMigration(23, "UPDATE gh_commits SET subject = subject || ' (23)';", () =>
+          observations.push(observeFromAnotherConnection(path)),
+        ),
+      ];
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
+      try {
+        const upgraded = openDatabase(path, { hostSlug: "host-a" });
+        expect(observations.length).toBeGreaterThan(0);
+        for (const observation of observations) {
+          expect(observation).toEqual({
+            userVersion: 21,
+            triggers: expectedTriggers(),
+            write: "blocked",
+          });
+        }
+        expect(userVersion(upgraded)).toBe(23);
+        expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
+        expect(
+          upgraded.query("SELECT 1 FROM gh_repos WHERE full_name = 'acme/during-upgrade'").get(),
+        ).toBeNull();
+        // 0023's update ran with the triggers installed: stamped, tagged, dirty.
+        expect(
+          upgraded.query("SELECT subject, sync_host, sync_dirty FROM gh_commits").all(),
+        ).toEqual([{ subject: "fix it (23)", sync_host: "host-a", sync_dirty: 1 }]);
+        upgraded.close();
+      } finally {
+        load.mockRestore();
+      }
+    }),
+  );
+
+  test(
+    "a failing later migration rolls 0022 back too: the database stays at v21 with its triggers and no marker",
+    withDirectory((path) => {
+      const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
+      seedMirrors(old);
+      old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
+      const before = syncState(old);
+      old.close();
+
+      const chain = [
+        ...migrationFiles.loadMigrations(),
+        { version: 23, sql: "UPDATE no_such_table SET x = 1;" },
+      ];
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
+      try {
+        expect(() => openDatabase(path, { hostSlug: "host-a" })).toThrow(/no such table/);
+      } finally {
+        load.mockRestore();
+      }
+
+      const raw = rawConnection(path);
+      expect(userVersion(raw)).toBe(21);
+      expect(installedTriggers(raw)).toEqual(expectedTriggers());
+      expect(isMirrorSyncEnabled(raw)).toBe(false);
+      expect(syncState(raw)).toEqual(before);
+      raw.close();
+
+      // The real chain still upgrades it afterwards.
+      const upgraded = openDatabase(path, { hostSlug: "host-a" });
+      expect(userVersion(upgraded)).toBe(22);
+      expect(isMirrorSyncEnabled(upgraded)).toBe(true);
+      expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
+      upgraded.close();
+    }),
+  );
+
+  test(
+    "a chain that crosses 22 keeps the steps below 22 when the block from 22 fails",
+    withDirectory((path) => {
+      openDatabase(path, { upToVersion: 18 }).close();
+
+      const chain = [
+        ...migrationFiles.loadMigrations(),
+        { version: 23, sql: "UPDATE no_such_table SET x = 1;" },
+      ];
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
+      try {
+        expect(() => openDatabase(path)).toThrow(/no such table/);
+      } finally {
+        load.mockRestore();
+      }
+
+      const raw = rawConnection(path);
+      // 19, 20 and 21 committed one by one; 22 and 23 rolled back as one.
+      expect(userVersion(raw)).toBe(21);
+      expect(installedTriggers(raw)).toEqual(expectedTriggers());
+      raw.close();
+    }),
+  );
+
+  test(
+    "a second process that already applied part of the block: only the rest runs, reconciled once",
+    withDirectory((path) => {
+      const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
+      seedMirrors(old);
+      old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
+      old.close();
+
+      // 23 fails if it runs twice, so re-running what the other process
+      // already applied would throw (CREATE TABLE, not ADD COLUMN, which
+      // runMigration tolerates as a duplicate).
+      const chain = [
+        ...migrationFiles.loadMigrations(),
+        { version: 23, sql: "CREATE TABLE t23 (x);" },
+        { version: 24, sql: "CREATE TABLE t24 (x);" },
+      ];
+      // Another process got 22 and 23 in after this one read user_version 21.
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => {
+        load.mockImplementation(() => chain);
+        openDatabase(path, { hostSlug: "host-a", upToVersion: 23 }).close();
+        return chain;
+      });
+      const original = triggers.reconcileMirrorTriggers;
+      const reconcile = spyOn(triggers, "reconcileMirrorTriggers").mockImplementation((database) =>
+        original(database),
+      );
+      try {
+        const upgraded = openDatabase(path, { hostSlug: "host-a" });
+        expect(userVersion(upgraded)).toBe(24);
+        // Once at the end of the other process's 22..23, once here after 24.
+        expect(reconcile).toHaveBeenCalledTimes(2);
+        expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
+        expect(
+          upgraded
+            .query(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('t23', 't24') ORDER BY name",
+            )
+            .all(),
+        ).toEqual([{ name: "t23" }, { name: "t24" }]);
+        upgraded.close();
       } finally {
         reconcile.mockRestore();
         load.mockRestore();

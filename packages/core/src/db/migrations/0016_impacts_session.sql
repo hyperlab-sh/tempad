@@ -2,7 +2,7 @@
 -- `impacts` CHECK constraint. SQLite cannot ALTER a CHECK constraint, so this
 -- copies the table under a new name with the widened constraint, copies rows
 -- across, drops the old table and renames the new one into place -- all
--- inside this migration's own transaction (see applyMigration).
+-- inside this migration's own transaction (see applyMigrations).
 --
 -- `impacts` is a projection table, created lazily by ensureTables rather than
 -- by a migration, so a database where the intent layer was never used does
