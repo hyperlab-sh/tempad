@@ -6,7 +6,7 @@ Goal: installing tempad is one command and it just works.
 
 ```sh
 claude plugin install tempad@hyperlab   # skill + hooks
-bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.toml
+bunx @hyperlab.sh/tempad init                        # writes TEMPAD_HOME/.env and tempad.toml
 ```
 
 ## Decided (operator)
@@ -21,7 +21,7 @@ bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.tom
 
 - `env.ts` keeps one table of every variable (`ENV_VARS`): env name, `Config` key, description, `secret`, kind (`string | list | boolean`). `tempad init` and the error messages read this table; nothing else lists variable names.
 - `tempadHome()` resolves `TEMPAD_HOME` (still `~/.tempad` when unset; that is a location, not a credential).
-- `loadConfig(command, needs)` reads `process.env` then `TEMPAD_HOME/.env`, validates only the variables in `needs`, and returns `Pick<Config, K> & { home }`. A missing one throws `ConfigError` naming the command and every missing variable, e.g. `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx tempad init`. No defaults for required values.
+- `loadConfig(command, needs)` reads `process.env` then `TEMPAD_HOME/.env`, validates only the variables in `needs`, and returns `Pick<Config, K> & { home }`. A missing one throws `ConfigError` naming the command and every missing variable, e.g. `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx @hyperlab.sh/tempad init`. No defaults for required values.
 - Collectors and reports take the narrowest `Pick<Config, ...>` they read, so the type checker rejects a command that reads a field it did not ask for.
 - Needs per command (from the 2026-10-16 call-site audit):
 
@@ -37,7 +37,7 @@ bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.tom
 | `--help`, `init`, `skill install`, `w5 hook install/uninstall`                                       | none, and they open no database                                                     |
 
 - `ANTHROPIC_API_KEY` stays as it is: required only when `[w5].backend = "api"`.
-- **Configured** means `TEMPAD_HOME/.env` or `TEMPAD_HOME/tempad.db` exists (`isConfigured(home)`). A command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx tempad init` instead of silently creating `~/.tempad/tempad.db`. The two hook-called commands, `w5 enqueue` and `w5 context`, exit 0 with no output and create nothing.
+- **Configured** means `TEMPAD_HOME/.env` or `TEMPAD_HOME/tempad.db` exists (`isConfigured(home)`). A command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx @hyperlab.sh/tempad init` instead of silently creating `~/.tempad/tempad.db`. The two hook-called commands, `w5 enqueue` and `w5 context`, exit 0 with no output and create nothing.
 - `tempad --help` (and `-h`, `help`) prints every command, `w5`/`quiet`/`review` included, and exits 0. An unknown command still prints usage and exits 2.
 - The CLI ignores a `.env` in the current directory. Bun loads `./.env` by default, and hooks run with the user's project as cwd, so a project's `TZ=UTC` would otherwise override `TEMPAD_HOME/.env`. Only `process.env` set by the caller and `TEMPAD_HOME/.env` count.
 
@@ -51,18 +51,18 @@ bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.tom
   1. no or malformed session id;
   2. tempad not configured (neither `TEMPAD_HOME/.env` nor `TEMPAD_HOME/tempad.db`);
   3. `TEMPAD_HOOK_SOURCE=plugin` and a legacy `settings.json` hook is still installed (user `~/.claude/settings.json` or `$CLAUDE_PROJECT_DIR/.claude/settings.json` contains `"tempad": true`). Legacy hooks keep working until `tempad w5 hook uninstall`, and the session never gets two enqueues or two context lines;
-  4. no CLI resolvable. Resolution order: `TEMPAD_BIN` (legacy hooks set it), `tempad` on `PATH`, `bunx tempad` when `bun` is on `PATH`.
+  4. no CLI resolvable. Resolution order: `TEMPAD_BIN` (legacy hooks set it), `tempad` on `PATH`, `bunx @hyperlab.sh/tempad` when `bun` is on `PATH`.
 - `tempad w5 hook install` stays for checkout users and prints that the plugin is the recommended route. `tempad w5 hook uninstall` needs no configuration and is the migration step.
 
 ### Migration for existing users
 
 1. `claude plugin install tempad@hyperlab`. Legacy hooks still run; plugin hooks stand down (rule 3).
-2. `bunx tempad w5 hook uninstall` (or from the checkout). Plugin hooks take over on the next event.
+2. `bunx @hyperlab.sh/tempad w5 hook uninstall` (or from the checkout). Plugin hooks take over on the next event.
 3. Remove the old skill copy from `~/.claude/skills/tempad-quest` if it was hand-copied; the plugin provides it.
 
 ## 3. Skill
 
-`tempad-quest` resolves the CLI before its first call: `tempad` on `PATH`, else `bunx tempad`, else it tells the user the one install command and stops. A CLI that answers "not set up" sends the user to `bunx tempad init`.
+`tempad-quest` resolves the CLI before its first call: `tempad` on `PATH`, else `bunx @hyperlab.sh/tempad`, else it tells the user the one install command and stops. A CLI that answers "not set up" sends the user to `bunx @hyperlab.sh/tempad init`.
 
 ## 4. `tempad init`
 
@@ -75,9 +75,9 @@ bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.tom
 
 ## 5. npm package
 
-- Name `tempad` (unscoped; free on the registry 2026-10-16, as are `@hyperlab-sh/tempad` and `@tempad/core`). Unscoped gives the shortest one-command install, `bunx tempad`.
-- `packages/core/package.json`: `name: "tempad"`, not private, `bin.tempad = ./src/cli.ts` (bun shebang already there), `engines.bun`, `files` whitelist (`src` without tests, `src/db/migrations`, `skills`, `hooks`, README, LICENSE), `repository`/`homepage`/`license`.
-- Verified with `bun publish --dry-run` and a packed tarball run as `bunx tempad --help` from a clean directory.
+- Name `@hyperlab.sh/tempad`, published with `publishConfig.access: public`. The first choice was the unscoped `tempad` (free on the registry 2026-10-16), but npm rejected it as too similar to `temp`/`tempy`, so the package is scoped. The bin stays `tempad` and the plugin stays `tempad`. One-command install: `bunx @hyperlab.sh/tempad`.
+- `packages/core/package.json`: `name: "@hyperlab.sh/tempad"`, `publishConfig.access: "public"`, not private, `bin.tempad = ./src/cli.ts` (bun shebang already there), `engines.bun`, `files` whitelist (`src` without tests, `src/db/migrations`, `skills`, `hooks`, README, LICENSE), `repository`/`homepage`/`license`.
+- Verified with `bun publish --dry-run` and a packed tarball run as `bunx @hyperlab.sh/tempad --help` from a clean directory.
 
 ## Out of scope
 

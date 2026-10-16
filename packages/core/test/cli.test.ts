@@ -207,7 +207,7 @@ describe("tempad sync --full", () => {
 });
 
 const CLI_PATH = join(import.meta.dir, "..", "src", "cli.ts");
-const NOT_SET_UP = "tempad is not set up yet; run: bunx tempad init\n";
+const NOT_SET_UP = "tempad is not set up yet; run: bunx @hyperlab.sh/tempad init\n";
 
 interface CliResult {
   exitCode: number;
@@ -412,7 +412,7 @@ describe("cli per-command configuration", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe(
-        `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(sandbox.tempadHome, ".env")} or run: bunx tempad init\n`,
+        `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(sandbox.tempadHome, ".env")} or run: bunx @hyperlab.sh/tempad init\n`,
       );
     } finally {
       cleanup(sandbox);
@@ -516,7 +516,7 @@ describe("cli per-command configuration", () => {
       ]);
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toBe(
-        `tempad report daily needs TZ; set it in ${join(sandbox.tempadHome, ".env")} or run: bunx tempad init\n`,
+        `tempad report daily needs TZ; set it in ${join(sandbox.tempadHome, ".env")} or run: bunx @hyperlab.sh/tempad init\n`,
       );
     } finally {
       cleanup(sandbox);

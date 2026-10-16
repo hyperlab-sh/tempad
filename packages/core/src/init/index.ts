@@ -410,7 +410,7 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
       }
     })();
     outLine();
-    outLine("Next steps (use `bunx tempad` where tempad is not on your PATH):");
+    outLine("Next steps (use `bunx @hyperlab.sh/tempad` where tempad is not on your PATH):");
     outLine("  claude plugin install tempad@hyperlab");
     outLine('  tempad hero init "<your name>"');
     outLine("  tempad sync");

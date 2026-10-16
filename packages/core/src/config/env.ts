@@ -203,7 +203,7 @@ export function isConfigured(home: string): boolean {
   return existsSync(join(home, ".env")) || existsSync(join(home, "tempad.db"));
 }
 
-export const NOT_SET_UP_MESSAGE = "tempad is not set up yet; run: bunx tempad init";
+export const NOT_SET_UP_MESSAGE = "tempad is not set up yet; run: bunx @hyperlab.sh/tempad init";
 
 /**
  * Names a cwd `.env` could inject. Bun loads `./.env` into `process.env` before any
@@ -280,7 +280,7 @@ export function loadConfig<K extends ConfigKey>(
     .map((variable) => variable.name);
   if (missing.length > 0) {
     throw new ConfigError(
-      `${command} needs ${missing.join(", ")}; set ${missing.length === 1 ? "it" : "them"} in ${join(home, ".env")} or run: bunx tempad init`,
+      `${command} needs ${missing.join(", ")}; set ${missing.length === 1 ? "it" : "them"} in ${join(home, ".env")} or run: bunx @hyperlab.sh/tempad init`,
       command,
       missing,
     );
