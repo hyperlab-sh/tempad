@@ -24,6 +24,7 @@ import {
   intentLines,
   openHost,
   projectionSnapshot,
+  rebuiltFromScratch,
   restamp,
   sourceSnapshot,
   temporaryDirectory,
@@ -1409,6 +1410,148 @@ describe("intent edits made concurrently on two hosts", () => {
       await intent(host, ["quest", "done", first as string]);
     }
     await settle();
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
+  });
+
+  test("parties and clients whose slugs differ stay separate, however close", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostA, ["client", "add", "acme", "Acme"]);
+    await intent(hostB, ["hero", "init", "Saulo"]);
+    await intent(hostB, ["party", "add", "Acme", "Acme, capitalised"]);
+    await intent(hostB, ["party", "add", "acme-2", "Acme Two"]);
+    await intent(hostB, ["client", "add", "Acme", "Acme, capitalised"]);
+    await intent(hostB, ["client", "add", "acme-2", "Acme Two"]);
+    await settle();
+
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT slug FROM parties ORDER BY slug").all()).toEqual([
+        { slug: "Acme" },
+        { slug: "acme" },
+        { slug: "acme-2" },
+      ]);
+      expect(host.query("SELECT slug FROM clients ORDER BY slug").all()).toEqual([
+        { slug: "Acme" },
+        { slug: "acme" },
+        { slug: "acme-2" },
+      ]);
+      // The two heroes are one person and do merge; nothing else does.
+      expect(host.query("SELECT kind FROM identity_aliases WHERE kind <> 'hero'").all()).toEqual(
+        [],
+      );
+    }
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
+  });
+
+  test("identical slugs still merge, next to a near-miss that does not", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostB, ["hero", "init", "Saulo"]);
+    await intent(hostB, ["party", "add", "acme", "Acme"]);
+    await intent(hostB, ["party", "add", "Acme", "Acme, capitalised"]);
+    await settle();
+
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT slug FROM parties ORDER BY slug").all()).toEqual([
+        { slug: "Acme" },
+        { slug: "acme" },
+      ]);
+      expect(
+        host.query("SELECT COUNT(*) AS n FROM identity_aliases WHERE kind = 'party'").get(),
+      ).toEqual({
+        n: 1,
+      });
+    }
+  });
+
+  test("an older hero and party that reach a host late become canonical for its earlier work", async () => {
+    // Host B set up first but stays offline; host A sets up later, works, and
+    // syncs first, so A's own ids are canonical on A until B's older events arrive.
+    await intent(hostB, ["hero", "init", "Saulo on b"]);
+    await intent(hostB, ["party", "add", "acme", "Acme"]);
+    await intent(hostB, ["client", "add", "foo", "Foo"]);
+    const canonical = {
+      hero: (hostB.query("SELECT id FROM heroes").get() as { id: string }).id,
+      party: (hostB.query("SELECT id FROM parties").get() as { id: string }).id,
+      client: (hostB.query("SELECT id FROM clients").get() as { id: string }).id,
+    };
+    await Bun.sleep(5);
+    await intent(hostA, ["hero", "init", "Saulo on a"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostA, ["client", "add", "foo", "Foo"]);
+    await intent(hostA, ["saga", "add", "--owner", "party:acme", "A party saga"]);
+    await intent(hostA, ["quest", "add", "--owner", "hero", "A quest"]);
+    await sync(hostA, remote, "host-a");
+    const ownHero = (hostA.query("SELECT id FROM heroes").get() as { id: string }).id;
+    expect(ownHero).not.toBe(canonical.hero);
+
+    await sync(hostB, remote, "host-b");
+    await sync(hostA, remote, "host-a"); // B's older events arrive late on A
+
+    expect(hostA.query("SELECT id, name FROM heroes").all()).toEqual([
+      { id: canonical.hero, name: "Saulo on b" },
+    ]);
+    expect(hostA.query("SELECT id FROM parties").all()).toEqual([{ id: canonical.party }]);
+    expect(hostA.query("SELECT id FROM clients").all()).toEqual([{ id: canonical.client }]);
+    expect(
+      hostA.query("SELECT owner_kind, owner_id FROM sagas WHERE title = 'A party saga'").get(),
+    ).toEqual({ owner_kind: "party", owner_id: canonical.party });
+    expect(
+      hostA.query("SELECT owner_kind, owner_id FROM quests WHERE title = 'A quest'").get(),
+    ).toEqual({ owner_kind: "hero", owner_id: canonical.hero });
+    expect(hostA.query("SELECT hero_id, party_id, left_at FROM memberships").all()).toEqual([
+      { hero_id: canonical.hero, party_id: canonical.party, left_at: null },
+    ]);
+
+    // Host A's projections are what a host holding every event from the start has.
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(rebuiltFromScratch(hostA)));
+    await sync(hostB, remote, "host-b");
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
+  });
+
+  test("a leave on one host does not end the membership the other host still holds", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostB, ["hero", "init", "Saulo"]);
+    await intent(hostB, ["party", "add", "acme", "Acme"]);
+
+    // A leaves before it has heard of B's join.
+    await intent(hostA, ["party", "leave", "acme", "--reason", "rotated off"]);
+    await settle();
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT left_at FROM memberships").all()).toEqual([{ left_at: null }]);
+    }
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
+
+    // B, which now sees one open membership standing for its own join, leaves too.
+    await intent(hostB, ["party", "leave", "acme", "--reason", "me too"]);
+    await settle();
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT reason FROM memberships WHERE left_at IS NOT NULL").all()).toEqual([
+        { reason: "me too" },
+      ]);
+      expect(
+        host.query("SELECT COUNT(*) AS n FROM memberships WHERE left_at IS NULL").get(),
+      ).toEqual({ n: 0 });
+    }
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
+  });
+
+  test("leaving after both joins are known ends both of them", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostB, ["hero", "init", "Saulo"]);
+    await intent(hostB, ["party", "add", "acme", "Acme"]);
+    await settle();
+    expect(hostA.query("SELECT COUNT(*) AS n FROM memberships").get()).toEqual({ n: 1 });
+
+    await intent(hostA, ["party", "leave", "acme", "--reason", "done"]);
+    await settle();
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT reason FROM memberships WHERE left_at IS NOT NULL").all()).toEqual([
+        { reason: "done" },
+      ]);
+    }
     expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
   });
 });

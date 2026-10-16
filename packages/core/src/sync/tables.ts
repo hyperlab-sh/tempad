@@ -57,6 +57,7 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "heroes",
   "parties",
   "memberships",
+  "membership_leaves",
   "clients",
   "sagas",
   "quests",
