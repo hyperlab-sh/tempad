@@ -2,7 +2,13 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
-import { type Config, type ConfigKey, type HomeConfig, requireFields } from "../config/env";
+import {
+  anthropicApiKey,
+  type Config,
+  type ConfigKey,
+  type HomeConfig,
+  requireFields,
+} from "../config/env";
 import type { IntentConfig } from "../intent/config";
 import { activeDeclaredQuests } from "../intent/declarations";
 import { backfill } from "./backfill";
@@ -19,6 +25,8 @@ import {
   hasUnstableInstall,
   installHooks,
   PLUGIN_RECOMMENDATION_MESSAGE,
+  SettingsParseError,
+  settingsPathFor,
   UNSTABLE_INSTALL_MESSAGE,
   uninstallHooks,
 } from "./hooks";
@@ -88,7 +96,7 @@ function buildClassifier(
     });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = anthropicApiKey(config.home);
   if (!apiKey) {
     return {
       classify() {
@@ -444,21 +452,7 @@ export function planW5Command(
   };
 }
 
-/**
- * The settings.json `w5 hook install|uninstall` edits. User scope follows Claude Code's own
- * rule, `$CLAUDE_CONFIG_DIR/settings.json` when that is set and non-empty, else
- * `$HOME/.claude/settings.json`: the same two places the hook scripts' stand-down check
- * and `tempad init`'s legacy-hook detection read.
- */
-export function settingsPathFor(
-  scope: string,
-  environment: NodeJS.ProcessEnv = process.env,
-): string {
-  if (scope === "project") return join(process.cwd(), ".claude", "settings.json");
-  const configured = environment.CLAUDE_CONFIG_DIR;
-  if (configured) return join(configured, "settings.json");
-  return join(environment.HOME ?? "", ".claude", "settings.json");
-}
+export { settingsPathFor };
 
 function runHook(args: string[]): number {
   const [action, ...rest] = args;
@@ -471,15 +465,30 @@ function runHook(args: string[]): number {
     strict: true,
   });
   const scope = values.scope === "project" ? "project" : "user";
-  const settingsPath = settingsPathFor(scope);
 
+  try {
+    return applyHookAction(action, settingsPathFor(scope), values.bin);
+  } catch (error) {
+    if (error instanceof SettingsParseError) {
+      console.error(error.message);
+      return 1;
+    }
+    throw error;
+  }
+}
+
+function applyHookAction(
+  action: string | undefined,
+  settingsPath: string,
+  binary: string | undefined,
+): number {
   if (action === "install") {
-    if (hasUnstableInstall(values.bin)) {
+    if (hasUnstableInstall(binary)) {
       console.error(UNSTABLE_INSTALL_MESSAGE);
       return 1;
     }
-    if (values.bin) {
-      installHooks(settingsPath, values.bin);
+    if (binary) {
+      installHooks(settingsPath, binary);
     } else {
       installHooks(settingsPath);
     }
@@ -515,7 +524,7 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     ? Number.parseInt(values.days, 10)
     : context.intentConfig.w5.backfillDays;
 
-  if (context.intentConfig.w5.backend === "api" && !process.env.ANTHROPIC_API_KEY) {
+  if (context.intentConfig.w5.backend === "api" && !anthropicApiKey(context.config.home)) {
     context.stdout("ANTHROPIC_API_KEY not set");
     return 1;
   }
@@ -577,7 +586,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
     throw error;
   }
 
-  if (context.intentConfig.w5.backend === "api" && !process.env.ANTHROPIC_API_KEY) {
+  if (context.intentConfig.w5.backend === "api" && !anthropicApiKey(context.config.home)) {
     context.stdout("ANTHROPIC_API_KEY not set");
     return 1;
   }

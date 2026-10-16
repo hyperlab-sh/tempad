@@ -35,6 +35,7 @@ import {
   runW5HookCommand,
   type W5Context,
 } from "./w5/cli.ts";
+import { userClaudeDirectory } from "./w5/hooks.ts";
 
 const INTENT_COMMANDS = new Set([
   "hero",
@@ -259,9 +260,13 @@ const SKILL_SOURCE_PATH = join(import.meta.dir, "..", "skills", "tempad-quest", 
 function skillDestinationFor(scope: string): string {
   if (scope === "project")
     return join(process.cwd(), ".claude", "skills", "tempad-quest", "SKILL.md");
-  const home = process.env.HOME;
-  if (!home) throw new Error("HOME is not set; required for `tempad skill install --scope user`");
-  return join(home, ".claude", "skills", "tempad-quest", "SKILL.md");
+  try {
+    return join(userClaudeDirectory(), "skills", "tempad-quest", "SKILL.md");
+  } catch {
+    throw new Error(
+      "HOME is not set; required for `tempad skill install --scope user` (or set CLAUDE_CONFIG_DIR)",
+    );
+  }
 }
 
 export function runSkillCommand(args: string[]): number {
@@ -426,12 +431,28 @@ async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[])
   return 2;
 }
 
+const OTHER_COMMANDS = new Set([
+  "init",
+  "sync",
+  "report",
+  "w5",
+  "quiet",
+  "review",
+  "skill",
+  "project",
+]);
+
+/** `<command> --help` only applies to a command that exists; an unknown one is a usage error. */
+function isKnownCommand(command: string | undefined): boolean {
+  return command !== undefined && (INTENT_COMMANDS.has(command) || OTHER_COMMANDS.has(command));
+}
+
 async function dispatch(command: string | undefined, rest: string[]): Promise<number> {
   if (command === "--help" || command === "-h" || command === "help") {
     printHelp();
     return 0;
   }
-  if (rest[0] === "--help" || rest[0] === "-h") {
+  if ((rest[0] === "--help" || rest[0] === "-h") && isKnownCommand(command)) {
     printHelp();
     return 0;
   }

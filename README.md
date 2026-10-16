@@ -116,13 +116,13 @@ If you installed the hooks with `tempad w5 hook install` (they live in `~/.claud
 
 1. `claude plugin install tempad@hyperlab`. The legacy hooks keep running and the plugin's hooks stand down while they exist, so a session never gets two enqueues or two context lines.
 2. `bunx tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration, uses the same settings file the hooks were installed into (`$CLAUDE_CONFIG_DIR` when set, else `~/.claude`), prints which file it changed, and removes only the entries it marked. The plugin's hooks take over on the next event.
-3. Remove the old skill copy if you copied it by hand: `rm -r ~/.claude/skills/tempad-quest`. The plugin provides it.
+3. Remove the old skill copy if you copied it by hand: `rm -r ~/.claude/skills/tempad-quest` (under `$CLAUDE_CONFIG_DIR/skills/` if you set that variable). The plugin provides it.
 
 `tempad w5 hook install` still exists for checkout users; it prints that the plugin is the recommended route.
 
 ## Configuration
 
-`TEMPAD_HOME` (default `~/.tempad`) holds everything tempad writes: `.env`, `tempad.toml`, `tempad.db`, `repos/` (bare git mirrors), `reports/` and `logs/`. Nothing lives in your project.
+`TEMPAD_HOME` (default `~/.tempad`; a leading `~` is expanded, also by the hook scripts) holds everything tempad writes: `.env`, `tempad.toml`, `tempad.db`, `repos/` (bare git mirrors), `reports/` and `logs/`. Nothing lives in your project.
 
 Settings are read from the real environment first, then `TEMPAD_HOME/.env`. A `.env` in the current directory is ignored on purpose: hooks run with your project as the working directory, and a project's `TZ` must not override yours.
 
@@ -144,7 +144,7 @@ Each command checks only the variables it needs and fails naming the command and
 
 `sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx tempad init`.
 
-`ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`.
+`ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad init --force` keeps that line when it rewrites the file.
 
 ### `tempad.toml`
 

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  anthropicApiKey,
   ConfigError,
   type ConfigKey,
   ENV_VARS,
@@ -118,6 +119,17 @@ describe("tempadHome / isConfigured / readDotEnv", () => {
     expect(tempadHome()).toBe(join(homedir(), "somewhere-tempad"));
     process.env.TEMPAD_HOME = tempHome;
     expect(tempadHome()).toBe(tempHome);
+  });
+
+  test("expands a bare ~ and ~/..., but not ~name or a ~ in the middle", () => {
+    process.env.TEMPAD_HOME = "~";
+    expect(tempadHome()).toBe(homedir());
+    process.env.TEMPAD_HOME = "~/.tempad-work";
+    expect(tempadHome()).toBe(join(homedir(), ".tempad-work"));
+    process.env.TEMPAD_HOME = "~other/x";
+    expect(tempadHome()).toBe("~other/x");
+    process.env.TEMPAD_HOME = "/a/~/b";
+    expect(tempadHome()).toBe("/a/~/b");
   });
 
   test("defaults to ~/.tempad when TEMPAD_HOME is unset or empty", () => {
@@ -411,5 +423,38 @@ describe("ignoreWorkingDirectoryEnvFiles", () => {
     const environment: NodeJS.ProcessEnv = { TZ: "UTC" };
     ignoreWorkingDirectoryEnvFiles(cwd, environment, []);
     expect(environment.TZ).toBe("UTC");
+  });
+});
+
+describe("anthropicApiKey", () => {
+  let previousKey: string | undefined;
+  beforeEach(() => {
+    previousKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+  });
+  afterEach(() => {
+    if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousKey;
+  });
+
+  test("has no default: undefined with neither the environment nor TEMPAD_HOME/.env", () => {
+    expect(anthropicApiKey(tempHome)).toBeUndefined();
+    writeEnvFile("MONDAY_USER=1\n");
+    expect(anthropicApiKey(tempHome)).toBeUndefined();
+  });
+
+  test("falls back to TEMPAD_HOME/.env, unquoting the value", () => {
+    writeEnvFile('ANTHROPIC_API_KEY="sk-from-file"\n');
+    expect(anthropicApiKey(tempHome)).toBe("sk-from-file");
+  });
+
+  test("the real environment wins over the file; an empty value counts as unset", () => {
+    writeEnvFile("ANTHROPIC_API_KEY=sk-from-file\n");
+    process.env.ANTHROPIC_API_KEY = "sk-from-env";
+    expect(anthropicApiKey(tempHome)).toBe("sk-from-env");
+    process.env.ANTHROPIC_API_KEY = "";
+    expect(anthropicApiKey(tempHome)).toBe("sk-from-file");
+    writeEnvFile("ANTHROPIC_API_KEY=\n");
+    expect(anthropicApiKey(tempHome)).toBeUndefined();
   });
 });

@@ -5,7 +5,14 @@
 # with nothing on stdout or stderr, and diagnostics go to TEMPAD_HOME/logs/w5.log
 # only once the home exists (an unconfigured machine gets no ~/.tempad).
 
-TEMPAD_HOME_DIR="${TEMPAD_HOME:-$HOME/.tempad}"
+# TEMPAD_HOME with a leading `~` or `~/` expanded, exactly as tempadHome() does in
+# src/config/env.ts (Claude settings `env` values reach us unexpanded).
+case "${TEMPAD_HOME:-}" in
+  "") TEMPAD_HOME_DIR="$HOME/.tempad" ;;
+  "~") TEMPAD_HOME_DIR="$HOME" ;;
+  "~/"*) TEMPAD_HOME_DIR="$HOME/${TEMPAD_HOME#"~/"}" ;;
+  *) TEMPAD_HOME_DIR="$TEMPAD_HOME" ;;
+esac
 W5_LOG_FILE="$TEMPAD_HOME_DIR/logs/w5.log"
 
 # Extract the session id from the hook payload on stdin; sets $session_id.
@@ -28,13 +35,20 @@ w5_log() {
 }
 
 # A legacy settings.json hook (marked "tempad": true by `tempad w5 hook install`)
-# is still installed in the user settings (~/.claude, or CLAUDE_CONFIG_DIR when
-# Claude Code runs with one) or the project settings.
+# is still installed in the user settings or the project settings. User settings
+# are $CLAUDE_CONFIG_DIR/settings.json when that is non-empty, else
+# $HOME/.claude/settings.json, never both (Claude Code reads only one, and
+# `tempad w5 hook uninstall` edits only that one: userClaudeDirectory() in
+# src/w5/hooks.ts).
 w5_legacy_hook_installed() {
-  local settings
+  local settings user_settings
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    user_settings="$CLAUDE_CONFIG_DIR/settings.json"
+  else
+    user_settings="$HOME/.claude/settings.json"
+  fi
   for settings in \
-    "$HOME/.claude/settings.json" \
-    "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/settings.json}" \
+    "$user_settings" \
     "${CLAUDE_PROJECT_DIR:+$CLAUDE_PROJECT_DIR/.claude/settings.json}"; do
     [ -n "$settings" ] && [ -f "$settings" ] || continue
     if grep -Eq '"tempad"[[:space:]]*:[[:space:]]*true' "$settings" 2>/dev/null; then

@@ -20,6 +20,43 @@ interface HooksFragment {
   UserPromptSubmit: HookMatcher[];
 }
 
+/**
+ * The directory holding Claude Code's user-level files (`settings.json`, `skills/`):
+ * `$CLAUDE_CONFIG_DIR` when set and non-empty, else `$HOME/.claude`. Never both. This is the
+ * single rule behind `w5 hook install|uninstall`, `skill install`, `tempad init`'s legacy-hook
+ * detection and (in shell) `hooks/w5-common.sh`.
+ */
+export function userClaudeDirectory(environment: NodeJS.ProcessEnv = process.env): string {
+  const configured = environment.CLAUDE_CONFIG_DIR;
+  if (configured) return configured;
+  const home = environment.HOME;
+  if (!home) throw new Error("HOME is not set and CLAUDE_CONFIG_DIR is empty");
+  return join(home, ".claude");
+}
+
+/**
+ * The settings.json `w5 hook install|uninstall` edits. User scope is
+ * `userClaudeDirectory()/settings.json`; project scope is `./.claude/settings.json`.
+ */
+export function settingsPathFor(
+  scope: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
+  if (scope === "project") return join(process.cwd(), ".claude", "settings.json");
+  return join(userClaudeDirectory(environment), "settings.json");
+}
+
+/** settings.json exists but is not a JSON object; thrown by install and uninstall. */
+export class SettingsParseError extends Error {
+  constructor(
+    readonly settingsPath: string,
+    detail: string,
+  ) {
+    super(`${settingsPath} is not valid JSON (${detail}); fix or remove it, then run this again`);
+    this.name = "SettingsParseError";
+  }
+}
+
 interface SettingsFile {
   hooks?: Partial<Record<string, HookMatcher[]>>;
   [key: string]: unknown;
@@ -117,7 +154,19 @@ export function renderHookSettings(binPath: string = CLI_PATH): HooksFragment {
 
 function readSettings(settingsPath: string): SettingsFile {
   if (!existsSync(settingsPath)) return {};
-  return JSON.parse(readFileSync(settingsPath, "utf8")) as SettingsFile;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
+  } catch (error) {
+    throw new SettingsParseError(
+      settingsPath,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new SettingsParseError(settingsPath, "top level is not an object");
+  }
+  return parsed as SettingsFile;
 }
 
 function writeSettings(settingsPath: string, settings: SettingsFile): void {
