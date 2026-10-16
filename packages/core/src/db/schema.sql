@@ -310,3 +310,6 @@ CREATE TABLE sync_tombstones (
   sync_dirty INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (tbl, pk)
 );
+
+-- Migration 0021_normalize_commit_dates.sql rewrote legacy offset-form
+-- gh_commits.authored_at / committed_at to UTC ('...Z'). No schema change.
