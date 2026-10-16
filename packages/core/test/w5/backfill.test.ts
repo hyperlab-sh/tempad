@@ -1086,3 +1086,243 @@ describe("planBackfillWindows", () => {
     expect(planBackfillWindows(database, sessions, { windowMinutes: 30 })[0]?.covered).toBe(true);
   });
 });
+
+// `backfill()` runs exactly the plan `planBackfillWindows` returns, so these pin the plan's rules
+// through the real run: each boundary below is one a mutant of the planning code would cross.
+describe("backfill runs the plan", () => {
+  const NOW = "2026-09-05T00:00:00.000Z";
+  const T = (time: string) => `2026-09-04T${time}Z`;
+
+  function insertTrace(
+    database: ReturnType<typeof openDatabase>,
+    input: { startedAt: string; endedAt: string; retractedAt?: string },
+  ) {
+    database
+      .query(
+        `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at, retracted_at)
+         VALUES (?, 's', 't', 'p', 'claude', ?, ?, 'w', 'w', 'w', 'w', 'w', 0.9, 'assistant', 'only', '2026-09-04T11:00:00.000Z', ?)`,
+      )
+      .run(
+        `T-${input.startedAt}-${input.endedAt}`,
+        input.startedAt,
+        input.endedAt,
+        input.retractedAt ?? null,
+      );
+  }
+
+  async function run(database: ReturnType<typeof openDatabase>, extra: { force?: boolean } = {}) {
+    const classifier = new FakeClassifier();
+    const result = await backfill(database, makeConfig(), config, classifier, {
+      days: 15,
+      now: NOW,
+      log: () => {},
+      ...extra,
+    });
+    return { result, classifier };
+  }
+
+  const plan = (
+    database: ReturnType<typeof openDatabase>,
+    windowMinutes = config.throttleMinutes * 3,
+  ) =>
+    planBackfillWindows(
+      database,
+      selectBackfillSessions(database, { cutoff: "2026-09-01T00:00:00.000Z" }),
+      { windowMinutes },
+    );
+
+  function fresh(messageTimestamps: string[]) {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    seedSession(database, { id: "only", endedAt: T("13:00:00.000"), messageTimestamps });
+    return database;
+  }
+
+  describe("window length is three throttle intervals", () => {
+    test.each([
+      {
+        name: "25 minutes apart is one window",
+        times: [T("10:00:00.000"), T("10:25:00.000")],
+        windows: 1,
+      },
+      {
+        name: "exactly 30 minutes apart is still one window",
+        times: [T("10:00:00.000"), T("10:30:00.000")],
+        windows: 1,
+      },
+      {
+        name: "30 minutes and a millisecond apart is two",
+        times: [T("10:00:00.000"), T("10:30:00.001")],
+        windows: 2,
+      },
+      {
+        name: "35 minutes apart is two windows",
+        times: [T("10:00:00.000"), T("10:35:00.000")],
+        windows: 2,
+      },
+    ])("$name", async ({ times, windows }) => {
+      const database = fresh([...times]);
+      expect(plan(database)).toHaveLength(windows);
+      const { result, classifier } = await run(database);
+      expect(result.windowsClassified).toBe(windows);
+      expect(classifier.calls).toBe(windows);
+    });
+
+    test("the window is measured from the window's first message, not the previous one", async () => {
+      // 10:00, 10:20, 10:40: each hop is 20 minutes but the third is 40 from the start.
+      const database = fresh([T("10:00:00.000"), T("10:20:00.000"), T("10:40:00.000")]);
+      const { result } = await run(database);
+      expect(result.windowsClassified).toBe(2);
+    });
+  });
+
+  describe("only messages with text make a window", () => {
+    test("a message without text neither extends a window nor starts one", async () => {
+      const database = fresh([T("10:00:00.000"), T("10:20:00.000")]);
+      const insertEmpty = (ts: string, id: string) =>
+        database
+          .query(
+            "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES (?, 'only', ?, 'user', 0, NULL)",
+          )
+          .run(id, ts);
+      insertEmpty(T("09:30:00.000"), "before"); // would pull the window start to 09:30
+      insertEmpty(T("10:50:00.000"), "after"); // would open a second window
+      const planned = plan(database);
+      expect(planned.map((window) => [window.startedAt, window.endedAt])).toEqual([
+        [T("10:00:00.000"), T("10:20:00.000")],
+      ]);
+      const { result, classifier } = await run(database);
+      expect(result.windowsClassified).toBe(1);
+      expect(classifier.calls).toBe(1);
+      expect(database.query("SELECT started_at AS s, ended_at AS e FROM w5_windows").all()).toEqual(
+        [{ s: T("10:00:00.000"), e: T("10:20:00.000") }],
+      );
+    });
+
+    test("the classifier is handed the planned messages, text and role included", async () => {
+      const database = fresh([T("10:00:00.000"), T("10:20:00.000")]);
+      const seen: ClassifierWindow[] = [];
+      const recording = new FakeClassifier();
+      const original = recording.classify.bind(recording);
+      recording.classify = async (window) => {
+        seen.push(window);
+        return original(window);
+      };
+      await backfill(database, makeConfig(), config, recording, {
+        days: 15,
+        now: NOW,
+        log: () => {},
+      });
+      expect(seen[0]?.messages).toEqual(plan(database)[0]?.messages);
+      expect(seen[0]?.messages.map((message) => [message.ts, message.role, message.text])).toEqual([
+        [T("10:00:00.000"), "user", "work"],
+        [T("10:20:00.000"), "user", "work"],
+      ]);
+    });
+  });
+
+  describe("coverage", () => {
+    const startedAt = T("10:00:00.000");
+    const endedAt = T("10:20:00.000");
+    const classifiedEvent = (
+      database: ReturnType<typeof openDatabase>,
+      start: string,
+      end: string,
+    ) =>
+      applyIncremental(
+        database,
+        new EventStore(database).append({
+          actor: "backfill",
+          kind: "window.classified",
+          subject: "only",
+          sessionId: "only",
+          payload: { session: "only", startedAt: start, endedAt: end },
+          at: NOW,
+        }),
+      );
+
+    test.each([
+      {
+        name: "a w5_windows row for exactly these bounds",
+        covered: true,
+        setup: (db: ReturnType<typeof openDatabase>) => classifiedEvent(db, startedAt, endedAt),
+      },
+      {
+        name: "a w5_windows row starting a millisecond off",
+        covered: false,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          classifiedEvent(db, T("10:00:00.001"), endedAt),
+      },
+      {
+        name: "a w5_windows row ending a millisecond off",
+        covered: false,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          classifiedEvent(db, startedAt, T("10:19:59.999")),
+      },
+      {
+        name: "a trace exactly the window's size",
+        covered: true,
+        setup: (db: ReturnType<typeof openDatabase>) => insertTrace(db, { startedAt, endedAt }),
+      },
+      {
+        name: "a trace strictly inside the window",
+        covered: true,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          insertTrace(db, { startedAt: T("10:05:00.000"), endedAt: T("10:15:00.000") }),
+      },
+      {
+        name: "a trace starting a millisecond before the window",
+        covered: false,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          insertTrace(db, { startedAt: T("09:59:59.999"), endedAt }),
+      },
+      {
+        name: "a trace ending a millisecond after the window",
+        covered: false,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          insertTrace(db, { startedAt, endedAt: T("10:20:00.001") }),
+      },
+      {
+        name: "a retracted trace exactly the window's size",
+        covered: false,
+        setup: (db: ReturnType<typeof openDatabase>) =>
+          insertTrace(db, { startedAt, endedAt, retractedAt: T("12:00:00.000") }),
+      },
+      { name: "no trace and no w5_windows row", covered: false, setup: () => {} },
+    ])("$name", async ({ covered, setup }) => {
+      const database = fresh([startedAt, endedAt]);
+      setup(database);
+      expect(plan(database).map((window) => window.covered)).toEqual([covered]);
+      const { result, classifier } = await run(database);
+      expect(result.windowsSkipped).toBe(covered ? 1 : 0);
+      expect(result.windowsClassified).toBe(covered ? 0 : 1);
+      expect(result.sessionsSkipped).toBe(covered ? 1 : 0);
+      expect(classifier.calls).toBe(covered ? 0 : 1);
+    });
+
+    test("--force classifies a covered window, in the plan and in the run", async () => {
+      const database = fresh([startedAt, endedAt]);
+      classifiedEvent(database, startedAt, endedAt);
+      const sessions = selectBackfillSessions(database, { cutoff: "2026-09-01T00:00:00.000Z" });
+      expect(
+        planBackfillWindows(database, sessions, { windowMinutes: 30, force: true }).map(
+          (window) => window.covered,
+        ),
+      ).toEqual([false]);
+      const { result } = await run(database, { force: true });
+      expect(result.windowsClassified).toBe(1);
+      expect(result.windowsSkipped).toBe(0);
+    });
+
+    test("a run classifies the uncovered windows only, and a second run has nothing left to plan", async () => {
+      const database = fresh([startedAt, endedAt, T("12:00:00.000")]);
+      classifiedEvent(database, startedAt, endedAt);
+      expect(plan(database).map((window) => window.covered)).toEqual([true, false]);
+      expect((await run(database)).result.windowsClassified).toBe(1);
+      expect(plan(database).map((window) => window.covered)).toEqual([true, true]);
+      const second = await run(database);
+      expect(second.result.windowsClassified).toBe(0);
+      expect(second.result.windowsSkipped).toBe(2);
+    });
+  });
+});

@@ -4,7 +4,7 @@ import type { Projection } from "./index";
  * A `window.classified` event records that a backfill window (a chunk of a
  * Claude session's messages, see `chunkByWindow` in `src/w5/backfill.ts`)
  * was successfully classified and applied -- independent of how many trace
- * segments the classifier split it into. `isWindowCovered` checks this
+ * segments the classifier split it into. `planBackfillWindows` checks this
  * table instead of `traces` so a window that produced 2+ segments (and
  * therefore 2+ traces, none of which individually span the window's exact
  * bounds) is still correctly recognized as already covered on the next run.

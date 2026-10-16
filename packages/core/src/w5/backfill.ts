@@ -88,40 +88,6 @@ export function selectBackfillSessions(
     .all(...parameters) as SessionRow[];
 }
 
-/**
- * Primary path: an explicit `w5_windows` row for this exact window (see
- * `src/intent/projections/window.ts`). Legacy fallback, for windows
- * classified before `window.classified` existed: a live (non-retracted)
- * trace nested inside the window's bounds. A database with traces already
- * classified under the old scheme has no `w5_windows` rows at all, so
- * without this fallback every one of those windows would look uncovered
- * and get reclassified (and re-duplicated) the first time backfill runs
- * post-upgrade.
- */
-export function isWindowCovered(
-  database: Database,
-  sessionId: string,
-  windowStartedAt: string,
-  windowEndedAt: string,
-): boolean {
-  const windowRow = database
-    .query(
-      "SELECT rowid FROM w5_windows WHERE session_id = ? AND started_at = ? AND ended_at = ? LIMIT 1",
-    )
-    .get(sessionId, windowStartedAt, windowEndedAt) as { rowid: number } | null;
-  if (windowRow !== null) return true;
-
-  const traceRow = database
-    .query(
-      `SELECT id FROM traces
-       WHERE session_id = ? AND retracted_at IS NULL
-         AND started_at >= ? AND ended_at <= ?
-       LIMIT 1`,
-    )
-    .get(sessionId, windowStartedAt, windowEndedAt) as { id: string } | null;
-  return traceRow !== null;
-}
-
 export function chunkByWindow<T extends { ts: string }>(
   messages: T[],
   windowMinutes: number,
@@ -145,82 +111,105 @@ export function chunkByWindow<T extends { ts: string }>(
   return chunks;
 }
 
+/** How far apart a window's first and last message may be: three throttle intervals. */
+export function backfillWindowMinutes(intentConfig: W5Config): number {
+  return intentConfig.throttleMinutes * 3;
+}
+
 export interface PlannedWindow {
   sessionId: string;
+  /** Position within the session's own chunk list, as the failure log reports it. */
+  index: number;
   startedAt: string;
   endedAt: string;
-  /** What `isWindowCovered` answers: a re-run would skip this window. */
+  /** The window's messages, oldest first: what the classifier is asked about. */
+  messages: { ts: string; role: string; text: string }[];
+  /** Last message of this session's previous window; the overlap tail's cut. */
+  previousWindowEnd: string | null;
+  /**
+   * A re-run would skip this window: an exact `w5_windows` row (see
+   * `src/intent/projections/window.ts`), or, for windows classified before
+   * `window.classified` existed, a live (non-retracted) trace nested inside the
+   * window's bounds. Without that fallback every such window would look
+   * uncovered and be reclassified (and re-duplicated) the first time backfill
+   * runs post-upgrade. Always false under `force`.
+   */
   covered: boolean;
 }
 
 /**
- * The windows a backfill over `sessions` would visit and whether each is
- * already covered, without classifying anything: the same message list
- * `buildWindow` reads for a whole session (newest 5000 with text, oldest
- * first, below `to` when given), the same `chunkByWindow`, the same coverage
- * rule as `isWindowCovered` (answered from two table reads instead of a
- * `traces` scan per window). Read-only; `tempad scry` uses it to say how much a
- * backfill would do. `test/w5/backfill.test.ts` pins that it agrees with a
- * real run, so a change to either side fails there.
+ * The windows a backfill over `sessions` visits, and whether each is already
+ * covered, without classifying anything. This is the one place that decides
+ * both: `backfill()` runs exactly this plan (its pending windows are the
+ * uncovered ones, its `windowsSkipped` the covered ones) and `tempad scry`
+ * reports it, so the recommendation cannot drift from the run.
+ *
+ * Messages are the newest 5000 with text, oldest first, below `to` when given
+ * (the same list `buildWindow` reads for a whole session), split by
+ * `chunkByWindow`. Coverage reads `w5_windows` and the live `traces` once and
+ * answers from memory; the per-window query it replaced scanned `traces` (no
+ * `session_id` index) once per window. The projection tables are created lazily
+ * by the first event that needs them, so a database that never classified
+ * anything has neither: every window is then uncovered. Read-only.
  */
 export function planBackfillWindows(
   database: Database,
   sessions: readonly SessionRow[],
-  options: { windowMinutes: number; to?: string },
+  options: { windowMinutes: number; to?: string; force?: boolean },
 ): PlannedWindow[] {
-  // `isWindowCovered` per chunk scans `traces` (no `session_id` index) once per
-  // window; for a plan over hundreds of sessions, read both tables once and
-  // answer the same two questions from memory.
-  // The projection tables are created lazily by the first event that needs
-  // them, so a database that never classified anything has neither: every
-  // window is then uncovered, as it is for `isWindowCovered`'s caller after
-  // `ensureTables`.
   const hasTable = (name: string) =>
     database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
     null;
   const wanted = new Set(sessions.map((session) => session.id));
   const classified = new Set<string>();
-  for (const row of (hasTable("w5_windows")
-    ? database.query("SELECT session_id, started_at, ended_at FROM w5_windows").all()
-    : []) as {
-    session_id: string;
-    started_at: string;
-    ended_at: string;
-  }[]) {
-    if (wanted.has(row.session_id))
-      classified.add(`${row.session_id}\u0000${row.started_at}\u0000${row.ended_at}`);
-  }
   const traces = new Map<string, { started_at: string; ended_at: string }[]>();
-  for (const row of (hasTable("traces")
-    ? database
-        .query(
-          "SELECT session_id, started_at, ended_at FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL",
-        )
-        .all()
-    : []) as { session_id: string; started_at: string; ended_at: string }[]) {
-    if (!wanted.has(row.session_id)) continue;
-    const list = traces.get(row.session_id);
-    if (list) list.push(row);
-    else traces.set(row.session_id, [row]);
+  if (!options.force) {
+    for (const row of (hasTable("w5_windows")
+      ? database.query("SELECT session_id, started_at, ended_at FROM w5_windows").all()
+      : []) as {
+      session_id: string;
+      started_at: string;
+      ended_at: string;
+    }[]) {
+      if (wanted.has(row.session_id))
+        classified.add(`${row.session_id}\u0000${row.started_at}\u0000${row.ended_at}`);
+    }
+    for (const row of (hasTable("traces")
+      ? database
+          .query(
+            "SELECT session_id, started_at, ended_at FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL",
+          )
+          .all()
+      : []) as { session_id: string; started_at: string; ended_at: string }[]) {
+      if (!wanted.has(row.session_id)) continue;
+      const list = traces.get(row.session_id);
+      if (list) list.push(row);
+      else traces.set(row.session_id, [row]);
+    }
   }
 
-  const messageTimestamps = database.query(
-    `SELECT ts FROM claude_messages
+  const readMessages = database.query(
+    `SELECT ts, role, text_preview as text FROM claude_messages
       WHERE session_id = ? AND text_preview IS NOT NULL
       ORDER BY ts DESC LIMIT 5000`,
   );
   const planned: PlannedWindow[] = [];
   for (const session of sessions) {
-    const rows = (messageTimestamps.all(session.id) as { ts: string }[]).reverse();
-    const bounded = options.to ? rows.filter((row) => row.ts < (options.to as string)) : rows;
+    const rows = (readMessages.all(session.id) as { ts: string; role: string; text: string }[])
+      .reverse()
+      .filter((message) => options.to === undefined || message.ts < options.to);
     const sessionTraces = traces.get(session.id) ?? [];
-    for (const chunk of chunkByWindow(bounded, options.windowMinutes)) {
+    const chunks = chunkByWindow(rows, options.windowMinutes);
+    for (const [index, chunk] of chunks.entries()) {
       const startedAt = chunk[0]?.ts ?? session.ended_at;
       const endedAt = chunk.at(-1)?.ts ?? session.ended_at;
       planned.push({
         sessionId: session.id,
+        index,
         startedAt,
         endedAt,
+        messages: chunk,
+        previousWindowEnd: index > 0 ? (chunks[index - 1]?.at(-1)?.ts ?? null) : null,
         covered:
           classified.has(`${session.id}\u0000${startedAt}\u0000${endedAt}`) ||
           sessionTraces.some((trace) => trace.started_at >= startedAt && trace.ended_at <= endedAt),
@@ -260,7 +249,7 @@ export async function backfill(
   let questProposedOnMatched = 0;
   let selectorDefaulted = 0;
   let selectorAmbiguous = 0;
-  const windowMinutes = intentConfig.throttleMinutes * 3;
+  const windowMinutes = backfillWindowMinutes(intentConfig);
 
   // Windows are classified in chronological order *across* sessions, not
   // session by session. Two sessions running the same afternoon interleave in
@@ -270,18 +259,13 @@ export async function backfill(
   // session's per-chunk `sinceTs` chain still holds, because a chunk's overlap
   // tail is derived from its own session's previous chunk, not from whatever
   // window happened to run before it.
-  interface PendingWindow {
-    session: SessionRow;
-    chunk: { ts: string; role: string; text: string }[];
-    /** Index within the session's own chunk list, as the failure log reports it. */
-    index: number;
-    startedAt: string;
-    endedAt: string;
-    /** Last message of this session's previous chunk; the overlap tail's cut. */
-    previousChunkEnd: string | null;
-  }
-
-  const pending: PendingWindow[] = [];
+  const planned = planBackfillWindows(database, sessions, {
+    windowMinutes,
+    to: options.to,
+    force: options.force,
+  });
+  const pending = planned.filter((window) => !window.covered);
+  windowsSkipped += planned.length - pending.length;
 
   /**
    * Decided once per session, never per chunk: a session either declares
@@ -305,55 +289,26 @@ export async function backfill(
     return mode;
   };
 
+  const plannedPerSession = new Map<string, number>();
+  for (const window of planned)
+    plannedPerSession.set(window.sessionId, (plannedPerSession.get(window.sessionId) ?? 0) + 1);
+  const pendingPerSession = new Map<string, number>();
+  for (const window of pending)
+    pendingPerSession.set(window.sessionId, (pendingPerSession.get(window.sessionId) ?? 0) + 1);
   for (const session of sessions) {
-    const fullWindow = buildWindow(database, {
-      sessionId: session.id,
-      mode: modeFor(session.id),
-      sinceTs: null,
-      maxMessages: 5000,
-      memoryHours: intentConfig.memoryHours,
-      memoryStints: intentConfig.memoryStints,
-      overlapMessages: intentConfig.overlapMessages,
-      // Only the message list is used from this window; the slice is rebuilt per
-      // chunk below with that chunk's own end as the bound.
-      windowEnd: options.to ?? session.ended_at,
-    });
-    const boundedMessages = options.to
-      ? fullWindow.messages.filter((message) => message.ts < (options.to as string))
-      : fullWindow.messages;
-    const chunks = chunkByWindow(boundedMessages, windowMinutes);
-
-    let sessionPending = 0;
-    for (const [index, chunk] of chunks.entries()) {
-      const startedAt = chunk[0]?.ts ?? session.ended_at;
-      const endedAt = chunk.at(-1)?.ts ?? session.ended_at;
-      const covered = options.force
-        ? false
-        : isWindowCovered(database, session.id, startedAt, endedAt);
-      if (covered) {
-        windowsSkipped += 1;
-        continue;
-      }
-      sessionPending += 1;
-      pending.push({
-        session,
-        chunk,
-        index,
-        startedAt,
-        endedAt,
-        previousChunkEnd: index > 0 ? (chunks[index - 1]?.at(-1)?.ts ?? null) : null,
-      });
-    }
-
-    if (chunks.length > 0 && sessionPending === 0) {
+    if ((plannedPerSession.get(session.id) ?? 0) > 0 && !pendingPerSession.has(session.id)) {
       sessionsSkipped += 1;
       options.log(`backfill: skipping ${session.id} (already covered)`);
     }
   }
 
+  // Decide every session's mode now, before any window is applied.
+  for (const session of sessions) modeFor(session.id);
+  const sessionsById = new Map(sessions.map((session) => [session.id, session]));
+
   pending.sort((left, right) =>
     left.startedAt === right.startedAt
-      ? left.session.id.localeCompare(right.session.id)
+      ? left.sessionId.localeCompare(right.sessionId)
       : left.startedAt < right.startedAt
         ? -1
         : 1,
@@ -363,12 +318,20 @@ export async function backfill(
   const sessionPendingCounts = new Map<string, number>();
   for (const window of pending) {
     sessionPendingCounts.set(
-      window.session.id,
-      (sessionPendingCounts.get(window.session.id) ?? 0) + 1,
+      window.sessionId,
+      (sessionPendingCounts.get(window.sessionId) ?? 0) + 1,
     );
   }
 
-  for (const { session, chunk, index, startedAt, endedAt, previousChunkEnd } of pending) {
+  for (const {
+    sessionId,
+    messages,
+    index,
+    startedAt,
+    endedAt,
+    previousWindowEnd: previousChunkEnd,
+  } of pending) {
+    const session = sessionsById.get(sessionId) as SessionRow;
     closeIdleStints(store, database, {
       sessionId: session.id,
       windowStartedAt: startedAt,
@@ -394,7 +357,7 @@ export async function backfill(
         overlapMessages: intentConfig.overlapMessages,
         windowEnd: endedAt,
       }),
-      messages: chunk,
+      messages,
     };
 
     try {
