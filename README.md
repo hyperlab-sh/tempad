@@ -44,59 +44,198 @@ TemPad is a self-awareness tool, not a surveillance tool. It exists to show what
 
 Rule of thumb: Sagas give direction, Quests are planned, Stints are what happened, Maneuvers are how, Traces are the proof, Places are where, Tools are how, Projects are whose and what for.
 
-The first release stores traces, places and projects. Sagas, quests and stints arrive with the `w5` hook (see the roadmap).
+Sagas, quests and stints come from the `w5` hook and the `tempad-quest` skill (see [Declaring quests](#declaring-quests)).
 
 ## Features
 
 - **Collectors** for Monday.com items assigned to you, GitHub commits and pull requests across one or more orgs (plus optional personal repos), and Claude Code session transcripts from any number of `~/.claude*` directories.
 - **Incremental sync.** Each source records where it left off. Git repos are kept as bare mirrors so rewritten history is re-diffed, not trusted.
 - **Path rules** map working directories to `org` and `project` using WHATWG `URLPattern` syntax, so `~/work/:org/:project/:rest*` is a complete config.
-- **Reports** per day, per project, and hour by hour, generated deterministically from the database as Markdown.
-- **w5 table** (planned): a Claude Code hook that periodically asks a small model _who, when, what, why, where_ about the live session and stores the answer.
+- **Reports** per day, per project, per week and hour by hour, generated deterministically from the database as Markdown.
+- **w5 hook.** A Claude Code hook that periodically classifies the live session into stints and traces under the quests you declared, handing doubts back to you instead of guessing. It classifies through your local `claude` CLI, so no API key is needed.
+- **Per-command configuration.** A command checks only the variables it needs, so `tempad report` never asks for a Monday token.
 
-## Installation
+## Install
 
-Requires [Bun](https://bun.sh) 1.3+.
+Requires [Bun](https://bun.sh) 1.3.14 or newer and [Claude Code](https://claude.com/claude-code). The [GitHub CLI](https://cli.github.com) (`gh`) is optional: without a `GH_TOKEN`, GitHub sync uses its credentials.
+
+1. **Install the Claude Code plugin** (the `tempad-quest` skill and the w5 hooks):
+
+   ```sh
+   claude plugin marketplace add hyperlab-sh/claude-plugins
+   claude plugin install tempad@hyperlab
+   ```
+
+2. **Configure tempad.** This creates `~/.tempad/.env` and `tempad.toml`:
+
+   ```sh
+   bunx tempad init
+   ```
+
+3. **Sync and report:**
+
+   ```sh
+   bunx tempad hero init "Your Name"
+   bunx tempad sync
+   bunx tempad report daily --from 2026-08-18 --to 2026-08-28
+   ```
+
+   Reports are printed and written to `~/.tempad/reports/`.
+
+The CLI is published to npm as [`tempad`](https://www.npmjs.com/package/tempad); `bunx tempad` runs it without a global install. `bun add -g tempad` installs a `tempad` command if you prefer one on your `PATH`, and the plugin's hooks and skill use it when present.
+
+### What the plugin installs
+
+- The **`tempad-quest` skill**, which has the session declare which quest it is pursuing (`tempad quest declare`) so work is tracked under the right outcome instead of guessed.
+- **Hooks** on `Stop`, `PreCompact`, `SessionEnd` and `UserPromptSubmit` that enqueue classification jobs and hand open doubts back to the session. They never block a session and are **silent until tempad is configured**: with no `~/.tempad/.env` or `tempad.db` they exit 0 with no output and create nothing.
+
+The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx tempad`.
+
+### `tempad init`
+
+`tempad init` prompts for every variable below (secrets are read without echo), suggesting a value where it can: the system time zone, the hostname, `git config user.email`, `~/.claude/projects`, `gh api user`. It then validates what it can cheaply, writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`, and prints the next steps. An existing file is kept unless `--force`; existing values become the prompt suggestions. It never prints a secret.
+
+| Flag                           | Effect                                                                                                |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `--non-interactive`            | No prompts; a missing required value exits 1 naming it                                                |
+| `--<variable>` (see the table) | Sets one variable, e.g. `--monday-api-token`, `--gh-orgs`, `--tz`; the flag is the name in kebab case |
+| `--home <path>`                | Use this directory as `TEMPAD_HOME` for this run                                                      |
+| `--force`                      | Overwrite an existing `.env` and `tempad.toml`                                                        |
+| `--no-verify`                  | Skip the checks (Monday token, GitHub credentials, `CLAUDE_DIRS` exist, `TZ` valid, `SINCE` parses)   |
 
 ```sh
-bun install
+bunx tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
+  --gh-user octocat --gh-orgs my-org --gh-include-personal false \
+  --git-author-emails me@example.com --claude-dirs ~/.claude --host-slug laptop \
+  --tz Europe/Berlin --since 2026-01-01
 ```
 
-## Quick Start
+### Migrating from settings.json hooks
+
+If you installed the hooks with `tempad w5 hook install` (they live in `~/.claude/settings.json`, marked `"tempad": true`), switch to the plugin without a gap:
+
+1. `claude plugin install tempad@hyperlab`. The legacy hooks keep running and the plugin's hooks stand down while they exist, so a session never gets two enqueues or two context lines.
+2. `bunx tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration and removes only the entries it marked. The plugin's hooks take over on the next event.
+3. Remove the old skill copy if you copied it by hand: `rm -r ~/.claude/skills/tempad-quest`. The plugin provides it.
+
+`tempad w5 hook install` still exists for checkout users; it prints that the plugin is the recommended route.
+
+## Configuration
+
+`TEMPAD_HOME` (default `~/.tempad`) holds everything tempad writes: `.env`, `tempad.toml`, `tempad.db`, `repos/` (bare git mirrors), `reports/` and `logs/`. Nothing lives in your project.
+
+Settings are read from the real environment first, then `TEMPAD_HOME/.env`. A `.env` in the current directory is ignored on purpose: hooks run with your project as the working directory, and a project's `TZ` must not override yours.
+
+Each command checks only the variables it needs and fails naming the command and every missing variable, for example `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx tempad init`. Required variables have no defaults.
+
+| Variable              | Meaning                                                                   | Needed by                    |
+| --------------------- | ------------------------------------------------------------------------- | ---------------------------- |
+| `MONDAY_API_TOKEN`    | Monday.com personal API token (secret)                                    | `sync monday`                |
+| `MONDAY_USER`         | Your Monday.com user: numeric id or display name                          | `sync monday`                |
+| `GH_USER`             | Your GitHub login                                                         | `sync github`                |
+| `GH_ORGS`             | Comma-separated GitHub organizations to mirror                            | `sync github`                |
+| `GH_INCLUDE_PERSONAL` | Also mirror your personal repositories (`true` or `false`)                | `sync github`                |
+| `GH_TOKEN`            | GitHub token (secret). Optional: `gh auth` credentials are used if unset  | `sync github`                |
+| `GIT_AUTHOR_EMAILS`   | Comma-separated commit author emails that count as yours                  | `sync github`                |
+| `CLAUDE_DIRS`         | Comma-separated Claude Code config directories holding `projects/*.jsonl` | `sync claude`, `w5 run`      |
+| `HOST_SLUG`           | Short name for this machine, stored with every Claude session             | `sync claude`, `w5 run`      |
+| `TZ`                  | IANA time zone that places work on days, e.g. `Europe/Berlin`             | `report *`, `w5 eval`        |
+| `SINCE`               | Earliest date to sync, `YYYY-MM-DD`                                       | `sync github`, `sync claude` |
+
+`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx tempad init`.
+
+`ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`.
+
+### `tempad.toml`
+
+`tempad.toml` holds what is not a credential: path rules, the intent layer and the w5 settings. A minimal one:
+
+```toml
+[hero]
+name = "Your Name"
+
+# First match wins; list exact-folder `path` rules before `pattern` rules.
+[[projects]]
+path = "~/work/acme/website"
+name = "Acme Website"
+org = "acme"
+project = "website"
+
+[[projects]]
+pattern = "~/work/:org/:project/:rest*"
+
+# Optional: map a GitHub repository or a Monday board to org/project.
+# [[repositories]]
+# full_name = "Acme/my-repo"
+# org = "acme"
+# project = "my-repo"
+#
+# [[boards]]
+# name = "My Board"
+# org = "acme"
+# project = "my-project"
+
+[w5]
+backend = "claude-cli" # or "api" (needs ANTHROPIC_API_KEY)
+mode = "declared"
+```
+
+Notable `[w5]` defaults: `backend = "claude-cli"`, `mode = "declared"`, `timeout_seconds = 180`, `stint_min_minutes = 5`. `tempad project register <path> --name "<display>"` adds a path rule for you.
+
+## Usage
 
 ```sh
-mkdir -p ~/.tempad
-cp packages/core/.env.example ~/.tempad/.env   # fill in tokens and ids
-cp packages/core/tempad.example.toml ~/.tempad/tempad.toml
-
-bun run tempad sync            # all sources
-bun run tempad sync claude     # one source
-bun run tempad report daily --from 2026-08-18 --to 2026-08-28
-
-bun run tempad w5 hook install # wire up the w5 self-awareness hook
-bun run tempad w5 backfill     # classify recent sessions the hook missed
+tempad sync [monday|github|claude] [--full]
+tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path]
+tempad w5 backfill      # classify recent sessions the hook missed
+tempad review           # open doubts and unconfirmed quests
+tempad --help           # every command
 ```
 
-Reports land in `~/.tempad/reports/`.
+`--full` clears a source's last-sync cursor so it rescans back to `SINCE`.
 
-The w5 hook classifies through the local `claude` CLI (`[w5].backend = "claude-cli"`, the default) using whatever subscription you're logged into — no `ANTHROPIC_API_KEY` needed. Set `[w5].backend = "api"` in `tempad.toml` to call the Anthropic API directly instead (requires `ANTHROPIC_API_KEY`).
+### Declaring quests
+
+The w5 hook classifies through the local `claude` CLI (`[w5].backend = "claude-cli"`, the default) using whatever subscription you are logged into. Set `[w5].backend = "api"` in `tempad.toml` to call the Anthropic API directly instead (requires `ANTHROPIC_API_KEY`).
+
+In `declared` mode the session states its quest (the `tempad-quest` skill does this) and the classifier only verifies that each stretch of work serves it, asking you when it doubts. The design is in [`docs/specs`](docs/specs).
 
 ## Repository layout
 
-| Path            | Why                                                                 |
-| --------------- | ------------------------------------------------------------------- |
-| `packages/core` | TypeScript library and `tempad` binary: schema, collectors, reports |
-| `apps/`         | Runnable programs (a Go TUI built on charmbracelet is planned)      |
-| `libs/`         | Private, bundle-time only packages shared across apps               |
-| `docs/specs`    | Design specs                                                        |
+| Path             | Why                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `packages/core`  | The npm package `tempad`: TypeScript library and `tempad` binary (schema, collectors, reports), the skill and the hook scripts |
+| `.claude-plugin` | The Claude Code plugin manifest (version matches `packages/core/package.json`)                                                 |
+| `hooks`          | The plugin's hook registration (`hooks.json`)                                                                                  |
+| `apps/`          | Runnable programs (a Go TUI built on charmbracelet is planned)                                                                 |
+| `libs/`          | Private, bundle-time only packages shared across apps                                                                          |
+| `docs/specs`     | Design specs                                                                                                                   |
 
-Tooling: [moon](https://moonrepo.dev) orchestrates tasks, [Biome](https://biomejs.dev) lints and formats JS/TS/JSON, [dprint](https://dprint.dev) formats Markdown, TOML and YAML.
+## Development
+
+```sh
+git clone git@github.com:hyperlab-sh/tempad.git
+cd tempad
+bun install
+bun packages/core/src/cli.ts --help   # run the CLI from the checkout
+```
+
+The gates, all of which CI runs:
+
+```sh
+bun run lint        # biome check
+bun run typecheck
+bun test
+bun run fmt:check   # biome + dprint; `bun run fmt` fixes
+```
+
+Tooling: [moon](https://moonrepo.dev) orchestrates tasks, [Biome](https://biomejs.dev) lints and formats JS/TS/JSON, [dprint](https://dprint.dev) formats Markdown, TOML and YAML. Bun is pinned to 1.3.14 in `.prototools`.
+
+To try the packed package the way users get it: `cd packages/core && bun pm pack`, then `bun add <tarball>` in an empty directory.
 
 ## Roadmap
 
 - **Profiles.** All configuration is global today (`TEMPAD_HOME/.env` and `tempad.toml`), so one machine can only serve one TemPad. Introduce profiles (for example `~/.tempad/profiles/<name>/` selected by `--profile` or `TEMPAD_PROFILE`) so a person can keep separate databases, tokens and path rules per client or per persona.
-- **w5 hook.** A Claude Code hook that periodically asks a small model _who, when, what, why, where, how_ about the live session and writes a trace, opening or matching stints, quests and side quests (with their nexus events), with a batch backfill over existing sessions. This is what turns raw sessions into "things I worked on", including side quests that never produced a commit.
-- **Weekly table.** Per weekday, per project: stints and quests touched, shipped vs abandoned, side-quest share. Depends on the w5 hook.
 - **Places in config.** Replace the separate `[[projects]]`, `[[repositories]]` and `[[boards]]` rules with one `[[places]]` list with a `kind`.
 - **Sagas and drift.** Set sagas and get a nudge when time drifts away from them for too long.
 - **TUI** in Go (charmbracelet) under `apps/`.
