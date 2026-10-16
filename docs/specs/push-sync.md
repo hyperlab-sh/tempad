@@ -50,16 +50,18 @@ Safe on existing databases: only `ADD COLUMN`, new tables, new triggers, and a t
 - Replace `events_no_update` so the only permitted update fills a NULL `uid`, fills a NULL `sync_host`, and/or clears `sync_dirty` from 1 to 0, with every other column unchanged. Content stays append-only; deletes stay forbidden.
 - `sync_host` is the origin host, set at append time from the local host (see "Local host" below); pulled events carry their origin host. `sync_dirty` is the push state, kept separate from the host tag: 1 = not yet pushed, 0 = pushed or pulled.
 - `EventStore.append` sets `uid` from a monotonic ULID factory, and guarantees the new uid is greater than every uid already in `events` (if the factory's value is not, it uses the successor of the current maximum), inside the same transaction as the insert. So on one host uid order is exactly insertion (`id`) order, across processes too.
-- Legacy rows get a uid once, right after migrations in `openDatabase`: rows in `id` order, a monotonic factory seeded with each row's `recorded_at` epoch ms. The monotonic factory never goes backwards (an earlier seed reuses the last time and increments), so legacy uid order is exactly `id` order even where `recorded_at` is not monotonic in `id`.
+- Legacy rows get a uid once, right after migrations in `openDatabase`, deterministically, so two hosts that started from a copy of the same pre-sync database assign the same uid to the same legacy event (otherwise every shared legacy event would be duplicated after the first sync). Rows are walked in `id` order. The 48-bit time part is the row's `recorded_at` epoch ms clamped to be non-decreasing in `id` order. The 80-bit random part is the `id` in the high 40 bits (big-endian, so ties within one millisecond sort by `id`) and the first 40 bits of SHA-256 over `recorded_at|kind|subject|payload` in the low 40 bits. Legacy uid order is therefore exactly `id` order, even where `recorded_at` is not monotonic in `id`. Copies diverge only where their content diverges: the same `id` with different content gets a different uid.
 
 **Mirrors** (`gh_repos`, `gh_commits`, `gh_pull_requests`, `monday_items`, `claude_sessions`, `claude_messages`):
 
 - `ADD COLUMN sync_host TEXT`, `ADD COLUMN sync_updated_at TEXT`, `ADD COLUMN sync_dirty INTEGER NOT NULL DEFAULT 1`. Existing rows get `sync_updated_at` = migration time, `sync_host` NULL (filled with the local host at their first push), `sync_dirty` 1, so the first push uploads them.
 - `sync_host` is the host tag of the row's last writer. `sync_dirty` is the push state, separate from the tag. `claude_sessions.host_slug` keeps its meaning (where the session ran) and is untouched.
 - Triggers per table, generated from its column list:
-  - `AFTER INSERT ... WHEN NEW.sync_updated_at IS NULL`: stamp `sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')` (millisecond UTC), `sync_host` = local host, `sync_dirty = 1`.
+  - **Stamps are strictly increasing per key on one host.** Every new version of a natural key gets a stamp strictly greater than the previous version's: `max(now, previous + 1 ms)`, where previous is the old row's stamp on update or delete, and the key's tombstone `deleted_at` on insert. Without this, two writes in the same millisecond would share a stamp. Mark-pushed (which matches on the stamp) would then clear the outbox flag for content never sent, and the server's strict `>` would drop the second write.
+  - `AFTER INSERT ... WHEN NEW.sync_updated_at IS NULL`: stamp `sync_updated_at` (millisecond UTC ISO, per the rule above), `sync_host` = local host, `sync_dirty = 1`.
   - `AFTER UPDATE ... WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (<any content column> IS NOT OLD.<col>)`: restamp, `sync_host` = local host, `sync_dirty = 1`. A pull writes an explicit `sync_updated_at`, so it never fires this; marking a row pushed changes only `sync_dirty` (and fills a NULL `sync_host`), which are not content, so that does not either. The collectors' `IS NOT` guards mean an unchanged re-collection never fires it at all.
-  - `AFTER DELETE`: upsert `(table, key JSON, deleted_at = now, sync_host = local host, sync_dirty = 1)` into `sync_tombstones`.
+  - `AFTER DELETE`: upsert `(table, key JSON, deleted_at = max(now, OLD stamp + 1 ms), sync_host = local host, sync_dirty = 1)` into `sync_tombstones`.
+- **Host-local columns.** Some mirror columns describe the local machine, not the shared fact: `gh_repos.mirrored_at` is when this host last fetched its own bare mirror. The registry lists them as `localColumns` per table. They are not content, so changing one never restamps or dirties the row. Push leaves them out of the payload, and pull never overwrites them: a newly inserted pulled row gets NULL, which correctly tells this host's collector its mirror is missing. Without this, every `tempad sync` would re-dirty every `gh_repos` row, and the rows would bounce between hosts.
 
 **Sync bookkeeping:**
 
@@ -108,6 +110,16 @@ Known limit: both this rule and cross-host event order depend on wall clocks (th
 ## Event order across hosts
 
 Replay order changes from `ORDER BY id` to `ORDER BY uid` in `EventStore.read`, `stateAsOf` (which also copies `uid`, `sync_host`, `sync_dirty`), `w5 dedupe` (keep the earliest uid, not the lowest id), and the declaration tiebreaks (`at DESC, uid DESC` where they say `at DESC, id DESC`, same for ASC). On a single host uid order is exactly `id` order, for legacy rows and new ones (see "Events" above), so with sync off every projection is byte-identical to today; a test rebuilds a fixture database with same-millisecond and out-of-order `recorded_at` events before and after the migration and compares every projection table. Across hosts uid order is a total order every host computes identically, which is what makes rebuilt projections converge. `projection_state.last_event_id` and `impacts.event_id` keep storing the local id; nothing reads them.
+
+## Identity merge across hosts
+
+Hosts set up independently each ran `tempad hero init`, and usually `party add` / `client add` with the same slugs. After sync, the merged log holds several `hero.created` events, and `party.created` / `client.created` events with different ids for one slug. Today `rebuildAll` would throw on the UNIQUE slug, and `SELECT id FROM heroes LIMIT 1` would pick an arbitrary hero.
+
+- **Rule:** the first created event in uid order is canonical. That means one hero overall, one party per slug and one client per slug. A later created event for an existing hero or slug does not insert a row. It records an alias `alias_id -> canonical_id` in a projection table, which is local-only and rebuilt with the rest.
+- **Reducers:** every reducer that reads a hero, party or client id from a payload or subject resolves it through the alias map first. Memberships, sagas and every other reference land on the canonical id.
+- **Hero lookups:** the hero lookups go through one helper, ordered so the canonical hero is returned.
+- **Other projection keys:** every other projection key two hosts could collide on is handled by the same rule or shown not to collide. w5 projections are host-local by construction, since backfill selects only its own host's sessions.
+- **Single host:** a single-host log has no duplicates and therefore no aliases, so offline projections stay byte-identical.
 
 ## Flow
 
