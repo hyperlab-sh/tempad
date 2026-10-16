@@ -11,7 +11,12 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import type { SpawnFn } from "../../src/w5/cli";
-import { planW5Command, runReviewCommand, runW5Command } from "../../src/w5/cli";
+import { planW5Command, runReviewCommand, runW5Command, runW5HookCommand } from "../../src/w5/cli";
+import {
+  isUnstableInstallPath,
+  PLUGIN_RECOMMENDATION_MESSAGE,
+  UNSTABLE_INSTALL_MESSAGE,
+} from "../../src/w5/hooks";
 
 registerAllProjections();
 
@@ -578,6 +583,104 @@ describe("w5 run / eval without the fields they need", () => {
       ).rejects.toThrow(/tz/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** Runs `tempad w5 hook ...` with HOME pointing at a fresh directory; captures console output. */
+function runHookCommand(args: string[]): {
+  code: number;
+  out: string[];
+  err: string[];
+  settingsPath: string;
+} {
+  const home = mkdtempSync(join(tmpdir(), "tempad-hook-cli-"));
+  const settingsPath = join(home, ".claude", "settings.json");
+  const savedHome = process.env.HOME;
+  const savedLog = console.log;
+  const savedError = console.error;
+  const out: string[] = [];
+  const err: string[] = [];
+  process.env.HOME = home;
+  console.log = (...parts: unknown[]) => out.push(parts.join(" "));
+  console.error = (...parts: unknown[]) => err.push(parts.join(" "));
+  try {
+    return { code: runW5HookCommand(args), out, err, settingsPath };
+  } finally {
+    console.log = savedLog;
+    console.error = savedError;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
+}
+
+describe("w5 hook install", () => {
+  test("prints the plugin recommendation after installing the hooks", () => {
+    const { code, out, settingsPath } = runHookCommand([
+      "install",
+      "--bin",
+      "/opt/tempad/src/cli.ts",
+    ]);
+    try {
+      expect(code).toBe(0);
+      expect(existsSync(settingsPath)).toBe(true);
+      expect(out).toContain(PLUGIN_RECOMMENDATION_MESSAGE);
+    } finally {
+      rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("refuses to write hooks that point into bunx's temporary directory", () => {
+    const { code, out, err, settingsPath } = runHookCommand([
+      "install",
+      "--bin",
+      "/var/folders/ab/xyz/T/bunx-501-tempad@0.1.0/node_modules/tempad/src/cli.ts",
+    ]);
+    try {
+      expect(code).toBe(1);
+      expect(err).toContain(UNSTABLE_INSTALL_MESSAGE);
+      expect(UNSTABLE_INSTALL_MESSAGE).toContain("claude plugin install tempad@hyperlab");
+      expect(UNSTABLE_INSTALL_MESSAGE).toContain("bun add -g tempad");
+      expect(out).not.toContain(PLUGIN_RECOMMENDATION_MESSAGE);
+      expect(existsSync(settingsPath)).toBe(false);
+    } finally {
+      rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("uninstall is not affected by where the CLI lives", () => {
+    const { code, err, settingsPath } = runHookCommand(["uninstall"]);
+    try {
+      expect(code).toBe(0);
+      expect(err).toEqual([]);
+    } finally {
+      rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
+    }
+  });
+});
+
+describe("isUnstableInstallPath", () => {
+  test("recognises bunx directories, bun's cache and temp directories", () => {
+    for (const path of [
+      "/tmp/bunx-1000-tempad@latest/node_modules/tempad/src/cli.ts",
+      "/var/folders/ab/xyz/T/bunx-501-tempad@0.1.0/node_modules/tempad/hooks/w5-stop.sh",
+      "/Users/me/.bun/install/cache/tempad@0.1.0@@@1/src/cli.ts",
+      "/private/var/folders/ab/T/anything/cli.ts",
+      "/tmp/checkout/cli.ts",
+      join(tmpdir(), "somewhere", "cli.ts"),
+    ]) {
+      expect(isUnstableInstallPath(path)).toBe(true);
+    }
+  });
+
+  test("accepts a checkout and a global install", () => {
+    for (const path of [
+      "/work/tempad/worktrees/main/packages/core/src/cli.ts",
+      "/Users/me/.bun/install/global/node_modules/tempad/src/cli.ts",
+      "/home/me/code/bunx-notes/cli.ts",
+      "/opt/tempad/src/cli.ts",
+    ]) {
+      expect(isUnstableInstallPath(path)).toBe(false);
     }
   });
 });
