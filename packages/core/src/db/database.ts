@@ -197,9 +197,12 @@ function backfillEventUids(database: Database): void {
   if (pending === null) return;
 
   // The rows and the maximum are read inside the write transaction. Two
-  // processes opening the same pre-0019 database both see NULL uids; reading
-  // before taking the lock would let the second hand out uids computed against
-  // a maximum the first has already moved.
+  // processes opening the same database both see NULL uids. On a plain pre-0019
+  // database the uids are deterministic, so a stale read would only recompute
+  // the same values; the lock earns its keep in the mixed case, where some
+  // uid already sits above a row's deterministic one and `ulidAfter` adds a
+  // random increment. A stale read there hands out a uid for a row the other
+  // process has already filled, and the append-only trigger aborts the open.
   const run = database.transaction(() => {
     const rows = database
       .query(
