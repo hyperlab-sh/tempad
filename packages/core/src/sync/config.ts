@@ -62,7 +62,22 @@ function validateUrl(value: unknown): string {
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`tempad.toml: [sync].url is not a valid URL: ${value}`);
+    throw new Error("tempad.toml: [sync].url is not a valid URL");
+  }
+  // The client honours `?tls=0` (plain text under a libsql: scheme) and
+  // `?authToken=` (a token in tempad.toml overriding TEMPAD_SYNC_TOKEN), and
+  // userinfo would carry credentials too. None of them is ever needed, so the
+  // url is scheme, host, port and path only. The value is not echoed back:
+  // it may hold a credential.
+  if (value.includes("?") || value.includes("#")) {
+    throw new Error(
+      "tempad.toml: [sync].url must not have a query string or fragment (options like ?tls=0 or ?authToken= are not allowed)",
+    );
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error(
+      "tempad.toml: [sync].url must not contain user info; the token comes from TEMPAD_SYNC_TOKEN",
+    );
   }
   if (SECURE_SCHEMES.has(url.protocol)) return value;
   if (PLAIN_SCHEMES.has(url.protocol)) {

@@ -98,6 +98,37 @@ describe("loadSyncConfig", () => {
     });
   }
 
+  for (const url of [
+    "libsql://sync.example.com:8080?tls=0",
+    "https://sync.example.com?tls=0",
+    "libsql://sync.example.com?authToken=secret-in-toml",
+    "http://127.0.0.1:8080?tls=1",
+    "libsql://sync.example.com?",
+    "libsql://sync.example.com#frag",
+  ]) {
+    test(`a query string or fragment is rejected, loopback or not: ${url}`, () => {
+      toml(`[sync]\nurl = "${url}"\n`);
+      expect(() => loadSyncConfig(home, TOKEN)).toThrow("must not have a query string or fragment");
+    });
+  }
+
+  test("the rejected url, which may hold a token, is not echoed in the error", () => {
+    toml('[sync]\nurl = "libsql://h.example?authToken=secret-in-toml"\n');
+    expect(() => loadSyncConfig(home, TOKEN)).not.toThrow("secret-in-toml");
+    expect(() => loadSyncConfig(home, TOKEN)).toThrow();
+  });
+
+  for (const url of [
+    "libsql://user:pass@sync.example.com",
+    "https://token@sync.example.com",
+    "http://user:pass@127.0.0.1:8080",
+  ]) {
+    test(`user info is rejected: ${url}`, () => {
+      toml(`[sync]\nurl = "${url}"\n`);
+      expect(() => loadSyncConfig(home, TOKEN)).toThrow("must not contain user info");
+    });
+  }
+
   test("an unsupported scheme is rejected", () => {
     toml('[sync]\nurl = "file:///tmp/x.db"\n');
     expect(() => loadSyncConfig(home, TOKEN)).toThrow("scheme file: is not supported");
