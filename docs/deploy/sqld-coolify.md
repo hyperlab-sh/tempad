@@ -8,13 +8,13 @@ The server behaviour below was checked against the `tursodatabase/libsql` source
 
 | Item          | Value                                                                                                                                         |
 | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Image         | `ghcr.io/tursodatabase/libsql-server` (arm64 hosts: the `-arm` tags, per `docs/DOCKER.md`)                                                    |
+| Image         | `ghcr.io/tursodatabase/libsql-server`. The digest below is a multi-arch index (amd64 and arm64), so one reference works on either host.       |
 | HTTP / Hrana  | `8080` (`SQLD_HTTP_LISTEN_ADDR`, the image defaults it to `0.0.0.0:8080`). This is the only port tempad uses.                                 |
 | gRPC          | `5001`, for replica-to-primary traffic. tempad does not need it. `SQLD_NODE=standalone` stops the image opening it.                           |
 | Data          | `/var/lib/sqld`, declared as the image `VOLUME` and its working directory. Mount a persistent volume here.                                    |
 | Database path | `SQLD_DB_PATH`, default `iku.db`, relative to `/var/lib/sqld`. Treat the whole directory as the database; never copy a single file out of it. |
 
-**Pin the image.** The registry publishes `latest` plus short-git-SHA tags (for example `d6c75af`), listed at <https://github.com/tursodatabase/libsql/pkgs/container/libsql-server>. Pick the newest SHA tag that is not `latest`, run it, and write it in the compose file. For a stricter pin append the digest: `image: ghcr.io/tursodatabase/libsql-server:d6c75af@sha256:<digest>`; `docker buildx imagetools inspect <image>:<tag>` prints it. Upgrade on purpose, then run the smoke check in section 5.
+**Pin the image.** The registry publishes `latest`, version tags and short-git-SHA tags, listed at <https://github.com/tursodatabase/libsql/pkgs/container/libsql-server>. This page pins `d6c75af@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67`. On 2026-10-16 the `d6c75af` tag, `latest` and that digest were the same image, and it is the one `sqld.integration.test.ts` runs against, so the tag and the digest agree. When a reference carries both, the digest decides and the tag is a label for humans. To upgrade, resolve the new tag's digest (`docker buildx imagetools inspect <image>:<tag>`, or `docker manifest inspect`), change both together, run the integration test against the new digest, then run the smoke check in section 5.
 
 ### Coolify resource
 
@@ -23,7 +23,7 @@ Create a **Docker Compose** resource (Empty or "raw compose"), not an Applicatio
 ```yaml
 services:
   sqld:
-    image: ghcr.io/tursodatabase/libsql-server:d6c75af # pin; see above
+    image: ghcr.io/tursodatabase/libsql-server:d6c75af@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67 # pin; see above
     restart: unless-stopped
     environment:
       - SERVICE_FQDN_SQLD_8080 # Coolify generates the domain and routes it to container port 8080
@@ -37,10 +37,13 @@ volumes:
 ```
 
 - Do not add a `ports:` entry. A published host port bypasses the proxy and its TLS (Coolify docs). The proxy reaches the container over the compose network.
-- In the resource's **Domains** field enter `https://tempad-sync.example.com:8080` (protocol, hostname, internal port). Coolify's proxy obtains the certificate and terminates TLS, so clients use `https://` or `libsql://`.
+- In the resource's **Domains** field enter `https://tempad-sync.example.com:8080` (protocol, hostname, internal port). Coolify's proxy obtains the certificate and terminates TLS, so clients use `https://` or `libsql://`. The domain must already resolve to the Coolify host (a wildcard record is enough). Coolify displays the stored domain without the `:8080`, but routing to container port 8080 works (verified on a real deploy).
 - Coolify shows compose-owned volumes read-only under Persistent Storage; change them in the file. Take the volume's name from there when you back it up.
-- The image has no healthcheck. The Dockerfile declares no `HEALTHCHECK`, so use the smoke check instead.
+- The image has no healthcheck. The Dockerfile declares no `HEALTHCHECK`, so Coolify reports the service as `running:unknown`, which is normal here. Use the smoke check instead.
+- `SQLD_AUTH_JWT_KEY` appears under Environment Variables as soon as the compose file is saved, with an empty value. Fill it in before the first start. sqld reads the variable through clap, which treats an empty value as unset, so an empty `SQLD_AUTH_JWT_KEY=` starts sqld with auth **disabled**: full access for anyone who can reach the URL (section 2). Run the smoke checks (section 5) after every deploy.
 - Hrana over WebSocket must pass through the proxy. If `libsql://` fails but `https://` works, the proxy is not forwarding WebSocket upgrades: use `https://` in `[sync].url`.
+
+**Without the UI.** The `coolify` CLI's `service create` only takes one-click service types, so for a raw compose file call the API (token from `coolify context`): `POST /api/v1/services` with `project_uuid`, `server_uuid`, `environment_name`, `name`, `docker_compose_raw` (the compose file, base64), `urls: [{"name": "sqld", "url": "https://tempad-sync.example.com:8080"}]` and `instant_deploy: false`; then `PATCH /api/v1/services/<uuid>/envs` with `{"key": "SQLD_AUTH_JWT_KEY", "value": "<public key>"}`; then `POST /api/v1/services/<uuid>/start` (a `GET` is refused). `coolify service restart <uuid>` restarts it. Set the key before the first `start`, so the service never runs unauthenticated.
 
 ## 2. Authentication
 
