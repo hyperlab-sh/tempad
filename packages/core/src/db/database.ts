@@ -1,38 +1,24 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
 import { encodeTime } from "ulid";
 import { ulidAfter } from "../intent/ids";
 import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
-
-const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
+import { loadMigrations } from "./migration-files";
 
 /**
  * From this version on, the push-sync mirror triggers exist only while
- * `sync_meta.mirror_sync_enabled` is set (src/sync/triggers.ts). Every
- * migration from here runs `reconcileMirrorTriggers` inside its own
- * transaction, so a migration that drops a trigger to change it has it back,
- * from `mirror-triggers.sql`, before any other connection can write.
+ * `sync_meta.mirror_sync_enabled` is set (src/sync/triggers.ts). The last
+ * pending migration from here runs `reconcileMirrorTriggers` once, inside its
+ * own transaction, so a migration that drops a trigger to change it has it
+ * back, from `mirror-triggers.sql`, before that migration commits.
+ *
+ * Only the last one: `mirror-triggers.sql` describes the head schema, so
+ * installing it after an intermediate step (say 22, on the way to a 25 that
+ * adds a mirror column the triggers name) would make any 23 or 24 statement
+ * touching that mirror fail. Between intermediate steps the triggers are as
+ * the previous step left them.
  */
 const TRIGGER_GATE_VERSION = 22;
-
-function loadMigrations(): { version: number; sql: string }[] {
-  const files = readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith(".sql"))
-    .sort();
-
-  return files.map((file) => {
-    const match = file.match(/^(\d+)_/);
-    if (!match?.[1]) {
-      throw new Error(`Migration file name must start with a number: ${file}`);
-    }
-    return {
-      version: Number.parseInt(match[1], 10),
-      sql: readFileSync(join(MIGRATIONS_DIR, file), "utf8"),
-    };
-  });
-}
 
 export interface OpenDatabaseOptions {
   /**
@@ -70,11 +56,16 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
   const currentVersion = (database.query("PRAGMA user_version;").get() as { user_version: number })
     .user_version;
 
-  const migrations = loadMigrations();
-  for (const migration of migrations) {
-    if (migration.version <= currentVersion) continue;
-    if (options.upToVersion !== undefined && migration.version > options.upToVersion) break;
-    applyMigration(database, migration);
+  const pending = loadMigrations().filter(
+    (migration) =>
+      migration.version > currentVersion &&
+      (options.upToVersion === undefined || migration.version <= options.upToVersion),
+  );
+  const last = pending.at(-1)?.version;
+  for (const migration of pending) {
+    applyMigration(database, migration, {
+      reconcileTriggers: migration.version === last && migration.version >= TRIGGER_GATE_VERSION,
+    });
   }
 
   if (hasColumn(database, "events", "uid")) backfillEventUids(database);
@@ -270,7 +261,11 @@ function backfillEventUids(database: Database): void {
  * SQLite runs DDL transactionally, so `ALTER TABLE` and `PRAGMA user_version`
  * both roll back with everything else.
  */
-function applyMigration(database: Database, migration: { version: number; sql: string }): void {
+function applyMigration(
+  database: Database,
+  migration: { version: number; sql: string },
+  options: { reconcileTriggers: boolean },
+): void {
   // IMMEDIATE takes the write lock up front (waiting out `busy_timeout`), and
   // the version is read again under it. `openDatabase` decided this migration
   // was due from a read taken before the lock: a second process (the w5 hook
@@ -285,7 +280,7 @@ function applyMigration(database: Database, migration: { version: number; sql: s
       return;
     }
     runMigration(database, migration.sql);
-    if (migration.version >= TRIGGER_GATE_VERSION) reconcileMirrorTriggers(database);
+    if (options.reconcileTriggers) reconcileMirrorTriggers(database);
     database.exec(`PRAGMA user_version = ${migration.version};`);
     database.exec("COMMIT");
   } catch (error) {

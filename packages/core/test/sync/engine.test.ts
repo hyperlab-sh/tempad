@@ -12,7 +12,6 @@ import {
   type SqlValue,
   type SyncRemote,
 } from "../../src/sync/engine";
-import { enableMirrorSync } from "../../src/sync/triggers";
 import {
   addCommit,
   addMondayItem,
@@ -446,9 +445,6 @@ describe("failures and identity", () => {
   });
 
   test("a server with a new identity is re-seeded from every host and cursors restart", async () => {
-    // Sync was already on when c1 was deleted, so the delete left a tombstone
-    // (a delete made before sync was ever used has nothing remote to undo).
-    enableMirrorSync(hostA);
     await intent(hostA, ["hero", "init", "Saulo"]);
     addRepository(hostA, "acme/web");
     addCommit(hostA, "c1", "acme/web", "x");

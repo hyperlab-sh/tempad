@@ -1,24 +1,27 @@
-import type { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../src/db/database.ts";
+import * as migrationFiles from "../src/db/migration-files.ts";
 import { dailyReport } from "../src/report/daily.ts";
 import { hourlyReport } from "../src/report/hourly.ts";
 import { projectReport } from "../src/report/project.ts";
 import { weeklyReport } from "../src/report/weekly.ts";
 import { runSyncEngine } from "../src/sync/engine.ts";
 import { SYNCED_UPSERT_TABLES } from "../src/sync/tables.ts";
+import * as triggers from "../src/sync/triggers.ts";
 import {
   enableMirrorSync,
+  ensureMirrorTriggers,
   isMirrorSyncEnabled,
   MIRROR_SYNC_ENABLED,
   MIRROR_TRIGGER_NAMES,
   mirrorTriggerDefinitions,
 } from "../src/sync/triggers.ts";
 import { REPORT_CONFIG, seedReportFixtures } from "./fixtures/report-golden/seed.ts";
-import { FakeRemote } from "./sync/helpers.ts";
+import { addCommit, addRepository, FakeRemote, restamp } from "./sync/helpers.ts";
 
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const PUSHED_STAMP = "2026-01-01T00:00:00.000Z";
@@ -311,16 +314,64 @@ describe("enableMirrorSync", () => {
     database.close();
   });
 
-  test("keeps a stamp a row already had (0019 stamped every row it found)", () => {
+  test("restamps a row 0019 already stamped as written now, and never moves a stamp backwards", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(`UPDATE gh_commits SET sync_updated_at = '${PUSHED_STAMP}'`);
+    database.exec("UPDATE gh_repos SET sync_updated_at = '2099-01-01T00:00:00.000Z'");
+    const before = new Date().toISOString();
     enableMirrorSync(database);
-    expect(
-      database.query("SELECT sync_updated_at, sync_host, sync_dirty FROM gh_commits").get(),
-    ).toEqual({ sync_updated_at: PUSHED_STAMP, sync_host: null, sync_dirty: 1 });
+    const commit = database
+      .query("SELECT sync_updated_at, sync_host, sync_dirty FROM gh_commits")
+      .get() as { sync_updated_at: string; sync_host: string; sync_dirty: number };
+    expect(commit.sync_updated_at >= before).toBe(true);
+    expect(commit).toMatchObject({ sync_host: "host-a", sync_dirty: 1 });
+    // A stamp ahead of the clock moves on by one millisecond, as the triggers do.
+    expect(database.query("SELECT sync_updated_at FROM gh_repos").get()).toEqual({
+      sync_updated_at: "2099-01-01T00:00:00.001Z",
+    });
     database.close();
   });
+
+  test(
+    "a row changed while sync was off beats an older version another host pushed after its 0019 stamp",
+    withDirectory(async (path) => {
+      const options = { batchSize: 50, push: true, pull: true };
+      // Host A, v21 era: the commit is collected and stamped Sept 1.
+      const oldA = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
+      addRepository(oldA, "acme/widgets");
+      addCommit(oldA, "abc123", "acme/widgets", "first version");
+      restamp(oldA, "gh_commits", "sha = ?", ["abc123"], "2026-09-01T00:00:00.000Z");
+      oldA.close();
+      // 0022 drops A's triggers; the collector changes the subject (Oct 5) and
+      // the Sept 1 stamp stays.
+      const hostA = openDatabase(path, { hostSlug: "host-a" });
+      addCommit(hostA, "abc123", "acme/widgets", "newer on A");
+      expect(
+        hostA.query("SELECT sync_updated_at FROM gh_commits WHERE sha = 'abc123'").get(),
+      ).toEqual({ sync_updated_at: "2026-09-01T00:00:00.000Z" });
+
+      // Host B pushes older content for the same sha, stamped Oct 1.
+      const remote = new FakeRemote();
+      const hostB = openDatabase(":memory:", { hostSlug: "host-b" });
+      addRepository(hostB, "acme/widgets");
+      addCommit(hostB, "abc123", "acme/widgets", "older on B");
+      await runSyncEngine(hostB, remote, { ...options, hostSlug: "host-b" });
+      restamp(hostB, "gh_commits", "sha = ?", ["abc123"], "2026-10-01T00:00:00.000Z");
+      await runSyncEngine(hostB, remote, { ...options, hostSlug: "host-b" });
+
+      // A's first sync, then B's next one: A's content wins on both.
+      await runSyncEngine(hostA, remote, { ...options, hostSlug: "host-a" });
+      await runSyncEngine(hostB, remote, { ...options, hostSlug: "host-b" });
+      for (const database of [hostA, hostB]) {
+        expect(
+          database.query("SELECT subject, sync_host FROM gh_commits WHERE sha = 'abc123'").get(),
+        ).toEqual({ subject: "newer on A", sync_host: "host-a" });
+      }
+      hostA.close();
+      hostB.close();
+    }),
+  );
 
   test("with sync on, inserts, updates and deletes stamp and tombstone exactly as the ungated 0021 triggers did", () => {
     const ungated = openDatabase(":memory:", { upToVersion: 21, hostSlug: "host-a" });
@@ -461,6 +512,128 @@ describe("offline report output", () => {
       expect(isMirrorSyncEnabled(fresh)).toBe(false);
       expect(render(fresh)).toEqual(before);
       fresh.close();
+    }),
+  );
+});
+
+/**
+ * Runs `sql` in another process inside `BEGIN IMMEDIATE`, holding the write
+ * lock for `holdMs` before it commits. Resolves once the lock is held, with a
+ * promise for the child's exit. Another process, because the race under test
+ * is between a read taken before the lock and the write that waits for it:
+ * one thread cannot commit while it is blocked waiting.
+ */
+async function commitFromAnotherProcess(
+  path: string,
+  sql: string,
+  holdMs: number,
+): Promise<{ exited: Promise<number> }> {
+  const code = `
+    import { Database } from "bun:sqlite";
+    const database = new Database(${JSON.stringify(path)});
+    database.exec("PRAGMA busy_timeout = 5000");
+    database.exec("BEGIN IMMEDIATE");
+    database.exec(${JSON.stringify(sql)});
+    console.log("ready");
+    Bun.sleepSync(${holdMs});
+    database.exec("COMMIT");
+    database.close();
+  `;
+  const child = Bun.spawn(["bun", "-e", code], { stdout: "pipe", stderr: "inherit" });
+  const reader = child.stdout.getReader();
+  let output = "";
+  while (!output.includes("ready")) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error(`child exited before taking the lock: ${output}`);
+    output += new TextDecoder().decode(value);
+  }
+  reader.releaseLock();
+  return { exited: child.exited };
+}
+
+/** A raw connection: `openDatabase` would itself reconcile the triggers. */
+function rawConnection(path: string): Database {
+  const database = new Database(path);
+  database.exec("PRAGMA busy_timeout = 5000");
+  return database;
+}
+
+const SET_MARKER = `INSERT INTO sync_meta (key, value) VALUES ('${MIRROR_SYNC_ENABLED}', 'other process')`;
+
+describe("races with another process", () => {
+  test(
+    "ensureMirrorTriggers re-plans under the lock: an enable committed after its first look keeps the triggers",
+    withDirectory(async (path) => {
+      // Triggers installed, marker gone: a plan made now drops all 18.
+      const setup = openDatabase(path);
+      enableMirrorSync(setup);
+      setup.query("DELETE FROM sync_meta WHERE key = ?").run(MIRROR_SYNC_ENABLED);
+      setup.close();
+
+      const reader = rawConnection(path);
+      const other = await commitFromAnotherProcess(path, SET_MARKER, 400);
+      ensureMirrorTriggers(reader);
+      expect(await other.exited).toBe(0);
+      expect(isMirrorSyncEnabled(reader)).toBe(true);
+      expect(installedTriggers(reader)).toEqual(expectedTriggers());
+      reader.close();
+    }),
+  );
+
+  test(
+    "enableMirrorSync re-checks the marker under the lock: losing the race is a no-op, not a UNIQUE error",
+    withDirectory(async (path) => {
+      openDatabase(path).close();
+      const loser = rawConnection(path);
+      const other = await commitFromAnotherProcess(path, SET_MARKER, 400);
+      expect(enableMirrorSync(loser)).toBe(false);
+      expect(await other.exited).toBe(0);
+      expect(
+        loser.query("SELECT value FROM sync_meta WHERE key = ?").get(MIRROR_SYNC_ENABLED),
+      ).toEqual({ value: "other process" });
+      loser.close();
+    }),
+  );
+});
+
+describe("reconcile runs once per upgrade", () => {
+  test(
+    "only the last pending migration reconciles, never an intermediate one, and an unchanged reopen not at all",
+    withDirectory((path) => {
+      const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
+      seedMirrors(old);
+      old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
+      old.close();
+
+      // Two future migrations past 22; the one at 23 updates a mirror.
+      const chain = [
+        ...migrationFiles.loadMigrations(),
+        { version: 23, sql: "UPDATE gh_commits SET subject = subject || ' (23)';" },
+        { version: 24, sql: "SELECT 1;" },
+      ];
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
+      const original = triggers.reconcileMirrorTriggers;
+      const versionsAtReconcile: number[] = [];
+      const reconcile = spyOn(triggers, "reconcileMirrorTriggers").mockImplementation(
+        (database) => {
+          versionsAtReconcile.push(userVersion(database));
+          original(database);
+        },
+      );
+      try {
+        const upgraded = openDatabase(path, { hostSlug: "host-a" });
+        expect(userVersion(upgraded)).toBe(24);
+        // Inside 24's transaction, before its user_version bump.
+        expect(versionsAtReconcile).toEqual([23]);
+        expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
+        upgraded.close();
+
+        openDatabase(path, { hostSlug: "host-a" }).close();
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        reconcile.mockRestore();
+        load.mockRestore();
+      }
     }),
   );
 });

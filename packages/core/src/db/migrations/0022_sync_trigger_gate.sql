@@ -5,8 +5,8 @@
 -- a collector deleted, forever. From here on the triggers exist only on a
 -- database where sync has run: `sync_meta.mirror_sync_enabled` marks it, and
 -- `reconcileMirrorTriggers` (src/sync/triggers.ts), which database.ts runs
--- inside this same transaction, installs src/sync/mirror-triggers.sql when
--- the marker is set. `enableMirrorSync` sets it on the first sync run.
+-- inside the last pending migration's transaction (this one, while it is the
+-- newest), installs src/sync/mirror-triggers.sql when the marker is set. `enableMirrorSync` sets it on the first sync run.
 --
 -- A database that has already synced keeps its triggers and every pending
 -- row, event and tombstone exactly as they were. The engine writes

@@ -10,6 +10,7 @@ import { rebuildAll } from "../../src/intent/projections";
 import { ALL_PROJECTIONS, registerAllProjections } from "../../src/intent/projections/register";
 import type { RemoteStatement, SqlValue, SyncRemote } from "../../src/sync/engine";
 import { SYNCED_UPSERT_TABLES } from "../../src/sync/tables";
+import { enableMirrorSync } from "../../src/sync/triggers";
 
 /** In-process stand-in for sqld: the same SQL, run by bun:sqlite. */
 export class FakeRemote implements SyncRemote {
@@ -59,8 +60,17 @@ export function temporaryDirectory(prefix = "tempad-sync-test-"): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
+/**
+ * A host that syncs, opened with sync already enabled: its mirror triggers
+ * stamp every write from the start, so a test can stage a conflict by
+ * restamping a row before the host's first sync without that sync's enable
+ * backfill restamping it again. (`test/migration-0022.test.ts` covers hosts
+ * that write before sync is enabled.)
+ */
 export function openHost(directory: string, hostSlug: string): Database {
-  return openDatabase(join(directory, `${hostSlug}.db`), { hostSlug });
+  const database = openDatabase(join(directory, `${hostSlug}.db`), { hostSlug });
+  enableMirrorSync(database);
+  return database;
 }
 
 export function addRepository(

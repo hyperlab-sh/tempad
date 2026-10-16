@@ -149,25 +149,33 @@ export function ensureMirrorTriggers(database: Database): void {
   database.transaction(() => applyPlan(database, planTriggers(database))).immediate();
 }
 
+/**
+ * Restamps every row of one mirror as a write made now, the way the update
+ * trigger would: `MAX(now, old stamp + 1 ms)`, so a stamp never moves
+ * backwards, with `sync_host` = the local host and `sync_dirty = 1`.
+ */
 const MIRROR_BACKFILL = (table: string) =>
   `UPDATE ${table}
-      SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-          sync_host = COALESCE(sync_host, (SELECT host_slug FROM sync_local WHERE id = 1)),
-          sync_dirty = 1
-    WHERE sync_updated_at IS NULL`;
+      SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', sync_updated_at, '+0.001 seconds'), '')),
+          sync_host = COALESCE((SELECT host_slug FROM sync_local WHERE id = 1), sync_host),
+          sync_dirty = 1`;
 
 /**
  * Turns sync on for this database, once: in one IMMEDIATE transaction, sets
- * the marker, gives every mirror row written while the triggers were absent
- * (`sync_updated_at IS NULL`) the stamp, host and dirty flag the insert
- * trigger would have given it, and installs the triggers. Returns whether
- * this call did it; later calls are a read and a no-op.
+ * the marker, restamps every mirror row as written now (`MIRROR_BACKFILL`),
+ * and installs the triggers. Returns whether this call did it; later calls
+ * are a read and a no-op.
+ *
+ * Every row is restamped, not only those with no stamp. The marker is absent,
+ * so nothing on this host was ever pushed and every row is already dirty. But
+ * a row 0019 stamped (say Sept 1) and a collector changed while the triggers
+ * were absent (Oct 5) still carries the Sept 1 stamp, so on the first pull it
+ * would lose last-writer-wins to an older version another host pushed on
+ * Oct 1. Rows written while sync was off therefore count as written at enable
+ * time; `tempad sync` collects before it pushes, so they are fresh then.
  *
  * Rows deleted while sync was off get no tombstone: no remote has ever held
- * this database's rows, so there is nothing to delete remotely. Rows updated
- * while sync was off keep the stamp they had (0019 stamped every row it
- * found) and are still dirty, since nothing was ever pushed, so they are
- * pushed with the rest.
+ * this database's rows, so there is nothing to delete remotely.
  */
 export function enableMirrorSync(database: Database): boolean {
   if (isMirrorSyncEnabled(database)) return false;
