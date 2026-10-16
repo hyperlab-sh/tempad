@@ -7,6 +7,7 @@
  * module.
  */
 import type { Database, Statement } from "bun:sqlite";
+import { normalizeOffsetTimestamp } from "../collect/github/log";
 import { newUlid } from "../intent/ids";
 import { type RebuildOptions, rebuildAll } from "../intent/projections";
 import { registerAllProjections } from "../intent/projections/register";
@@ -813,6 +814,14 @@ class LocalApplier {
     }
 
     const data = JSON.parse(row.data as string) as Record<string, SqlValue>;
+    // Rows pushed before commit dates were stored as UTC (migration 0021) are still
+    // offset-form on the server, and reports compare these columns as text.
+    if (name === "gh_commits") {
+      for (const column of ["authored_at", "committed_at"]) {
+        const value = data[column];
+        if (typeof value === "string") data[column] = normalizeOffsetTimestamp(value);
+      }
+    }
     // Unknown pulled columns are dropped (safe because of the schema gate);
     // host-local columns are never written by a pull.
     const columns = Object.keys(data).filter((column) => shape.contentSet.has(column));

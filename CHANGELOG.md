@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- The GitHub collector's reconcile step compared `gh_commits.authored_at` to the window start as text. Rows stored before commit dates were normalized to UTC keep the author's offset (`2026-09-07T23:00:00-03:00`), so one near the window boundary could be skipped and its orphaned sha (after a history rewrite) never deleted. It now compares against a UTC-normalized bound, which is valid because every stored value is UTC: migration 0021 rewrites the legacy rows, and a pull rewrites any offset-form `gh_commits` dates that older pushes left on the sync server.
+
+### Migration
+
+- `0021_normalize_commit_dates.sql` rewrites legacy offset-form `gh_commits.authored_at` and `committed_at` to UTC (`2026-09-08T02:00:00.000Z`), the form the collector writes today. Rows already in UTC are untouched, a second run changes nothing, and push-sync state (`sync_updated_at`, `sync_host`, `sync_dirty`) is left as it was.
+
 ## [0.1.1] - 2026-10-16
 
 ### Added

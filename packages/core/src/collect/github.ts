@@ -4,7 +4,7 @@ import type { LoadedConfig } from "../config/env.ts";
 import { loadRules, resolveRepository } from "../config/rules.ts";
 import { getSyncState, setSyncState } from "../db/sync-state.ts";
 import { discoverRepositories } from "./github/discover.ts";
-import { commitExists, logCommits, refsContaining } from "./github/log.ts";
+import { commitExists, logCommits, refsContaining, toUtcIso } from "./github/log.ts";
 import { mirrorRepository } from "./github/mirror.ts";
 import { fetchFirstAuthoredAt, fetchPullRequests } from "./github/pull-requests.ts";
 import type { CommandRunner } from "./github/request.ts";
@@ -308,9 +308,15 @@ export function createGithubCollector(
           else if (outcome === "updated") updated++;
         }
 
+        // Text comparison on the `gh_commits_authored` index. Every stored value is in
+        // the `...sssZ` form `toUtcIso` writes: migration 0021 rewrote the legacy offset
+        // rows and the pull applier normalizes any that arrive from the server later.
+        // `toUtcIso(lower)` is defensive: `lower` is already UTC `toISOString()` output or a
+        // validated `YYYY-MM-DD`, which sorts below every `YYYY-MM-DDT...Z`, so today it
+        // changes nothing. Correctness comes from 0021 plus the applier, not from this call.
         const storedShas = database
           .query(`SELECT sha FROM gh_commits WHERE repo = ? AND authored_at >= ?`)
-          .all(repository.fullName, lower) as { sha: string }[];
+          .all(repository.fullName, toUtcIso(lower)) as { sha: string }[];
 
         for (const { sha } of storedShas) {
           const exists = await commitExists(mirrorResult.path, sha, dependencies.runner);

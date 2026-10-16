@@ -297,6 +297,59 @@ describe("two hosts", () => {
     });
   });
 
+  test("a pulled gh_commits row in legacy offset form is stored in UTC, clean, and not pushed back", async () => {
+    addRepository(hostA, "acme/web");
+    addCommit(hostA, "c1", "acme/web", "legacy");
+    addCommit(hostA, "c2", "acme/web", "already utc");
+    await sync(hostA, remote, "host-a");
+
+    // What a host that pushed before commit dates were stored as UTC left on the server.
+    remote.database
+      .query(
+        `UPDATE sync_rows
+            SET data = json_set(data, '$.authored_at', '2026-10-01T07:00:00-03:00',
+                                      '$.committed_at', '2026-10-01T19:30:00+09:30')
+          WHERE tbl = 'gh_commits' AND pk = json_array('c1')`,
+      )
+      .run();
+    const serverRow = remote.database
+      .query("SELECT sync_host, sync_updated_at FROM sync_rows WHERE tbl = 'gh_commits' AND pk = ?")
+      .get('["c1"]') as { sync_host: string; sync_updated_at: string };
+
+    const summary = await sync(hostB, remote, "host-b");
+    expect(summary.pulled.rows).toBeGreaterThan(0);
+
+    expect(
+      hostB.query("SELECT sha, authored_at, committed_at FROM gh_commits ORDER BY sha").all(),
+    ).toEqual([
+      {
+        sha: "c1",
+        authored_at: "2026-10-01T10:00:00.000Z",
+        committed_at: "2026-10-01T10:00:00.000Z",
+      },
+      {
+        sha: "c2",
+        authored_at: "2026-10-01T10:00:00.000Z",
+        committed_at: "2026-10-01T10:00:00.000Z",
+      },
+    ]);
+    // The pull's own stamp and host survive: nothing restamped, nothing dirty, no tombstone.
+    expect(
+      hostB
+        .query("SELECT sync_host, sync_updated_at, sync_dirty FROM gh_commits WHERE sha = 'c1'")
+        .get(),
+    ).toEqual({
+      sync_host: serverRow.sync_host,
+      sync_updated_at: serverRow.sync_updated_at,
+      sync_dirty: 0,
+    });
+    expect(hostB.query("SELECT COUNT(*) AS n FROM sync_tombstones").get()).toEqual({ n: 0 });
+
+    // A second run on B pushes nothing: the normalized pull is not a local change.
+    const again = await sync(hostB, remote, "host-b");
+    expect(again.pushed).toEqual({ events: 0, rows: 0, tombstones: 0 });
+  });
+
   test("a pulled column the local schema lacks is dropped", async () => {
     addRepository(hostA, "acme/web");
     await sync(hostA, remote, "host-a");

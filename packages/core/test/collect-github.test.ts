@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,6 +27,43 @@ function daysAgo(days: number, offsetHours = 0): string {
   const hours = String(Math.abs(offsetHours)).padStart(2, "0");
   const wallClock = new Date(instant + offsetHours * 60 * 60 * 1000).toISOString();
   return `${wallClock.slice(0, -1)}${sign}${hours}:00`;
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+const NORMALIZE_COMMIT_DATES_SQL = readFileSync(
+  join(import.meta.dir, "../src/db/migrations/0021_normalize_commit_dates.sql"),
+  "utf8",
+);
+
+/**
+ * Replays migration 0021 over rows planted after the database was opened, the way an
+ * upgrade rewrites a database that was written by a release before b699db6.
+ */
+function migrateLegacyDates(database: Database): void {
+  database.exec(NORMALIZE_COMMIT_DATES_SQL);
+}
+
+/**
+ * Inserts a `gh_commits` row for a sha that is in no mirror, with `authored_at`
+ * and `committed_at` in git's offset form (`...-03:00`) the way releases before
+ * b699db6 stored them: the same instant as `instantMs`, rendered at `offsetHours`.
+ */
+function plantLegacyOrphan(
+  database: Database,
+  sha: string,
+  instantMs: number,
+  offsetHours: number,
+): void {
+  const sign = offsetHours < 0 ? "-" : "+";
+  const wallClock = new Date(instantMs + offsetHours * HOUR_MS).toISOString().slice(0, 19);
+  const stored = `${wallClock}${sign}${String(Math.abs(offsetHours)).padStart(2, "0")}:00`;
+  database
+    .query(
+      `INSERT INTO gh_commits (sha, repo, branches, author_name, author_email, authored_at, committed_at, subject, body)
+       VALUES (?, 'Mosaicstg/LiUNA-Campaigns', '["main"]', 'S', 'me@saulo.engineer', ?, ?, 'orphan', NULL)`,
+    )
+    .run(sha, stored, stored);
 }
 
 const FIXTURES_DIR = join(import.meta.dir, "fixtures/github");
@@ -491,6 +529,92 @@ describe("github collector", () => {
         .query("SELECT COUNT(*) AS n FROM gh_commits WHERE repo = ?")
         .get("Mosaicstg/LiUNA-Campaigns") as { n: number };
       expect(count.n).toBe(3);
+
+      database.close();
+    } finally {
+      rmSync(homeDirectory, { recursive: true, force: true });
+      rmSync(sourceDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("reconcile after 0021: a legacy offset-form row is in or out of the window by its real time", async () => {
+    const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
+    const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
+    const sourceDirectory = await buildRepository([
+      { ...author, message: "live", date: daysAgo(1), files: { "a.md": "a" } },
+    ]);
+
+    try {
+      const database = openDatabase(join(homeDirectory, "tempad.db"));
+      const config = baseConfig(homeDirectory);
+      const collector = createGithubCollector({
+        fetch: makeFetch(),
+        runner: makeRunner({ source: sourceDirectory }),
+      });
+      await collector.sync(database, config, {});
+
+      // Pin the window so both planted rows sit one hour either side of its lower bound.
+      const lastSyncMs = Math.floor((Date.now() - DAY_MS) / 1000) * 1000;
+      database
+        .query("UPDATE sync_state SET last_sync_at = ? WHERE source = 'github'")
+        .run(new Date(lastSyncMs).toISOString());
+      const lowerMs = lastSyncMs - 7 * DAY_MS;
+      // Orphans as a pre-b699db6 release stored them (see `plantLegacyOrphan`). Left in
+      // offset form, -03:00 wall clock sorts BELOW the UTC bound although the instant is
+      // inside the window, and +09:00 sorts ABOVE it although the instant is outside;
+      // 0021 puts both on the instant, and reconcile compares text from there.
+      plantLegacyOrphan(database, "1".repeat(40), lowerMs + HOUR_MS, -3);
+      plantLegacyOrphan(database, "2".repeat(40), lowerMs - HOUR_MS, 9);
+      migrateLegacyDates(database);
+
+      const summary = await collector.sync(database, config, {});
+      expect(summary.deleted).toBe(1);
+
+      const survivors = (
+        database.query("SELECT sha FROM gh_commits WHERE subject = 'orphan'").all() as {
+          sha: string;
+        }[]
+      ).map((row) => row.sha);
+      expect(survivors).toEqual(["2".repeat(40)]);
+
+      database.close();
+    } finally {
+      rmSync(homeDirectory, { recursive: true, force: true });
+      rmSync(sourceDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("reconcile after 0021 with a date-only `since` keeps normalized rows in the window (regression guard; passes without toUtcIso)", async () => {
+    const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
+    const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
+    const sourceDirectory = await buildRepository([
+      { ...author, message: "live", date: daysAgo(1), files: { "a.md": "a" } },
+    ]);
+
+    try {
+      const database = openDatabase(join(homeDirectory, "tempad.db"));
+      const config = baseConfig(homeDirectory); // since: "2026-08-01"
+      const collector = createGithubCollector({
+        fetch: makeFetch(),
+        runner: makeRunner({ source: sourceDirectory }),
+      });
+      await collector.sync(database, config, {});
+
+      // No sync_state: the window starts at `since` itself, a bare date.
+      database.query("DELETE FROM sync_state WHERE source = 'github'").run();
+      const sinceMs = Date.parse("2026-08-01T00:00:00.000Z");
+      plantLegacyOrphan(database, "1".repeat(40), sinceMs + HOUR_MS, -3); // 2026-07-31T22:00-03:00
+      plantLegacyOrphan(database, "2".repeat(40), sinceMs - HOUR_MS, 9); // 2026-08-01T08:00+09:00
+      migrateLegacyDates(database);
+
+      const summary = await collector.sync(database, config, {});
+      expect(summary.deleted).toBe(1);
+      const survivors = (
+        database.query("SELECT sha FROM gh_commits WHERE subject = 'orphan'").all() as {
+          sha: string;
+        }[]
+      ).map((row) => row.sha);
+      expect(survivors).toEqual(["2".repeat(40)]);
 
       database.close();
     } finally {

@@ -17,8 +17,23 @@ const FIELD_SEP = "\x1f";
 const RECORD_SEP = "\x1e";
 const LOG_FORMAT = ["%H", "%an", "%ae", "%aI", "%cI", "%s", "%b"].join(FIELD_SEP);
 
-function toUtcIso(dateString: string): string {
+export function toUtcIso(dateString: string): string {
   return new Date(dateString).toISOString();
+}
+
+// What git's %aI / %cI emit for a non-UTC author: a colon-separated numeric offset.
+// Mirrors the GLOB in migration 0021_normalize_commit_dates.sql.
+const OFFSET_SUFFIX = /[-+]\d{2}:\d{2}$/;
+
+/**
+ * Rewrites a legacy offset-form timestamp (`2026-09-07T23:00:00-03:00`) to the UTC
+ * form the collector writes (`2026-09-08T02:00:00.000Z`). Anything else, including a
+ * value that ends in an offset but does not parse, is returned as it came.
+ */
+export function normalizeOffsetTimestamp(value: string): string {
+  if (!OFFSET_SUFFIX.test(value)) return value;
+  const instant = new Date(value);
+  return Number.isNaN(instant.getTime()) ? value : instant.toISOString();
 }
 
 function parseShortstat(line: string | undefined): {
