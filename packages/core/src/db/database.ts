@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { encodeTime } from "ulid";
+import { normalizeOffsetTimestamp } from "../collect/github/log";
 import { ulidAfter } from "../intent/ids";
 import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
 import { loadMigrations, type MigrationFile } from "./migration-files";
@@ -251,6 +252,87 @@ function backfillEventUids(database: Database): void {
   run.immediate();
 }
 
+interface CommitDateRow {
+  rowid: number;
+  authored_at: string;
+  committed_at: string;
+  sync_updated_at: string | null;
+}
+
+const OFFSET_FORM_COMMITS = `
+  SELECT rowid, authored_at, committed_at, sync_updated_at
+    FROM gh_commits
+   WHERE authored_at GLOB '*[-+][0-9][0-9]:[0-9][0-9]'
+      OR committed_at GLOB '*[-+][0-9][0-9]:[0-9][0-9]'`;
+
+function wideOffsetCommitChanges(rows: CommitDateRow[]) {
+  return rows
+    .map((row) => ({
+      row,
+      authoredAt: normalizeOffsetTimestamp(row.authored_at),
+      committedAt: normalizeOffsetTimestamp(row.committed_at),
+    }))
+    .filter(
+      (change) =>
+        change.authoredAt !== change.row.authored_at ||
+        change.committedAt !== change.row.committed_at,
+    );
+}
+
+/**
+ * Finishes migration 0021 for the commit dates SQLite could not convert.
+ *
+ * 0021 rewrites `gh_commits.authored_at`/`committed_at` from offset form to UTC
+ * with `strftime`, which returns NULL for an offset of +-15:00 or more, so its
+ * COALESCE kept the original text. `toUtcIso` and `LocalApplier.applyRow` (both
+ * `new Date(...).toISOString()`) accept offsets up to +-23:59, so a peer pulling
+ * the same row stores UTC and two hosts would hold different text for one
+ * instant. Real git never emits such an offset; it appears only in imported
+ * history. JavaScript is the canonical form (it is what the collector and the
+ * pull write), so this rewrites whatever 0021 left with the same function,
+ * `normalizeOffsetTimestamp`, and one instant has one text on every host.
+ *
+ * Sync: like 0021, this is a pure function of the stored value, so every host
+ * reaches the same text alone and nothing is pushed for it. `gh_commits_sync_update`
+ * fires only while the stamp is unchanged, so each row's stamp is moved in the
+ * same statement and put back in a second one (both are stamp changes, so
+ * neither fires it). `sync_host` and `sync_dirty` are never written: a row
+ * pushed before stays clean, a row not yet pushed stays dirty and goes out
+ * normalized. A pull winning over such a row, or the reverse, compares equal
+ * text under an equal stamp, so there is nothing to loop on.
+ *
+ * Runs once, as the TypeScript half of migration 0023 (`MIGRATION_STEPS`), inside
+ * `applyMigrations`' IMMEDIATE transaction: the rewrite commits atomically with
+ * the version bump, the migration lock serializes two processes, and every later
+ * open costs nothing (it is never scanned for again). A backup restored from
+ * below 23 reruns it. A value that ends in an offset but does not parse stays as
+ * it is.
+ */
+function normalizeWideOffsetCommitDates(database: Database): void {
+  const changes = wideOffsetCommitChanges(
+    database.query(OFFSET_FORM_COMMITS).all() as CommitDateRow[],
+  );
+  const rewrite = database.query(
+    "UPDATE gh_commits SET authored_at = ?, committed_at = ?, sync_updated_at = ? WHERE rowid = ?",
+  );
+  const restore = database.query("UPDATE gh_commits SET sync_updated_at = ? WHERE rowid = ?");
+  for (const { row, authoredAt, committedAt } of changes) {
+    // The marker is no stamp a real row holds (`...Z`), so it always differs.
+    rewrite.run(authoredAt, committedAt, `${row.sync_updated_at ?? ""}~`, row.rowid);
+    restore.run(row.sync_updated_at, row.rowid);
+  }
+}
+
+/**
+ * TypeScript halves of migrations, keyed by version. `applyMigrations` runs
+ * each right after that migration's SQL, inside the same transaction, so a throw
+ * rolls back the SQL, the step and the version bump together. For a rewrite SQL
+ * cannot express exactly.
+ */
+const MIGRATION_STEPS: Readonly<Record<number, (database: Database) => void>> = {
+  23: normalizeWideOffsetCommitDates,
+};
+
 /**
  * Runs `migrations` (ascending) and the `user_version` bump inside a single
  * transaction, so a failure part-way through leaves the database exactly as
@@ -274,6 +356,9 @@ function backfillEventUids(database: Database): void {
  * installed, so committing them separately opens no gap and keeps their
  * progress on a later failure, while the block from the gate is the stretch
  * whose intermediate commits would expose a database with no triggers.
+ *
+ * A migration's TypeScript half (`MIGRATION_STEPS`) runs right after its SQL,
+ * inside the same transaction.
  *
  * With `reconcileTriggers`, `reconcileMirrorTriggers` runs once after the last
  * migration's SQL, before the version bump and the commit.
@@ -301,7 +386,10 @@ function applyMigrations(
       database.exec("ROLLBACK");
       return;
     }
-    for (const migration of due) runMigration(database, migration.sql);
+    for (const migration of due) {
+      runMigration(database, migration.sql);
+      MIGRATION_STEPS[migration.version]?.(database);
+    }
     if (options.reconcileTriggers) reconcileMirrorTriggers(database);
     database.exec(`PRAGMA user_version = ${last.version};`);
     database.exec("COMMIT");

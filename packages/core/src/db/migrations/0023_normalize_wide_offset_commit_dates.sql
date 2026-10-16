@@ -1,0 +1,19 @@
+-- Normalize gh_commits dates with a UTC offset of +-15:00 or more.
+--
+-- Migration 0021 rewrote offset-form commit dates to UTC with SQLite's
+-- strftime, which returns NULL for an offset of +-15:00 or more (and its
+-- COALESCE kept the original text). JavaScript's toISOString, which the
+-- collector (toUtcIso) and the pull path (normalizeOffsetTimestamp) use,
+-- accepts offsets up to +-23:59, so a host that pulled such a row stored UTC
+-- while the rewritten host kept offset text: two texts for one instant. Git
+-- never emits such offsets; imported history can.
+--
+-- SQL cannot produce the JavaScript form for those values, so this migration
+-- has no statements. Its work is the TypeScript step registered for version 23
+-- in MIGRATION_STEPS (src/db/database.ts, normalizeWideOffsetCommitDates),
+-- which applyMigrations runs right after this file inside the same IMMEDIATE
+-- transaction as the user_version bump. It therefore runs once per database
+-- (a backup restored from below 23 reruns it), costs nothing on later opens,
+-- and rolls back with the version if it fails. It restamps and dirties
+-- nothing; see the function for why that is safe for sync.
+SELECT 1;

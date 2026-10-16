@@ -164,7 +164,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
 
   test("a fresh database has no mirror triggers: no stamps, no tombstones", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
-    expect(userVersion(database)).toBe(22);
+    expect(userVersion(database)).toBe(23);
     expect(isMirrorSyncEnabled(database)).toBe(false);
     expect(installedTriggers(database)).toEqual({});
 
@@ -194,7 +194,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
       old.close();
 
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(22);
+      expect(userVersion(database)).toBe(23);
       expect(isMirrorSyncEnabled(database)).toBe(false);
       expect(installedTriggers(database)).toEqual({});
       expect(syncState(database)).toEqual({ ...before, tombstones: [] });
@@ -247,7 +247,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
         old.close();
 
         const database = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(database)).toBe(22);
+        expect(userVersion(database)).toBe(23);
         expect(isMirrorSyncEnabled(database)).toBe(true);
         expect(installedTriggers(database)).toEqual(triggers);
         expect(syncState(database)).toEqual(before);
@@ -502,7 +502,7 @@ describe("offline report output", () => {
       old.close();
 
       const migrated = openDatabase(path, { hostSlug: "test-host" });
-      expect(userVersion(migrated)).toBe(22);
+      expect(userVersion(migrated)).toBe(23);
       expect(render(migrated)).toEqual(before);
       migrated.close();
 
@@ -705,7 +705,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       const observations: Observation[] = [];
       const chain = [
         ...migrationFiles.loadMigrations(),
-        observedMigration(23, "UPDATE gh_commits SET subject = subject || ' (23)';", () =>
+        observedMigration(24, "UPDATE gh_commits SET subject = subject || ' (23)';", () =>
           observations.push(observeFromAnotherConnection(path)),
         ),
       ];
@@ -720,12 +720,12 @@ describe("migrations from 22 on apply as one transaction", () => {
             write: "blocked",
           });
         }
-        expect(userVersion(upgraded)).toBe(23);
+        expect(userVersion(upgraded)).toBe(24);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
         expect(
           upgraded.query("SELECT 1 FROM gh_repos WHERE full_name = 'acme/during-upgrade'").get(),
         ).toBeNull();
-        // 0023's update ran with the triggers installed: stamped, tagged, dirty.
+        // 0024's update ran with the triggers installed: stamped, tagged, dirty.
         expect(
           upgraded.query("SELECT subject, sync_host, sync_dirty FROM gh_commits").all(),
         ).toEqual([{ subject: "fix it (23)", sync_host: "host-a", sync_dirty: 1 }]);
@@ -747,7 +747,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       const chain = [
         ...migrationFiles.loadMigrations(),
-        { version: 23, sql: "UPDATE no_such_table SET x = 1;" },
+        { version: 24, sql: "UPDATE no_such_table SET x = 1;" },
       ];
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
       try {
@@ -765,7 +765,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       // The real chain still upgrades it afterwards.
       const upgraded = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(upgraded)).toBe(22);
+      expect(userVersion(upgraded)).toBe(23);
       expect(isMirrorSyncEnabled(upgraded)).toBe(true);
       expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
       upgraded.close();
@@ -779,7 +779,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       const chain = [
         ...migrationFiles.loadMigrations(),
-        { version: 23, sql: "UPDATE no_such_table SET x = 1;" },
+        { version: 24, sql: "UPDATE no_such_table SET x = 1;" },
       ];
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
       try {
@@ -789,7 +789,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       }
 
       const raw = rawConnection(path);
-      // 19, 20 and 21 committed one by one; 22 and 23 rolled back as one.
+      // 19, 20 and 21 committed one by one; 22, 23 and 24 rolled back as one.
       expect(userVersion(raw)).toBe(21);
       expect(installedTriggers(raw)).toEqual(expectedTriggers());
       raw.close();
@@ -809,13 +809,13 @@ describe("migrations from 22 on apply as one transaction", () => {
       // runMigration tolerates as a duplicate).
       const chain = [
         ...migrationFiles.loadMigrations(),
-        { version: 23, sql: "CREATE TABLE t23 (x);" },
-        { version: 24, sql: "CREATE TABLE t24 (x);" },
+        { version: 24, sql: "CREATE TABLE t23 (x);" },
+        { version: 25, sql: "CREATE TABLE t24 (x);" },
       ];
       // Another process got 22 and 23 in after this one read user_version 21.
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => {
         load.mockImplementation(() => chain);
-        openDatabase(path, { hostSlug: "host-a", upToVersion: 23 }).close();
+        openDatabase(path, { hostSlug: "host-a", upToVersion: 24 }).close();
         return chain;
       });
       const original = triggers.reconcileMirrorTriggers;
@@ -824,7 +824,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       );
       try {
         const upgraded = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(upgraded)).toBe(24);
+        expect(userVersion(upgraded)).toBe(25);
         // Once at the end of the other process's 22..23, once here after 24.
         expect(reconcile).toHaveBeenCalledTimes(2);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());

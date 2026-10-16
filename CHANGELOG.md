@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Commit dates with a UTC offset of +-15:00 or more (never emitted by git, only by imported history) were left in offset form by migration 0021, because SQLite's `strftime` returns NULL for them, while a host that pulled the same row stored UTC. Migration 0023 now rewrites them to the same UTC text, once, atomically with the version bump, without restamping or re-dirtying the row, so every host holds one text per instant and later opens pay nothing.
+
 ## [0.2.0] - 2026-10-16
 
 ### Added
