@@ -33,8 +33,8 @@ describe("release: package and plugin versions", () => {
     expect(plugin.version).toBe(manifest.version);
   });
 
-  test("both are named tempad", () => {
-    expect(manifest.name).toBe("tempad");
+  test("the npm package is scoped, the plugin is named tempad", () => {
+    expect(manifest.name).toBe("@hyperlab.sh/tempad");
     expect(plugin.name).toBe("tempad");
   });
 });

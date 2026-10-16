@@ -1,5 +1,5 @@
 {
-  "name": "tempad",
+  "name": "@hyperlab.sh/tempad",
   "version": "0.1.0",
   "description": "Reconstructs work history hour by hour from git, Monday.com and Claude Code sessions into SQLite, then generates timesheet reports.",
   "license": "MIT",
@@ -31,6 +31,9 @@
   },
   "bin": {
     "tempad": "./src/cli.ts"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "src",
