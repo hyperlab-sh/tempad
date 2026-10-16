@@ -1,7 +1,7 @@
 {
   "name": "tempad",
-  "version": "0.1.0",
-  "description": "Reconstructs work history hour by hour from git, Monday.com and Claude Code sessions. Adds the tempad-quest skill and hooks that keep each session's quest declared.",
+  "version": "0.1.1",
+  "description": "Reconstructs work history hour by hour from git, Monday.com and Claude Code sessions. Adds the quest and setup skills and hooks that keep each session's quest declared.",
   "author": {
     "name": "Saulo Vallory",
     "email": "me@saulo.engineer"

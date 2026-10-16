@@ -44,7 +44,7 @@ TemPad is a self-awareness tool, not a surveillance tool. It exists to show what
 
 Rule of thumb: Sagas give direction, Quests are planned, Stints are what happened, Maneuvers are how, Traces are the proof, Places are where, Tools are how, Projects are whose and what for.
 
-Sagas, quests and stints come from the `w5` hook and the `tempad-quest` skill (see [Declaring quests](#declaring-quests)).
+Sagas, quests and stints come from the `w5` hook and the `quest` skill (see [Declaring quests](#declaring-quests)).
 
 ## Features
 
@@ -59,41 +59,59 @@ Sagas, quests and stints come from the `w5` hook and the `tempad-quest` skill (s
 
 Requires [Bun](https://bun.sh) 1.3.14 or newer and [Claude Code](https://claude.com/claude-code). The [GitHub CLI](https://cli.github.com) (`gh`) is optional: without a `GH_TOKEN`, GitHub sync uses its credentials.
 
-1. **Install the Claude Code plugin** (the `tempad-quest` skill and the w5 hooks):
+1. **Add the marketplace:**
 
    ```sh
    claude plugin marketplace add hyperlab-sh/claude-plugins
+   ```
+
+2. **Install the plugin** (the `quest` and `setup` skills and the w5 hooks):
+
+   ```sh
    claude plugin install tempad@hyperlab
    ```
 
-2. **Configure tempad.** This creates `~/.tempad/.env` and `tempad.toml`:
+3. **Run `/tempad:setup` in Claude Code.** It checks for bun, installs the `tempad` CLI globally, asks for your settings, writes `~/.tempad/.env` and `tempad.toml`, and verifies the result. Secrets are passed through the environment and never echoed.
 
-   ```sh
-   bunx @hyperlab.sh/tempad init
-   ```
+Then sync and report:
 
-3. **Sync and report:**
+```sh
+tempad hero init "Your Name"
+tempad sync
+tempad report daily --from 2026-08-18 --to 2026-08-28
+```
 
-   ```sh
-   bunx @hyperlab.sh/tempad hero init "Your Name"
-   bunx @hyperlab.sh/tempad sync
-   bunx @hyperlab.sh/tempad report daily --from 2026-08-18 --to 2026-08-28
-   ```
+Reports are printed and written to `~/.tempad/reports/`.
 
-   Reports are printed and written to `~/.tempad/reports/`.
+### Optional: use the CLI directly
 
-The CLI is published to npm as [`@hyperlab.sh/tempad`](https://www.npmjs.com/package/@hyperlab.sh/tempad); `bunx @hyperlab.sh/tempad` runs it without a global install. `bun add -g @hyperlab.sh/tempad` installs a `tempad` command if you prefer one on your `PATH`, and the plugin's hooks and skill use it when present.
+The CLI is published to npm as [`@hyperlab.sh/tempad`](https://www.npmjs.com/package/@hyperlab.sh/tempad). Without Claude Code:
+
+```sh
+bun add -g @hyperlab.sh/tempad
+tempad setup
+```
+
+`bunx @hyperlab.sh/tempad <command>` runs it once without installing. The plugin's hooks and skills use `tempad` when it is on your `PATH`, else `bunx`.
+
+### Other agents (Codex, Cursor, etc.)
+
+The `quest` skill is plain `SKILL.md`; install it with the [skills](https://github.com/vercel-labs/skills) CLI:
+
+```sh
+npx skills add hyperlab-sh/tempad --skill quest
+```
 
 ### What the plugin installs
 
-- The **`tempad-quest` skill**, which has the session declare which quest it is pursuing (`tempad quest declare`) so work is tracked under the right outcome instead of guessed.
+- The **`quest` skill** (`/tempad:quest`), which has the session declare which quest it is pursuing (`tempad quest declare`) so work is tracked under the right outcome instead of guessed.
 - **Hooks** on `Stop`, `PreCompact`, `SessionEnd` and `UserPromptSubmit` that enqueue classification jobs and hand open doubts back to the session. They never block a session and are **silent until tempad is configured**: with no `~/.tempad/.env` or `tempad.db` they exit 0 with no output and create nothing.
 
 The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx @hyperlab.sh/tempad`.
 
-### `tempad init`
+### `tempad setup`
 
-`tempad init` prompts for every variable below (secrets are read without echo), suggesting a value where it can: the system time zone, the hostname, `git config user.email`, `~/.claude` for `CLAUDE_DIRS` (the Claude config directory, not its `projects/` subfolder; `$CLAUDE_CONFIG_DIR` when that is set and has `projects/`), `gh api user`. It then validates what it can cheaply, writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`, and prints the next steps. An existing `.env` is only updated after you confirm (non-interactive runs refuse unless `--force`), its values become the prompt suggestions, and an existing `tempad.toml` is kept. With `--force` both files are replaced without asking, and the old ones are left beside them as `.env.bak` and `tempad.toml.bak`. It never prints a secret.
+`tempad setup` (the old name `tempad init` still works) prompts for every variable below (secrets are read without echo), suggesting a value where it can: the system time zone, the hostname, `git config user.email`, `~/.claude` for `CLAUDE_DIRS` (the Claude config directory, not its `projects/` subfolder; `$CLAUDE_CONFIG_DIR` when that is set and has `projects/`), `gh api user`. It then validates what it can cheaply, writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`, and prints the next steps. An existing `.env` is only updated after you confirm (non-interactive runs refuse unless `--force`), its values become the prompt suggestions, and an existing `tempad.toml` is kept. With `--force` both files are replaced without asking, and the old ones are left beside them as `.env.bak` and `tempad.toml.bak`. It never prints a secret.
 
 | Flag                           | Effect                                                                                                                                                    |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -104,7 +122,7 @@ The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx @hyp
 | `--no-verify`                  | Skip the network and filesystem checks (Monday token, GitHub credentials, `CLAUDE_DIRS` exist); format checks (booleans, lists, `TZ`, `SINCE`) always run |
 
 ```sh
-bunx @hyperlab.sh/tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
+tempad setup --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
   --gh-user octocat --gh-orgs my-org --gh-include-personal false \
   --git-author-emails me@example.com --claude-dirs ~/.claude --host-slug laptop \
   --tz Europe/Berlin --since 2026-01-01
@@ -126,7 +144,7 @@ If you installed the hooks with `tempad w5 hook install` (they live in `~/.claud
 
 Settings are read from the real environment first, then `TEMPAD_HOME/.env`. A `.env` in the current directory is ignored on purpose: hooks run with your project as the working directory, and a project's `TZ` must not override yours.
 
-Each command checks only the variables it needs and fails naming the command and every missing variable, for example `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx @hyperlab.sh/tempad init`. Required variables have no defaults.
+Each command checks only the variables it needs and fails naming the command and every missing variable, for example `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run /tempad:setup in Claude Code, or `tempad setup` in a terminal`. Required variables have no defaults.
 
 | Variable              | Meaning                                                                   | Needed by                    |
 | --------------------- | ------------------------------------------------------------------------- | ---------------------------- |
@@ -144,7 +162,7 @@ Each command checks only the variables it needs and fails naming the command and
 
 `sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx @hyperlab.sh/tempad init`.
 
-`ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad init --force` keeps that line when it rewrites the file.
+`ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad setup --force` keeps that line when it rewrites the file.
 
 ### `tempad.toml`
 
@@ -198,7 +216,7 @@ tempad --help           # every command
 
 The w5 hook classifies through the local `claude` CLI (`[w5].backend = "claude-cli"`, the default) using whatever subscription you are logged into. Set `[w5].backend = "api"` in `tempad.toml` to call the Anthropic API directly instead (requires `ANTHROPIC_API_KEY`).
 
-In `declared` mode the session states its quest (the `tempad-quest` skill does this) and the classifier only verifies that each stretch of work serves it, asking you when it doubts. The design is in [`docs/specs`](docs/specs).
+In `declared` mode the session states its quest (the `quest` skill does this) and the classifier only verifies that each stretch of work serves it, asking you when it doubts. The design is in [`docs/specs`](docs/specs).
 
 ## Repository layout
 
