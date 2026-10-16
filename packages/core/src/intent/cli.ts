@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import type { Config } from "../config/env";
+import type { HomeConfig } from "../config/env";
 import { answerQuestion, assignStint, stateImpact, THEME_PATTERN } from "./api";
 import type { IntentConfig } from "./config";
 import {
@@ -23,7 +23,7 @@ registerAllProjections();
 
 export interface IntentContext {
   database: Database;
-  config: Config;
+  config: HomeConfig;
   intentConfig: IntentConfig;
   stdout: (line: string) => void;
 }

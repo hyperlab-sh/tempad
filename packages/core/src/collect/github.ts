@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { join } from "node:path";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import { loadRules, resolveRepository } from "../config/rules.ts";
 import { getSyncState, setSyncState } from "../db/sync-state.ts";
 import { discoverRepositories } from "./github/discover.ts";
@@ -218,10 +218,26 @@ function setFirstAuthoredAt(
     .run(firstAuthoredAt, updatedAt, repo, number);
 }
 
-export function createGithubCollector(dependencies: GithubCollectorDependencies): Collector {
+export const GITHUB_NEEDS = [
+  "ghUser",
+  "ghOrgs",
+  "ghIncludePersonal",
+  "ghToken",
+  "gitAuthorEmails",
+  "since",
+] as const;
+
+export function createGithubCollector(
+  dependencies: GithubCollectorDependencies,
+): Collector<(typeof GITHUB_NEEDS)[number]> {
   return {
     name: "github",
-    async sync(database: Database, config: Config, options: SyncOptions): Promise<SyncSummary> {
+    needs: GITHUB_NEEDS,
+    async sync(
+      database: Database,
+      config: LoadedConfig<(typeof GITHUB_NEEDS)[number]>,
+      options: SyncOptions,
+    ): Promise<SyncSummary> {
       const syncStart = new Date().toISOString();
       const syncState = getSyncState(database, "github");
       const lower = lowerBound(options.since ?? config.since, syncState?.lastSyncAt);

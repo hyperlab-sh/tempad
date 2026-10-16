@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import { projectLabel } from "./format.ts";
 import {
   queryDismissedMinutesByQuest,
@@ -97,7 +97,7 @@ const HEADERS = [
   "short work",
 ];
 
-function render(database: Database, config: Config, options: ReportOptions): string {
+function render(database: Database, config: LoadedConfig<"tz">, options: ReportOptions): string {
   const timeZone = config.tz;
   const days = dayRange(options.from, options.to);
   const intentDatabase = resolveIntentDatabase(database, options.asOf);

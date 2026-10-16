@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file
 import type { Database } from "bun:sqlite";
 import { copyFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,16 +7,33 @@ import { parseArgs } from "node:util";
 import { reresolveSessions as reresolveClaudeSessions } from "./collect/claude.ts";
 import { collectors } from "./collect/index.ts";
 import type { Collector, SyncSummary } from "./collect/types.ts";
-import { loadConfig } from "./config/env.ts";
+import {
+  ConfigError,
+  type ConfigKey,
+  ignoreWorkingDirectoryEnvFiles,
+  isConfigured,
+  type LoadedConfig,
+  loadConfig,
+  NOT_SET_UP_MESSAGE,
+  tempadHome,
+} from "./config/env.ts";
 import { deriveOrgProject, registerProject } from "./config/project-register.ts";
 import { loadRules, normalizePathForMatch } from "./config/rules.ts";
 import { openDatabase } from "./db/database.ts";
 import { setSyncState } from "./db/sync-state.ts";
 import { runIntentCommand } from "./intent/cli.ts";
 import { loadIntentConfig } from "./intent/config.ts";
+import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
-import { runQuietCommand, runReviewCommand, runW5Command } from "./w5/cli.ts";
+import {
+  planW5Command,
+  runQuietCommand,
+  runReviewCommand,
+  runW5Command,
+  runW5HookCommand,
+  type W5Context,
+} from "./w5/cli.ts";
 
 const INTENT_COMMANDS = new Set([
   "hero",
@@ -31,39 +48,77 @@ const INTENT_COMMANDS = new Set([
   "rebuild",
 ]);
 
+const USAGE_LINES: string[] = [
+  "Usage:",
+  "  tempad --help | -h | help",
+  "  tempad init   (create TEMPAD_HOME with .env and tempad.toml; not available yet)",
+  "  tempad sync [monday|github|claude] [--full]",
+  "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
+  '  tempad hero init "<name>"',
+  '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
+  '  tempad client add <slug> "<name>"',
+  '  tempad saga add --owner hero|party:<slug> "<title>" [--statement] | reword <id> "<title>" | replace <id> "<title>" --reason "..." | end <id> --reason ... | list [--all] [--as-of <iso>]',
+  '  tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment] | confirm|merge|pause|resume|done|abandon|branch|return <id> | list [--all] [--unconfirmed] [--side] [--as-of <iso>]',
+  '  tempad quest declare --session <id> (--quest <id> | --new "<title>" --outcome "<text>" | --done <quest>) [--plan "a; b; c"] ...',
+  "  tempad stint list [--open] [--quest <id>]",
+  "  tempad trace list [--since <iso>] [--stint <id>]",
+  '  tempad impact set <ref> "<text>" [--theme <t>] | list [--project <p>] [--from <date> --to <date>] | import <file.json>',
+  '  tempad answer <question-id> (--belongs | --quest <id|new:"title">) [--why "..."]',
+  "  tempad rebuild [--until <iso>]",
+  "  tempad w5 enqueue --session <id> [--forced]",
+  "  tempad w5 context --session <id>",
+  "  tempad w5 run [--detached]",
+  "  tempad w5 hook install|uninstall [--scope user|project]",
+  "  tempad w5 backfill [--days <n>] [--model <name>] [--force]",
+  "  tempad w5 dedupe [--dry-run]",
+  "  tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
+  "  tempad quiet <2h|30m>",
+  "  tempad review [--days <n>]",
+  "  tempad skill install [--scope user|project]",
+  '  tempad project register <path> --name "<display>" [--org <org>] [--project <slug>] | list | reresolve <path>',
+];
+
 function printUsage(): void {
-  console.error("Usage:");
-  console.error("  tempad sync [monday|github|claude] [--full]");
-  console.error(
-    "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
-  );
-  console.error('  tempad hero init "<name>"');
-  console.error(
-    '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
-  );
-  console.error('  tempad client add <slug> "<name>"');
-  console.error(
-    '  tempad saga add --owner hero|party:<slug> "<title>" [--statement] | reword <id> "<title>" | replace <id> "<title>" --reason "..." | end <id> --reason ... | list [--all] [--as-of <iso>]',
-  );
-  console.error(
-    '  tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment] | confirm|merge|pause|resume|done|abandon|branch|return <id> | list [--all] [--unconfirmed] [--side] [--as-of <iso>]',
-  );
-  console.error("  tempad stint list [--open] [--quest <id>]");
-  console.error("  tempad trace list [--since <iso>] [--stint <id>]");
-  console.error(
-    '  tempad impact set <ref> "<text>" [--theme <t>] | list [--project <p>] [--from <date> --to <date>] | import <file.json>',
-  );
-  console.error('  tempad answer <question-id> --quest <id|new:"title"> [--why "..."]');
-  console.error("  tempad rebuild [--until <iso>]");
-  console.error("  tempad skill install [--scope user|project]");
-  console.error(
-    '  tempad project register <path> --name "<display>" [--org <org>] [--project <slug>] | list | reresolve <path>',
-  );
+  for (const line of USAGE_LINES) console.error(line);
+}
+
+function printHelp(): void {
+  for (const line of USAGE_LINES) console.log(line);
+}
+
+/**
+ * Exit code 1 when `home` has neither `.env` nor `tempad.db`. Called before anything
+ * that opens the database so an unconfigured machine never gets `~/.tempad/tempad.db`
+ * created as a side effect.
+ */
+function assertConfigured(home: string): void {
+  if (!isConfigured(home)) throw new NotSetUpError();
+}
+
+class NotSetUpError extends Error {
+  constructor() {
+    super(NOT_SET_UP_MESSAGE);
+    this.name = "NotSetUpError";
+  }
+}
+
+/**
+ * Setup for a command that opens the database: the configured check first (so an
+ * unconfigured home is never written to), then the command's own environment needs,
+ * then the database.
+ */
+function prepareCommand<K extends ConfigKey>(
+  label: string,
+  needs: readonly K[],
+): { config: LoadedConfig<K>; database: Database } {
+  assertConfigured(tempadHome());
+  const config = loadConfig(label, needs);
+  return { config, database: openDatabase(join(config.home, "tempad.db")) };
 }
 
 export async function runSync(
   database: Database,
-  config: ReturnType<typeof loadConfig>,
+  config: LoadedConfig<ConfigKey>,
   selected: Collector[],
   full = false,
 ): Promise<{ summaries: SyncSummary[]; failed: boolean }> {
@@ -106,13 +161,17 @@ async function runSyncCommand(args: string[]): Promise<number> {
     return 2;
   }
 
-  const config = loadConfig();
-  const database = openDatabase(join(config.home, "tempad.db"));
-
   const selected: Collector[] =
     source !== undefined
       ? [collectors.get(source as Collector["name"]) as Collector]
       : [...collectors.values()];
+
+  // Only the selected collectors' variables are required, so `sync monday` works on a
+  // machine that has never configured GitHub. `runSync` types the result as the full
+  // config; each collector's own `LoadedConfig` is what it actually reads.
+  const needs = [...new Set(selected.flatMap((collector) => collector.needs))];
+  const label = source === undefined ? "tempad sync" : `tempad sync ${source}`;
+  const { config, database } = prepareCommand(label, needs);
 
   if (values.full) {
     const deleteSyncState = database.query("DELETE FROM sync_state WHERE source = ?");
@@ -171,8 +230,7 @@ async function runReportCommand(args: string[]): Promise<number> {
     return 2;
   }
 
-  const config = loadConfig();
-  const database = openDatabase(join(config.home, "tempad.db"));
+  const { config, database } = prepareCommand(`tempad report ${kind}`, ["tz"]);
   const report = reports.get(kind as Report["kind"]) as Report;
 
   const options: ReportOptions = {
@@ -314,8 +372,7 @@ export async function runProjectCommand(args: string[], context: ProjectContext)
 }
 
 async function runProjectDispatch(rest: string[]): Promise<number> {
-  const config = loadConfig();
-  const database = openDatabase(join(config.home, "tempad.db"));
+  const { config, database } = prepareCommand("tempad project", []);
   return runProjectCommand(rest, {
     database,
     tomlPath: join(config.home, "tempad.toml"),
@@ -326,8 +383,7 @@ async function runProjectDispatch(rest: string[]): Promise<number> {
 }
 
 async function runIntentDispatch(command: string, rest: string[]): Promise<number> {
-  const config = loadConfig();
-  const database = openDatabase(join(config.home, "tempad.db"));
+  const { config, database } = prepareCommand(`tempad ${command}`, []);
   const intentConfig = loadIntentConfig(join(config.home, "tempad.toml"));
   return runIntentCommand([command, ...rest], {
     database,
@@ -337,11 +393,31 @@ async function runIntentDispatch(command: string, rest: string[]): Promise<numbe
   });
 }
 
-async function runW5Dispatch(command: string, rest: string[]): Promise<number> {
-  const config = loadConfig();
-  const database = openDatabase(join(config.home, "tempad.db"));
+async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[]): Promise<number> {
+  const plan = planW5Command(command, rest);
+  if (plan === null) {
+    printUsage();
+    return 2;
+  }
+  // Editing settings.json needs neither configuration nor a database; it is also the
+  // migration step, so it must work on a machine tempad was never set up on.
+  if (!plan.opensDatabase) return runW5HookCommand(rest.slice(1));
+
+  // The hook-called commands never fail a session: on an unconfigured home they
+  // exit 0 without output and without creating anything.
+  if (plan.silentWhenUnconfigured && !isConfigured(tempadHome())) return 0;
+
+  const { config, database } = prepareCommand(plan.label, plan.needs);
+  // Projection tables are created lazily; the w5 commands read them, and a home that
+  // `tempad init` just set up has none yet. Intent commands do the same in runIntentCommand.
+  ensureTables(database);
   const intentConfig = loadIntentConfig(join(config.home, "tempad.toml"));
-  const context = { database, config, intentConfig, stdout: (line: string) => console.log(line) };
+  const context: W5Context = {
+    database,
+    config,
+    intentConfig,
+    stdout: (line: string) => console.log(line),
+  };
 
   if (command === "w5") return runW5Command(rest, context);
   if (command === "quiet") return runQuietCommand(rest, context);
@@ -349,8 +425,17 @@ async function runW5Dispatch(command: string, rest: string[]): Promise<number> {
   return 2;
 }
 
-async function main(): Promise<number> {
-  const [command, ...rest] = process.argv.slice(2);
+async function dispatch(command: string | undefined, rest: string[]): Promise<number> {
+  if (command === "--help" || command === "-h" || command === "help") {
+    printHelp();
+    return 0;
+  }
+  if (rest[0] === "--help" || rest[0] === "-h") {
+    printHelp();
+    return 0;
+  }
+
+  // `tempad init` is dispatched here, before anything reads configuration.
 
   if (command === "sync") {
     return runSyncCommand(rest);
@@ -373,6 +458,21 @@ async function main(): Promise<number> {
 
   printUsage();
   return 2;
+}
+
+async function main(): Promise<number> {
+  // The shebang passes --no-env-file; this covers `bun src/cli.ts`, which ignores it.
+  ignoreWorkingDirectoryEnvFiles();
+  const [command, ...rest] = process.argv.slice(2);
+  try {
+    return await dispatch(command, rest);
+  } catch (error) {
+    if (error instanceof ConfigError || error instanceof NotSetUpError) {
+      console.error(error.message);
+      return 1;
+    }
+    throw error;
+  }
 }
 
 if (import.meta.main) {

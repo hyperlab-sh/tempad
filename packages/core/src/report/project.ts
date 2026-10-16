@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import { type ImpactRow, queryImpacts } from "../intent/api.ts";
 import { formatEvidenceRef } from "../intent/evidence-ref.ts";
 import { projectLabel } from "./format.ts";
@@ -60,7 +60,7 @@ function inferBranch(branchesJson: string): string {
   );
 }
 
-function render(database: Database, config: Config, options: ReportOptions): string {
+function render(database: Database, config: LoadedConfig<"tz">, options: ReportOptions): string {
   const range = {
     from: options.from,
     to: options.to,

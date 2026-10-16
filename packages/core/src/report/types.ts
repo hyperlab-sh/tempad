@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 
 export interface ReportOptions {
   from: string;
@@ -14,5 +14,5 @@ export interface ReportOptions {
 
 export interface Report {
   kind: "daily" | "project" | "hourly" | "weekly";
-  render(database: Database, config: Config, options: ReportOptions): string;
+  render(database: Database, config: LoadedConfig<"tz">, options: ReportOptions): string;
 }

@@ -11,7 +11,7 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import type { SpawnFn } from "../../src/w5/cli";
-import { runReviewCommand, runW5Command } from "../../src/w5/cli";
+import { planW5Command, runReviewCommand, runW5Command } from "../../src/w5/cli";
 
 registerAllProjections();
 
@@ -55,6 +55,8 @@ describe("w5 enqueue", () => {
       expect(spawnCalls[0]?.detached).toBe(true);
       expect(spawnCalls[0]?.cmd).toContain("w5");
       expect(spawnCalls[0]?.cmd).toContain("run");
+      // The detached run inherits the hook's cwd (a user's project); its .env must not load.
+      expect(spawnCalls[0]?.cmd).toContain("--no-env-file");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -501,6 +503,81 @@ describe("tempad review", () => {
 
       expect(code).toBe(2);
       expect(lines.some((line) => line.includes("usage"))).toBe(true);
+    }
+  });
+});
+
+describe("planW5Command", () => {
+  test("w5 run needs CLAUDE_DIRS and HOST_SLUG fields, w5 eval needs tz, the rest nothing", () => {
+    expect(planW5Command("w5", ["run"])?.needs).toEqual(["claudeDirs", "hostSlug"]);
+    expect(planW5Command("w5", ["run", "--detached"])?.needs).toEqual(["claudeDirs", "hostSlug"]);
+    expect(planW5Command("w5", ["eval", "--from", "a"])?.needs).toEqual(["tz"]);
+    for (const subcommand of ["enqueue", "context", "backfill", "dedupe", "hook"]) {
+      expect(planW5Command("w5", [subcommand])?.needs).toEqual([]);
+    }
+    expect(planW5Command("quiet", ["2h"])?.needs).toEqual([]);
+    expect(planW5Command("review", [])?.needs).toEqual([]);
+  });
+
+  test("only enqueue and context are silent on an unconfigured home", () => {
+    const silent = ["enqueue", "context", "run", "backfill", "dedupe", "eval", "hook"].filter(
+      (subcommand) => planW5Command("w5", [subcommand])?.silentWhenUnconfigured,
+    );
+    expect(silent).toEqual(["enqueue", "context"]);
+    expect(planW5Command("quiet", ["2h"])?.silentWhenUnconfigured).toBe(false);
+    expect(planW5Command("review", [])?.silentWhenUnconfigured).toBe(false);
+  });
+
+  test("hook is the only w5 subcommand that opens no database", () => {
+    expect(planW5Command("w5", ["hook", "uninstall"])?.opensDatabase).toBe(false);
+    for (const subcommand of ["enqueue", "context", "run", "backfill", "dedupe", "eval"]) {
+      expect(planW5Command("w5", [subcommand])?.opensDatabase).toBe(true);
+    }
+    expect(planW5Command("quiet", ["2h"])?.opensDatabase).toBe(true);
+    expect(planW5Command("review", [])?.opensDatabase).toBe(true);
+  });
+
+  test("labels name the command as the user typed it", () => {
+    expect(planW5Command("w5", ["run"])?.label).toBe("tempad w5 run");
+    expect(planW5Command("quiet", ["30m"])?.label).toBe("tempad quiet");
+  });
+
+  test("an unknown or missing subcommand has no plan", () => {
+    expect(planW5Command("w5", ["frobnicate"])).toBeNull();
+    expect(planW5Command("w5", [])).toBeNull();
+  });
+});
+
+describe("w5 run / eval without the fields they need", () => {
+  test("w5 run throws a clear error when the dispatcher did not load CLAUDE_DIRS and HOST_SLUG", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    try {
+      await expect(
+        runW5Command(["run"], {
+          database: openDatabase(":memory:"),
+          config: { home: dir },
+          intentConfig: defaultIntentConfig(),
+          stdout: () => {},
+        }),
+      ).rejects.toThrow(/claudeDirs/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("w5 eval throws a clear error when the dispatcher did not load TZ", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    try {
+      await expect(
+        runW5Command(["eval", "--from", "2026-01-01", "--to", "2026-01-02"], {
+          database: openDatabase(":memory:"),
+          config: { home: dir },
+          intentConfig: defaultIntentConfig(),
+          stdout: () => {},
+        }),
+      ).rejects.toThrow(/tz/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

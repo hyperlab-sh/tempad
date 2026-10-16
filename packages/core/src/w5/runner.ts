@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { syncOneSessionFile } from "../collect/claude";
-import type { Config } from "../config/env";
+import type { LoadedConfig } from "../config/env";
 import type { W5Config } from "../intent/config";
 import { registerAllProjections } from "../intent/projections/register";
 import { EventStore } from "../intent/store";
@@ -85,7 +85,7 @@ function windowStartedAt(
 
 export async function runOnce(
   database: Database,
-  config: Config,
+  config: LoadedConfig<"claudeDirs" | "hostSlug">,
   intentConfig: W5Config,
   classifier: Classifier,
   options: RunOnceOptions,
@@ -179,7 +179,7 @@ export async function runOnce(
 
 export async function drain(
   database: Database,
-  config: Config,
+  config: LoadedConfig<"claudeDirs" | "hostSlug">,
   intentConfig: W5Config,
   classifier: Classifier,
   options: RunOnceOptions,

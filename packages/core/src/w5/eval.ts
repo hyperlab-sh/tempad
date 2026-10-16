@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import type { Config } from "../config/env";
+import type { HomeConfig } from "../config/env";
 import { openDatabase } from "../db/database";
 import { defaultIntentConfig } from "../intent/config";
 import { declareQuest } from "../intent/declarations";
@@ -57,21 +57,8 @@ export function validateEvalRange(from: string, to: string, timeZone = "UTC"): E
   return normalizeEvalRange(from, to, timeZone);
 }
 
-function minimalConfig(scratchDir: string): Config {
-  return {
-    mondayApiToken: "",
-    mondayUser: "",
-    ghUser: "",
-    ghOrgs: [],
-    ghIncludePersonal: false,
-    ghToken: undefined,
-    gitAuthorEmails: [],
-    claudeDirs: [],
-    hostSlug: "eval",
-    tz: "UTC",
-    since: "2020-01-01",
-    home: scratchDir,
-  };
+function minimalConfig(scratchDir: string): HomeConfig {
+  return { home: scratchDir };
 }
 
 export interface EvalOptions {

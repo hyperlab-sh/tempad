@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { ConfigKey, LoadedConfig } from "../config/env.ts";
 
 export interface SyncSummary {
   source: string;
@@ -15,7 +15,13 @@ export interface SyncOptions {
   full?: boolean;
 }
 
-export interface Collector {
+/**
+ * A collector declares the `Config` fields it reads in `needs`; `sync` receives
+ * exactly those, so reading anything else is a type error and `tempad sync <source>`
+ * asks the environment for nothing more.
+ */
+export interface Collector<K extends ConfigKey = ConfigKey> {
   name: "monday" | "github" | "claude";
-  sync(database: Database, config: Config, options: SyncOptions): Promise<SyncSummary>;
+  needs: readonly K[];
+  sync(database: Database, config: LoadedConfig<K>, options: SyncOptions): Promise<SyncSummary>;
 }

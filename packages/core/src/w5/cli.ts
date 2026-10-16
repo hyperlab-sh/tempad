@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
-import type { Config } from "../config/env";
+import { type Config, type ConfigKey, type HomeConfig, requireFields } from "../config/env";
 import type { IntentConfig } from "../intent/config";
 import { activeDeclaredQuests } from "../intent/declarations";
 import { backfill } from "./backfill";
@@ -31,9 +31,15 @@ export interface SpawnOptions {
 
 export type SpawnFn = (options: SpawnOptions) => void;
 
+/**
+ * What a w5 handler is handed: the home, plus whichever of these `planW5Command`
+ * said the subcommand needs. A handler that reads one goes through `requireFields`.
+ */
+export type W5RuntimeConfig = HomeConfig & Partial<Pick<Config, "claudeDirs" | "hostSlug" | "tz">>;
+
 export interface W5Context {
   database: Database;
-  config: Config;
+  config: W5RuntimeConfig;
   intentConfig: IntentConfig;
   stdout: (line: string) => void;
   spawn?: SpawnFn;
@@ -50,17 +56,21 @@ const defaultSpawn: SpawnFn = (options) => {
 
 const CLI_PATH = join(import.meta.dir, "..", "cli.ts");
 
-function logPath(config: Config): string {
+function logPath(config: HomeConfig): string {
   return join(config.home, "logs", "w5.log");
 }
 
-function log(config: Config, line: string): void {
+function log(config: HomeConfig, line: string): void {
   const path = logPath(config);
   mkdirSync(dirname(path), { recursive: true });
   appendFileSync(path, `${new Date().toISOString()} ${line}\n`);
 }
 
-function buildClassifier(config: Config, intentConfig: IntentConfig, model?: string): Classifier {
+function buildClassifier(
+  config: HomeConfig,
+  intentConfig: IntentConfig,
+  model?: string,
+): Classifier {
   const resolvedModel = model ?? intentConfig.w5.model;
 
   const timeoutMs = intentConfig.w5.timeoutSeconds * 1000;
@@ -85,7 +95,7 @@ function buildClassifier(config: Config, intentConfig: IntentConfig, model?: str
   return new AnthropicClassifier({ apiKey, model: resolvedModel, timeoutMs });
 }
 
-function lockPathFor(config: Config): string {
+function lockPathFor(config: HomeConfig): string {
   return join(config.home, "w5.lock");
 }
 
@@ -96,7 +106,9 @@ function spawnDetachedRun(context: W5Context): void {
   const logFd = openSync(path, "a");
 
   spawn({
-    cmd: [process.execPath, CLI_PATH, "w5", "run"],
+    // --no-env-file: the detached run inherits the hook's cwd, a user's project, and
+    // Bun would load that project's .env over TEMPAD_HOME/.env.
+    cmd: [process.execPath, "--no-env-file", CLI_PATH, "w5", "run"],
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env: { ...process.env, TEMPAD_HOME: context.config.home },
@@ -220,7 +232,7 @@ async function runRun(args: string[], context: W5Context): Promise<number> {
     const classifier = buildClassifier(context.config, context.intentConfig);
     const count = await drain(
       context.database,
-      context.config,
+      requireFields("tempad w5 run", context.config, W5_RUN_NEEDS),
       context.intentConfig.w5,
       classifier,
       {
@@ -373,6 +385,61 @@ function runReview(args: string[], context: W5Context): number {
   return 0;
 }
 
+/**
+ * What each command class needs from the environment and from disk, so the dispatcher
+ * can validate it before any handler (or database) is touched. `needs` is read from
+ * the code of the handlers below; `W5_RUN_NEEDS` / `W5_EVAL_NEEDS` are what they pass
+ * to `requireFields`.
+ */
+export interface CommandPlan {
+  /** Command as shown in a `ConfigError`, e.g. `tempad w5 run`. */
+  label: string;
+  needs: readonly ConfigKey[];
+  /** False for commands that touch neither the database nor TEMPAD_HOME. */
+  opensDatabase: boolean;
+  /** Hook-called commands: on an unconfigured home, exit 0 silently instead of failing. */
+  silentWhenUnconfigured: boolean;
+}
+
+export const W5_RUN_NEEDS = ["claudeDirs", "hostSlug"] as const;
+export const W5_EVAL_NEEDS = ["tz"] as const;
+
+const W5_DATABASE_SUBCOMMANDS = new Set([
+  "enqueue",
+  "context",
+  "run",
+  "backfill",
+  "dedupe",
+  "eval",
+]);
+
+/** Returns null when `command` + `args` name no known w5 subcommand. */
+export function planW5Command(
+  command: "w5" | "quiet" | "review",
+  args: string[],
+): CommandPlan | null {
+  if (command === "quiet" || command === "review") {
+    return {
+      label: `tempad ${command}`,
+      needs: [],
+      opensDatabase: true,
+      silentWhenUnconfigured: false,
+    };
+  }
+  const subcommand = args[0] ?? "";
+  const label = `tempad w5 ${subcommand}`;
+  if (subcommand === "hook") {
+    return { label, needs: [], opensDatabase: false, silentWhenUnconfigured: false };
+  }
+  if (!W5_DATABASE_SUBCOMMANDS.has(subcommand)) return null;
+  return {
+    label,
+    needs: subcommand === "run" ? W5_RUN_NEEDS : subcommand === "eval" ? W5_EVAL_NEEDS : [],
+    opensDatabase: true,
+    silentWhenUnconfigured: subcommand === "enqueue" || subcommand === "context",
+  };
+}
+
 function settingsPathFor(scope: string): string {
   const home = process.env.HOME ?? "";
   if (scope === "project") return join(process.cwd(), ".claude", "settings.json");
@@ -465,6 +532,8 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
     strict: true,
   });
 
+  const evalConfig = requireFields("tempad w5 eval", context.config, W5_EVAL_NEEDS);
+
   if (!values.from || !values.to) {
     context.stdout(
       "usage: tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
@@ -473,7 +542,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
   }
 
   try {
-    validateEvalRange(values.from, values.to, context.config.tz);
+    validateEvalRange(values.from, values.to, evalConfig.tz);
   } catch (error) {
     if (error instanceof InvalidEvalRangeError) {
       context.stdout(error.message);
@@ -505,7 +574,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
         context.stdout(line);
       },
       declareFile: values.declare,
-      timeZone: context.config.tz,
+      timeZone: evalConfig.tz,
     });
   } catch (error) {
     if (error instanceof InvalidDeclareFileError) {
@@ -562,6 +631,11 @@ function runDedupe(args: string[], context: W5Context): number {
   const result = dedupe(context.database, { dryRun: values["dry-run"] === true });
   context.stdout(`traces=${result.traces} stints=${result.stints} quests=${result.quests}`);
   return 0;
+}
+
+/** `tempad w5 hook ...`: edits settings.json only, needs no config and no database. */
+export function runW5HookCommand(args: string[]): number {
+  return runHook(args);
 }
 
 export async function runW5Command(args: string[], context: W5Context): Promise<number> {

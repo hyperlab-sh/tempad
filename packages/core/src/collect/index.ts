@@ -16,6 +16,9 @@ const defaultRunner: CommandRunner = {
   },
 };
 
+// Each collector narrows `sync`'s config to the fields it reads. `Collector` is
+// method-bivariant, so the map holds them all; `tempad sync` loads the union of the
+// selected collectors' `needs` before calling any of them.
 export const collectors: Map<Collector["name"], Collector> = new Map();
 collectors.set(mondayCollector.name, mondayCollector);
 collectors.set(claudeCollector.name, claudeCollector);
