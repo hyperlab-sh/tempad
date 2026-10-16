@@ -1,9 +1,9 @@
 ---
-name: tempad-quest
+name: quest
 description: Declare which quest this session (or subagent) is pursuing, so tempad tracks work under the right outcome instead of guessing. Use at session start, when the outcome changes, and inside every subagent before it starts work.
 ---
 
-# tempad-quest
+# quest
 
 TemPad tracks the human's attention, not the agent's — declare which quest the coming work
 pursues, so tempad places it under the right outcome instead of guessing.
@@ -29,15 +29,15 @@ Before your first tempad call in this session, find the CLI once: `tempad` if `c
 succeeds, else `bunx @hyperlab.sh/tempad` if `command -v bun` succeeds. Use that form wherever a command below
 says `tempad`.
 
-- Neither exists: tell the user exactly "Install bun (https://bun.sh), then run `bunx @hyperlab.sh/tempad init`"
-  and stop. Do not declare anything.
-- The CLI answers `tempad is not set up yet`: tell the user to run `bunx @hyperlab.sh/tempad init` and stop.
+- Neither exists: tell the user to run `/tempad:setup` (it installs bun guidance and the CLI) and stop.
+  Do not declare anything.
+- The CLI answers `tempad is not set up yet`: tell the user to run `/tempad:setup` (or `tempad setup` in a terminal) and stop.
 
 ## Declare
 
 `<id>` and the active quests both come from the `UserPromptSubmit` hook line at the top of each
-turn: `tempad: session <id>, active quests: <title> [Q1], <title> [Q2]. Declare with the
-tempad-quest skill if this prompt starts a different outcome.` (`none` = nothing declared). Read
+turn: `tempad: session <id>, active quests: <title> [Q1], <title> [Q2]. Declare with
+/tempad:quest (or the tempad-quest skill) if this prompt starts a different outcome.` (`none` = nothing declared). Read
 it fresh each turn; do not track either yourself. Declare at session start; on every new quest
 (plain re-declaration, or `--deviates-from` for a detour); inside every subagent with `--parent`;
 when a quest is done (`--done`); and when one ask spans two quests, declare both — the verifier

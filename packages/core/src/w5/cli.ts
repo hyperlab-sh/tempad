@@ -176,6 +176,7 @@ function runContext(args: string[], context: W5Context): number {
   const declarationLine = buildDeclarationLine(
     active.map((quest) => ({ title: quest.title, alias: quest.alias })),
     values.session,
+    process.env.TEMPAD_HOOK_SOURCE,
   );
 
   const rows = context.database

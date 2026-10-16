@@ -230,15 +230,24 @@ export function uninstallHooks(settingsPath: string): void {
   writeSettings(settingsPath, { ...settings, hooks });
 }
 
+/**
+ * How the hook text names the quest skill: the plugin namespaces it (`/tempad:quest`),
+ * the legacy `tempad skill install` copy is a bare `tempad-quest` in `~/.claude/skills`.
+ */
+export function questSkillReference(source: string | undefined): string {
+  return source === "plugin" ? "/tempad:quest" : "the tempad-quest skill";
+}
+
 export function buildDeclarationLine(
   active: { title: string; alias: string }[],
   sessionId: string,
+  source?: string,
 ): string {
   const quests =
     active.length === 0
       ? "none"
       : active.map((quest) => `${quest.title} [${quest.alias}]`).join(", ");
-  return `tempad: session ${sessionId}, active quests: ${quests}. Declare with the tempad-quest skill if this prompt starts a different outcome.`;
+  return `tempad: session ${sessionId}, active quests: ${quests}. Declare with ${questSkillReference(source)} if this prompt starts a different outcome.`;
 }
 
 /**
