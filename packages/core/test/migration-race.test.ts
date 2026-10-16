@@ -84,10 +84,17 @@ async function openConcurrently(
         const exitCode = await child.exited;
         if (exitCode !== 0 || out.trim() === "") {
           throw new Error(
-            `child exited with code ${exitCode} and ${out.trim() === "" ? "no" : "unexpected"} output; stderr: ${stderr.trim() || "(empty)"}`,
+            `child exited with code ${exitCode}; stdout: ${out.trim() || "(empty)"}; stderr: ${stderr.trim() || "(empty)"}`,
           );
         }
-        const parsed = JSON.parse(out.trim()) as { ok: boolean; error?: string };
+        let parsed: { ok: boolean; error?: string };
+        try {
+          parsed = JSON.parse(out.trim()) as { ok: boolean; error?: string };
+        } catch (error) {
+          throw new Error(
+            `child printed non-JSON output (${String(error)}); stdout: ${out.trim()}; stderr: ${stderr.trim() || "(empty)"}`,
+          );
+        }
         return { ...parsed, stderr: stderr.trim() };
       }),
     );
