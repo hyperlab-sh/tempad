@@ -35,6 +35,11 @@ export interface SyncRunOptions {
   pageSize?: number;
   push: boolean;
   pull: boolean;
+  /**
+   * Rebuilds every projection; defaults to `registerAllProjections()` plus
+   * `rebuildAll`. Tests pass a failing one to prove the pending marker.
+   */
+  rebuildProjections?: (database: Database) => void;
 }
 
 export interface SyncCounts {
@@ -65,6 +70,28 @@ export const REMOTE_SCHEMA: readonly string[] = [
 
 /** Columns of `events` that are not content (the payload never carries them). */
 const EVENT_NON_CONTENT = new Set(["id", "uid", "sync_host", "sync_dirty"]);
+
+/**
+ * Local `sync_meta` key set in the same transaction that inserts a pulled
+ * events page, and deleted only after a rebuild succeeds. A run that dies
+ * between those two points (network error on a later page, a throw from
+ * the rebuild, a crash) leaves it set, and the next run rebuilds first.
+ */
+const REBUILD_PENDING = "rebuild_pending";
+
+function defaultRebuild(database: Database): void {
+  registerAllProjections();
+  rebuildAll(database);
+}
+
+/** Rebuilds the projections when a pulled page left them stale. */
+function rebuildIfPending(database: Database, rebuild: (database: Database) => void): boolean {
+  const pending = database.query("SELECT 1 FROM sync_meta WHERE key = ?").get(REBUILD_PENDING);
+  if (pending === null) return false;
+  rebuild(database);
+  database.query("DELETE FROM sync_meta WHERE key = ?").run(REBUILD_PENDING);
+  return true;
+}
 
 const CLOCK_BUMP = "UPDATE sync_clock SET seq = seq + 1 WHERE id = 1";
 const CURRENT_SEQ = "(SELECT seq FROM sync_clock WHERE id = 1)";
@@ -166,6 +193,10 @@ export async function runSyncEngine(
   options: SyncRunOptions,
 ): Promise<SyncRunSummary> {
   const own = options.hostSlug;
+  const rebuild = options.rebuildProjections ?? defaultRebuild;
+  // Before any network call: a previous run's pulled events must be
+  // projected even when this run is push-only or cannot reach the server.
+  const rebuiltFirst = rebuildIfPending(database, rebuild);
   const localVersion = (database.query("PRAGMA user_version").get() as { user_version: number })
     .user_version;
 
@@ -194,6 +225,11 @@ export async function runSyncEngine(
       `remote holds data from tempad schema ${remoteVersion}; upgrade tempad on this host (schema ${localVersion})`,
     );
   }
+  if (remoteVersion < localVersion) {
+    // Raise it now, not only with the first push batch: a pull-only run or
+    // one with nothing dirty must still stop older hosts at the gate.
+    await remote.write([{ sql: RAISE_SCHEMA_VERSION, args: [String(localVersion)] }]);
+  }
   const serverId = meta.get("server_id") ?? "";
   const clock = Number(
     (await remote.query("SELECT seq FROM sync_clock WHERE id = 1"))[0]?.seq ?? 0,
@@ -215,7 +251,7 @@ export async function runSyncEngine(
   const summary: SyncRunSummary = {
     pushed: { events: 0, rows: 0, tombstones: 0 },
     pulled: { events: 0, rows: 0, tombstones: 0 },
-    rebuilt: false,
+    rebuilt: rebuiltFirst,
     reseeded: false,
   };
 
@@ -236,7 +272,6 @@ export async function runSyncEngine(
     const context: PushContext = {
       database,
       remote,
-      own,
       batchSize: options.batchSize,
       reseed: unknown,
       schemaVersion: String(localVersion),
@@ -263,11 +298,7 @@ export async function runSyncEngine(
     summary.pulled.events = await pullEvents(database, remote, own, pageSize);
   }
 
-  if (summary.pulled.events > 0) {
-    registerAllProjections();
-    rebuildAll(database);
-    summary.rebuilt = true;
-  }
+  if (rebuildIfPending(database, rebuild)) summary.rebuilt = true;
 
   return summary;
 }
@@ -275,7 +306,6 @@ export async function runSyncEngine(
 interface PushContext {
   database: Database;
   remote: SyncRemote;
-  own: string;
   batchSize: number;
   reseed: boolean;
   schemaVersion: string;
@@ -299,10 +329,16 @@ function batchPrelude(context: PushContext): RemoteStatement[] {
   ];
 }
 
-const OUTBOX = "(sync_dirty = 1 OR (? = 1 AND sync_host = ?))";
+/**
+ * Dirty rows, or every row on a re-seed. A re-seed sends other hosts' rows
+ * and events too, with their own host and stamp: a host that has retired
+ * since must not vanish with the old server. The server-side conflict rule
+ * and `ON CONFLICT (uid) DO NOTHING` keep that idempotent.
+ */
+const OUTBOX = "(sync_dirty = 1 OR ? = 1)";
 
 async function pushMirror(context: PushContext, shape: MirrorShape): Promise<number> {
-  const { database, own } = context;
+  const { database } = context;
   const name = shape.table.name;
   const keys = shape.table.keyColumns.map(quoted).join(", ");
   const select = database.query(
@@ -315,7 +351,7 @@ async function pushMirror(context: PushContext, shape: MirrorShape): Promise<num
   let after = 0;
   let pushed = 0;
   for (;;) {
-    const rows = select.all(after, context.reseed ? 1 : 0, own, context.batchSize) as Record<
+    const rows = select.all(after, context.reseed ? 1 : 0, context.batchSize) as Record<
       string,
       unknown
     >[];
@@ -343,7 +379,7 @@ async function pushMirror(context: PushContext, shape: MirrorShape): Promise<num
 }
 
 async function pushEvents(context: PushContext): Promise<number> {
-  const { database, own } = context;
+  const { database } = context;
   const content = columnsOf(database, "events").filter((column) => !EVENT_NON_CONTENT.has(column));
   const select = database.query(
     `SELECT uid, sync_host, ${content.map(quoted).join(", ")} FROM events
@@ -353,7 +389,7 @@ async function pushEvents(context: PushContext): Promise<number> {
   let after = "";
   let pushed = 0;
   for (;;) {
-    const rows = select.all(after, context.reseed ? 1 : 0, own, context.batchSize) as Record<
+    const rows = select.all(after, context.reseed ? 1 : 0, context.batchSize) as Record<
       string,
       unknown
     >[];
@@ -375,7 +411,7 @@ async function pushEvents(context: PushContext): Promise<number> {
 }
 
 async function pushTombstones(context: PushContext): Promise<number> {
-  const { database, own } = context;
+  const { database } = context;
   const select = database.query(
     `SELECT rowid AS sync_rowid, tbl, pk, deleted_at, sync_host FROM sync_tombstones
       WHERE rowid > ? AND ${OUTBOX} ORDER BY rowid LIMIT ?`,
@@ -386,7 +422,7 @@ async function pushTombstones(context: PushContext): Promise<number> {
   let after = 0;
   let pushed = 0;
   for (;;) {
-    const rows = select.all(after, context.reseed ? 1 : 0, own, context.batchSize) as {
+    const rows = select.all(after, context.reseed ? 1 : 0, context.batchSize) as {
       sync_rowid: number;
       tbl: string;
       pk: string;
@@ -688,13 +724,16 @@ async function pullEvents(
     }[];
     if (page.length === 0) return inserted;
     const last = Number(page.at(-1)?.seq);
+    let pageInserted = 0;
     database.transaction(() => {
       database.exec("PRAGMA defer_foreign_keys = ON");
       for (const event of page) {
         const data = JSON.parse(event.data) as Record<string, SqlValue>;
         const columns = Object.keys(data).filter((column) => content.has(column));
-        const insertSql = `INSERT OR IGNORE INTO events (uid, sync_host, sync_dirty, ${columns.map(quoted).join(", ")})
-          VALUES (?, ?, 0, ${columns.map(() => "?").join(", ")})`;
+        // Only a duplicate uid is skipped; any other constraint violation
+        // throws and rolls the page back, so the cursor never passes it.
+        const insertSql = `INSERT INTO events (uid, sync_host, sync_dirty, ${columns.map(quoted).join(", ")})
+          VALUES (?, ?, 0, ${columns.map(() => "?").join(", ")}) ON CONFLICT (uid) DO NOTHING`;
         let statement = statements.get(insertSql);
         if (statement === undefined) {
           statement = database.query(insertSql);
@@ -706,6 +745,14 @@ async function pullEvents(
           ...columns.map((column) => data[column] ?? null),
         );
         inserted += result.changes;
+        pageInserted += result.changes;
+      }
+      if (pageInserted > 0) {
+        database
+          .query(
+            "INSERT INTO sync_meta (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+          )
+          .run(REBUILD_PENDING);
       }
       writeCursor(database, "events", last);
     })();

@@ -348,6 +348,22 @@ describe("failures and identity", () => {
     );
   });
 
+  test("a newer host raises the remote schema version even on a pull-only run", async () => {
+    await sync(hostA, remote, "host-a");
+    remote.database.query("UPDATE sync_meta SET value = '3' WHERE key = 'schema_version'").run();
+    await runSyncEngine(hostA, remote, {
+      hostSlug: "host-a",
+      batchSize: 500,
+      push: false,
+      pull: true,
+    });
+    const version = (hostA.query("PRAGMA user_version").get() as { user_version: number })
+      .user_version;
+    expect(
+      remote.database.query("SELECT value FROM sync_meta WHERE key = 'schema_version'").get(),
+    ).toEqual({ value: String(version) });
+  });
+
   test("a newer host raises the remote schema version with its push", async () => {
     await sync(hostA, remote, "host-a");
     remote.database.query("UPDATE sync_meta SET value = '3' WHERE key = 'schema_version'").run();
@@ -375,10 +391,11 @@ describe("failures and identity", () => {
     const fresh = new FakeRemote();
     const reseedA = await sync(hostA, fresh, "host-a");
     expect(reseedA.reseeded).toBe(true);
-    expect(reseedA.pushed).toEqual({ events: 1, rows: 1, tombstones: 1 });
+    // Every row it holds, B's acme/api included, not only its own.
+    expect(reseedA.pushed).toEqual({ events: 1, rows: 2, tombstones: 1 });
     const reseedB = await sync(hostB, fresh, "host-b");
     expect(reseedB.reseeded).toBe(true);
-    expect(reseedB.pushed.rows).toBe(1);
+    expect(reseedB.pushed).toEqual({ events: 1, rows: 2, tombstones: 1 });
     expect(fresh.database.query("SELECT COUNT(*) AS n FROM sync_rows").get()).toEqual({ n: 3 });
     expect(fresh.database.query("SELECT COUNT(*) AS n FROM sync_events").get()).toEqual({ n: 1 });
 
@@ -421,5 +438,200 @@ describe("failures and identity", () => {
     });
     expect(summary.pulled.rows).toBe(4);
     expect(sourceSnapshot(hostA)).toEqual(sourceSnapshot(hostB));
+  });
+});
+
+/** Wraps a remote so its `n`th pull page query on `sync_events` throws. */
+function failingOnEventsPage(remote: SyncRemote, failOn: number): SyncRemote {
+  let pages = 0;
+  return {
+    async query(sql, args) {
+      if (sql.includes("FROM sync_events") && sql.includes("seq > ?")) {
+        pages += 1;
+        if (pages === failOn) throw new Error("injected pull failure");
+      }
+      return remote.query(sql, args);
+    },
+    write: (statements) => remote.write(statements),
+    close: () => remote.close(),
+  };
+}
+
+function rebuildPending(database: Database): boolean {
+  return database.query("SELECT 1 FROM sync_meta WHERE key = 'rebuild_pending'").get() !== null;
+}
+
+function eventCount(database: Database): number {
+  return (database.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+}
+
+describe("partial pull and stale projections", () => {
+  beforeEach(async () => {
+    directory = temporaryDirectory();
+    remote = new FakeRemote();
+    hostA = openHost(directory, "host-a");
+    hostB = openHost(directory, "host-b");
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["party", "add", "acme", "Acme"]);
+    await intent(hostA, ["saga", "add", "--owner", "hero", "Ship push sync"]);
+    // One event per batch, so each event has its own seq and its own page.
+    await sync(hostA, remote, "host-a", { batchSize: 1 });
+  });
+
+  afterEach(() => {
+    hostA.close();
+    hostB.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  test("a pull that fails on a later page leaves a marker, and a push-only run rebuilds", async () => {
+    const pullOnly = { hostSlug: "host-b", batchSize: 500, pageSize: 1, push: false, pull: true };
+    await expect(runSyncEngine(hostB, failingOnEventsPage(remote, 2), pullOnly)).rejects.toThrow(
+      "injected pull failure",
+    );
+    expect(eventCount(hostB)).toBe(1);
+    expect(rebuildPending(hostB)).toBe(true);
+
+    const pushOnly = await runSyncEngine(hostB, remote, {
+      hostSlug: "host-b",
+      batchSize: 500,
+      push: true,
+      pull: false,
+    });
+    expect(pushOnly.rebuilt).toBe(true);
+    expect(pushOnly.pulled.events).toBe(0);
+    expect(rebuildPending(hostB)).toBe(false);
+    expect(hostB.query("SELECT COUNT(*) AS n FROM heroes").get()).toEqual({ n: 1 });
+
+    const rest = await runSyncEngine(hostB, remote, { ...pullOnly, pull: true });
+    expect(rest.rebuilt).toBe(true);
+    expect(projectionSnapshot(hostB)).toEqual(projectionSnapshot(hostA));
+    expect(rebuildPending(hostB)).toBe(false);
+  });
+
+  test("the next full run after a failed pull rebuilds and matches the source host", async () => {
+    const options = { hostSlug: "host-b", batchSize: 500, pageSize: 1, ...both };
+    await expect(runSyncEngine(hostB, failingOnEventsPage(remote, 3), options)).rejects.toThrow(
+      "injected pull failure",
+    );
+    const next = await runSyncEngine(hostB, remote, options);
+    expect(next.rebuilt).toBe(true);
+    expect(projectionSnapshot(hostB)).toEqual(projectionSnapshot(hostA));
+    expect(sourceSnapshot(hostB).events).toEqual(sourceSnapshot(hostA).events);
+  });
+
+  test("a throw from the rebuild itself keeps the marker until a rebuild succeeds", async () => {
+    await expect(
+      runSyncEngine(hostB, remote, {
+        hostSlug: "host-b",
+        batchSize: 500,
+        ...both,
+        rebuildProjections: () => {
+          throw new Error("injected rebuild failure");
+        },
+      }),
+    ).rejects.toThrow("injected rebuild failure");
+    expect(rebuildPending(hostB)).toBe(true);
+    expect(eventCount(hostB)).toBe(eventCount(hostA));
+
+    const next = await sync(hostB, remote, "host-b");
+    expect(next.pulled.events).toBe(0);
+    expect(next.rebuilt).toBe(true);
+    expect(rebuildPending(hostB)).toBe(false);
+    expect(projectionSnapshot(hostB)).toEqual(projectionSnapshot(hostA));
+
+    const quiet = await sync(hostB, remote, "host-b");
+    expect(quiet.rebuilt).toBe(false);
+  });
+
+  test("a pulled event that violates a constraint rolls its page back and holds the cursor", async () => {
+    const seq = remote.clock() + 1;
+    remote.database.query("UPDATE sync_clock SET seq = ?").run(seq);
+    remote.database
+      .query("INSERT INTO sync_events (uid, data, sync_host, seq) VALUES (?, ?, 'host-a', ?)")
+      .run(
+        "7ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        JSON.stringify({
+          at: "2026-10-01T00:00:00.000Z",
+          recorded_at: "x",
+          actor: "hero",
+          subject: "s",
+          payload: "{}",
+        }),
+        seq,
+      );
+    const options = { hostSlug: "host-b", batchSize: 500, pageSize: 1, push: false, pull: true };
+    await expect(runSyncEngine(hostB, remote, options)).rejects.toThrow(/NOT NULL/);
+    expect(eventCount(hostB)).toBe(eventCount(hostA));
+    const cursor = hostB.query("SELECT seq FROM sync_cursors WHERE stream = 'events'").get() as {
+      seq: number;
+    };
+    expect(cursor.seq).toBe(seq - 1);
+    // Still stuck on it: the bad event is never skipped.
+    await expect(runSyncEngine(hostB, remote, options)).rejects.toThrow(/NOT NULL/);
+  });
+});
+
+describe("re-seed from a surviving host", () => {
+  test("a fresh fourth host converges to every host's data after one host re-seeds", async () => {
+    const root = temporaryDirectory();
+    const server = new FakeRemote();
+    const a = openHost(root, "host-a");
+    const b = openHost(root, "host-b");
+    const c = openHost(root, "host-c");
+    try {
+      await intent(a, ["hero", "init", "Saulo"]);
+      await intent(b, ["hero", "init", "Saulo"]);
+      await intent(b, ["party", "add", "acme", "Acme"]);
+      await intent(c, ["hero", "init", "Saulo"]);
+      await intent(c, ["party", "add", "acme", "Acme"]);
+      addRepository(a, "acme/web");
+      addCommit(a, "a1", "acme/web", "from a");
+      addRepository(b, "acme/api");
+      addPullRequest(b, "acme/api", 7, "from b");
+      addMondayItem(c, 42, "from c");
+      addRepository(c, "acme/ops");
+      addCommit(c, "gone", "acme/ops", "deleted on c");
+      for (const [host, slug] of [
+        [a, "host-a"],
+        [b, "host-b"],
+        [c, "host-c"],
+      ] as const)
+        await sync(host, server, slug);
+      c.query("DELETE FROM gh_commits WHERE sha = 'gone'").run();
+      await sync(c, server, "host-c");
+      for (const [host, slug] of [
+        [a, "host-a"],
+        [b, "host-b"],
+        [c, "host-c"],
+      ] as const)
+        await sync(host, server, slug);
+      expect(sourceSnapshot(a)).toEqual(sourceSnapshot(c));
+
+      // The server is lost; B and C are retired. Only A re-seeds.
+      const replacement = new FakeRemote();
+      const reseed = await sync(a, replacement, "host-a");
+      expect(reseed.reseeded).toBe(true);
+
+      const d = openHost(root, "host-d");
+      try {
+        const fresh = await sync(d, replacement, "host-d");
+        expect(fresh.rebuilt).toBe(true);
+        expect(sourceSnapshot(d)).toEqual(sourceSnapshot(a));
+        expect(projectionSnapshot(d)).toEqual(projectionSnapshot(a));
+        expect(d.query("SELECT COUNT(*) AS n FROM sync_tombstones").get()).toEqual({ n: 1 });
+        // Idempotent: a second re-seed-sized push changes nothing remotely.
+        const clock = replacement.clock();
+        await sync(a, replacement, "host-a");
+        expect(replacement.clock()).toBe(clock);
+      } finally {
+        d.close();
+      }
+    } finally {
+      a.close();
+      b.close();
+      c.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
