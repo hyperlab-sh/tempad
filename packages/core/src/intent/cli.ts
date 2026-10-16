@@ -15,6 +15,7 @@ import { EVIDENCE_REF_SHAPES, formatEvidenceRef, parseEvidenceRef } from "./evid
 import { currentHeroId } from "./identity";
 import { newUlid } from "./ids";
 import { applyIncremental, ensureTables, rebuildAll } from "./projections";
+import { openMembershipOriginals } from "./projections/party";
 import { resolveQuest } from "./projections/quest";
 import { registerAllProjections } from "./projections/register";
 import { EventStore } from "./store";
@@ -149,15 +150,21 @@ function runPartyCommand(args: string[], context: IntentContext): number {
       console.error(`hero is not a member of ${slug}`);
       return 1;
     }
-    applyIncremental(
-      context.database,
-      store.append({
-        actor: "hero",
-        kind: "membership.left",
-        subject: membership.id,
-        payload: { reason: values.reason },
-      }),
-    );
+    // After a sync the hero's membership can stand for several joins (one per
+    // host that ran `party add`), and a leave ends only the join it names, so
+    // leaving the party means ending each one still open. On a single host
+    // there is exactly one.
+    for (const original of openMembershipOriginals(context.database, membership.id)) {
+      applyIncremental(
+        context.database,
+        store.append({
+          actor: "hero",
+          kind: "membership.left",
+          subject: original,
+          payload: { reason: values.reason },
+        }),
+      );
+    }
     return 0;
   }
 

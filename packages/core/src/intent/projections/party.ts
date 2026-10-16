@@ -1,12 +1,38 @@
+import type { Database } from "bun:sqlite";
 import { recordAlias, resolveIdentity } from "../identity";
 import type { Projection } from "./index";
 
+/**
+ * Every membership event id that stands for the canonical membership
+ * `membershipId`: itself, plus each later `membership.joined` another host
+ * wrote for the same (hero, party) while it was open (recorded as aliases).
+ * Oldest first, canonical first.
+ */
+export function membershipOriginals(database: Database, membershipId: string): string[] {
+  const aliases = database
+    .query(
+      "SELECT alias_id FROM identity_aliases WHERE kind = 'membership' AND canonical_id = ? ORDER BY alias_id",
+    )
+    .all(membershipId) as { alias_id: string }[];
+  return [membershipId, ...aliases.map((row) => row.alias_id)];
+}
+
+/** The originals of `membershipId` that have not left yet. */
+export function openMembershipOriginals(database: Database, membershipId: string): string[] {
+  return membershipOriginals(database, membershipId).filter(
+    (original) =>
+      database.query("SELECT 1 FROM membership_leaves WHERE original_id = ?").get(original) ===
+      null,
+  );
+}
+
 export const partyProjection: Projection = {
   name: "parties",
-  tables: ["parties", "memberships", "clients"],
+  tables: ["parties", "memberships", "membership_leaves", "clients"],
   createSql: `
     CREATE TABLE IF NOT EXISTS parties (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS memberships (id TEXT PRIMARY KEY, hero_id TEXT NOT NULL, party_id TEXT NOT NULL, joined_at TEXT NOT NULL, left_at TEXT, reason TEXT);
+    CREATE TABLE IF NOT EXISTS membership_leaves (original_id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_at TEXT NOT NULL);`,
   apply(database, event) {
     const payload = event.payload;
@@ -64,15 +90,23 @@ export const partyProjection: Projection = {
           .run(event.subject, hero, party, String(payload.joined ?? event.at));
         return;
       }
-      case "membership.left":
+      case "membership.left": {
+        // A leave ends only the membership it names. When two hosts each
+        // joined, the second join is folded into the first's row, but the hero
+        // still holds both memberships: the row closes when the last of them
+        // has left, so a host that left cannot end one the other host never
+        // gave up. With a single original (every single-host log) the first
+        // leave closes the row, exactly as before.
+        database
+          .query("INSERT OR REPLACE INTO membership_leaves (original_id) VALUES (?)")
+          .run(event.subject);
+        const canonical = resolveIdentity(database, "membership", event.subject);
+        if (openMembershipOriginals(database, canonical).length > 0) return;
         database
           .query("UPDATE memberships SET left_at = ?, reason = ? WHERE id = ?")
-          .run(
-            event.at,
-            payload.reason ? String(payload.reason) : null,
-            resolveIdentity(database, "membership", event.subject),
-          );
+          .run(event.at, payload.reason ? String(payload.reason) : null, canonical);
         return;
+      }
       case "client.created": {
         // One client per slug, same rule as parties.
         const existing = database

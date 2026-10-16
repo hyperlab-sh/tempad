@@ -241,7 +241,17 @@ export function rebuiltFromScratch(source: Database): Database {
     .query(
       "SELECT at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host FROM events ORDER BY RANDOM()",
     )
-    .all() as Record<string, string | null>[];
+    .all() as {
+    at: string;
+    recorded_at: string;
+    actor: string;
+    session_id: string | null;
+    kind: string;
+    subject: string;
+    payload: string;
+    uid: string;
+    sync_host: string | null;
+  }[];
   const insert = target.query(
     `INSERT INTO events (at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host, sync_dirty)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
