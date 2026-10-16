@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { logCommits } from "../src/collect/github/log.ts";
+import { logCommits, normalizeOffsetTimestamp } from "../src/collect/github/log.ts";
 import { buildRepository } from "./fixtures/git/build-repository.ts";
 
 function runner() {
@@ -50,5 +50,20 @@ describe("logCommits", () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe("normalizeOffsetTimestamp", () => {
+  test("rewrites offset-form timestamps to UTC with milliseconds", () => {
+    expect(normalizeOffsetTimestamp("2026-07-21T13:57:02-03:00")).toBe("2026-07-21T16:57:02.000Z");
+    expect(normalizeOffsetTimestamp("2026-07-21T01:00:00+09:30")).toBe("2026-07-20T15:30:00.000Z");
+    expect(normalizeOffsetTimestamp("2026-07-21T00:00:00+00:00")).toBe("2026-07-21T00:00:00.000Z");
+  });
+
+  test("leaves UTC, date-only and unparseable values untouched", () => {
+    expect(normalizeOffsetTimestamp("2026-07-21T16:57:02.000Z")).toBe("2026-07-21T16:57:02.000Z");
+    expect(normalizeOffsetTimestamp("2026-07-21")).toBe("2026-07-21");
+    expect(normalizeOffsetTimestamp("garbage-03:00")).toBe("garbage-03:00");
+    expect(normalizeOffsetTimestamp("")).toBe("");
   });
 });
