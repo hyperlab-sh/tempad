@@ -56,9 +56,36 @@ export interface BackfillResult {
   sessionsInferred: number;
 }
 
-interface SessionRow {
+export interface SessionRow {
   id: string;
   ended_at: string;
+}
+
+/**
+ * The sessions a backfill run looks at: ended on or after `cutoff` (and before
+ * `to`, when given), on `hostSlug` when set, oldest first. `backfill` and
+ * `tempad scry` both call it, so scry's "windows still to classify" can never
+ * select a different set of sessions than the run it recommends.
+ */
+export function selectBackfillSessions(
+  database: Database,
+  options: { cutoff: string; to?: string; hostSlug?: string },
+): SessionRow[] {
+  const clauses = ["ended_at >= ?"];
+  const parameters: string[] = [options.cutoff];
+  if (options.to) {
+    clauses.push("ended_at < ?");
+    parameters.push(options.to);
+  }
+  if (options.hostSlug !== undefined) {
+    clauses.push("host_slug = ?");
+    parameters.push(options.hostSlug);
+  }
+  return database
+    .query(
+      `SELECT id, ended_at FROM claude_sessions WHERE ${clauses.join(" AND ")} ORDER BY started_at ASC`,
+    )
+    .all(...parameters) as SessionRow[];
 }
 
 /**
@@ -71,7 +98,7 @@ interface SessionRow {
  * and get reclassified (and re-duplicated) the first time backfill runs
  * post-upgrade.
  */
-function isWindowCovered(
+export function isWindowCovered(
   database: Database,
   sessionId: string,
   windowStartedAt: string,
@@ -95,7 +122,10 @@ function isWindowCovered(
   return traceRow !== null;
 }
 
-function chunkByWindow<T extends { ts: string }>(messages: T[], windowMinutes: number): T[][] {
+export function chunkByWindow<T extends { ts: string }>(
+  messages: T[],
+  windowMinutes: number,
+): T[][] {
   if (messages.length === 0) return [];
   const chunks: T[][] = [];
   let current: T[] = [];
@@ -115,6 +145,91 @@ function chunkByWindow<T extends { ts: string }>(messages: T[], windowMinutes: n
   return chunks;
 }
 
+export interface PlannedWindow {
+  sessionId: string;
+  startedAt: string;
+  endedAt: string;
+  /** What `isWindowCovered` answers: a re-run would skip this window. */
+  covered: boolean;
+}
+
+/**
+ * The windows a backfill over `sessions` would visit and whether each is
+ * already covered, without classifying anything: the same message list
+ * `buildWindow` reads for a whole session (newest 5000 with text, oldest
+ * first, below `to` when given), the same `chunkByWindow`, the same coverage
+ * rule as `isWindowCovered` (answered from two table reads instead of a
+ * `traces` scan per window). Read-only; `tempad scry` uses it to say how much a
+ * backfill would do. `test/w5/backfill.test.ts` pins that it agrees with a
+ * real run, so a change to either side fails there.
+ */
+export function planBackfillWindows(
+  database: Database,
+  sessions: readonly SessionRow[],
+  options: { windowMinutes: number; to?: string },
+): PlannedWindow[] {
+  // `isWindowCovered` per chunk scans `traces` (no `session_id` index) once per
+  // window; for a plan over hundreds of sessions, read both tables once and
+  // answer the same two questions from memory.
+  // The projection tables are created lazily by the first event that needs
+  // them, so a database that never classified anything has neither: every
+  // window is then uncovered, as it is for `isWindowCovered`'s caller after
+  // `ensureTables`.
+  const hasTable = (name: string) =>
+    database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !==
+    null;
+  const wanted = new Set(sessions.map((session) => session.id));
+  const classified = new Set<string>();
+  for (const row of (hasTable("w5_windows")
+    ? database.query("SELECT session_id, started_at, ended_at FROM w5_windows").all()
+    : []) as {
+    session_id: string;
+    started_at: string;
+    ended_at: string;
+  }[]) {
+    if (wanted.has(row.session_id))
+      classified.add(`${row.session_id}\u0000${row.started_at}\u0000${row.ended_at}`);
+  }
+  const traces = new Map<string, { started_at: string; ended_at: string }[]>();
+  for (const row of (hasTable("traces")
+    ? database
+        .query(
+          "SELECT session_id, started_at, ended_at FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL",
+        )
+        .all()
+    : []) as { session_id: string; started_at: string; ended_at: string }[]) {
+    if (!wanted.has(row.session_id)) continue;
+    const list = traces.get(row.session_id);
+    if (list) list.push(row);
+    else traces.set(row.session_id, [row]);
+  }
+
+  const messageTimestamps = database.query(
+    `SELECT ts FROM claude_messages
+      WHERE session_id = ? AND text_preview IS NOT NULL
+      ORDER BY ts DESC LIMIT 5000`,
+  );
+  const planned: PlannedWindow[] = [];
+  for (const session of sessions) {
+    const rows = (messageTimestamps.all(session.id) as { ts: string }[]).reverse();
+    const bounded = options.to ? rows.filter((row) => row.ts < (options.to as string)) : rows;
+    const sessionTraces = traces.get(session.id) ?? [];
+    for (const chunk of chunkByWindow(bounded, options.windowMinutes)) {
+      const startedAt = chunk[0]?.ts ?? session.ended_at;
+      const endedAt = chunk.at(-1)?.ts ?? session.ended_at;
+      planned.push({
+        sessionId: session.id,
+        startedAt,
+        endedAt,
+        covered:
+          classified.has(`${session.id}\u0000${startedAt}\u0000${endedAt}`) ||
+          sessionTraces.some((trace) => trace.started_at >= startedAt && trace.ended_at <= endedAt),
+      });
+    }
+  }
+  return planned;
+}
+
 export async function backfill(
   database: Database,
   _config: HomeConfig,
@@ -128,21 +243,11 @@ export async function backfill(
     options.from ??
     new Date(Date.parse(options.now) - options.days * 24 * 60 * 60 * 1000).toISOString();
 
-  const sessionClauses = ["ended_at >= ?"];
-  const sessionParameters: string[] = [cutoff];
-  if (options.to) {
-    sessionClauses.push("ended_at < ?");
-    sessionParameters.push(options.to);
-  }
-  if (options.hostSlug !== undefined) {
-    sessionClauses.push("host_slug = ?");
-    sessionParameters.push(options.hostSlug);
-  }
-  const sessions = database
-    .query(
-      `SELECT id, ended_at FROM claude_sessions WHERE ${sessionClauses.join(" AND ")} ORDER BY started_at ASC`,
-    )
-    .all(...sessionParameters) as SessionRow[];
+  const sessions = selectBackfillSessions(database, {
+    cutoff,
+    to: options.to,
+    hostSlug: options.hostSlug,
+  });
 
   let sessionsClassified = 0;
   let sessionsSkipped = 0;

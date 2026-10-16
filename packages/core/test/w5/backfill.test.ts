@@ -1,4 +1,8 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import type { Config } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
 import type { W5Config } from "../../src/intent/config";
@@ -6,7 +10,7 @@ import { declareQuest } from "../../src/intent/declarations";
 import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
-import { backfill } from "../../src/w5/backfill";
+import { backfill, planBackfillWindows, selectBackfillSessions } from "../../src/w5/backfill";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
 
@@ -997,5 +1001,88 @@ describe("backfill hands the classifier the prompt its mode needs", () => {
       expect(prompt).toContain("open quests:");
       expect(prompt).not.toContain("your declared quest");
     }
+  });
+});
+
+describe("planBackfillWindows", () => {
+  // `tempad scry` recommends a backfill from this plan, so it must predict exactly what a real run does.
+  test("predicts the windows a real run classifies and the ones it skips, for the same host filter", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    // "long" has three 30-minute windows (10:00-10:20, 11:10, 12:30).
+    seedSession(database, {
+      id: "long",
+      endedAt: "2026-09-04T13:00:00.000Z",
+      hostSlug: "host-a",
+      messageTimestamps: [
+        "2026-09-04T10:00:00.000Z",
+        "2026-09-04T10:20:00.000Z",
+        "2026-09-04T11:10:00.000Z",
+        "2026-09-04T12:30:00.000Z",
+      ],
+    });
+    seedSession(database, { id: "short", endedAt: "2026-09-04T15:00:00.000Z", hostSlug: "host-a" });
+    seedSession(database, {
+      id: "elsewhere",
+      endedAt: "2026-09-04T15:30:00.000Z",
+      hostSlug: "host-b",
+    });
+    const now = "2026-09-05T00:00:00.000Z";
+    const cutoff = "2026-09-01T00:00:00.000Z";
+    const windowMinutes = config.throttleMinutes * 3;
+
+    // Only sessions that ended before 14:00 get classified: "long" is covered, the others are not.
+    await backfill(database, makeConfig(), config, new FakeClassifier(), {
+      days: 15,
+      now,
+      log: () => {},
+      to: "2026-09-04T14:00:00.000Z",
+    });
+
+    for (const hostSlug of ["host-a", undefined]) {
+      const sessions = selectBackfillSessions(database, { cutoff, hostSlug });
+      const planned = planBackfillWindows(database, sessions, { windowMinutes });
+      const covered = planned.filter((window) => window.covered).length;
+      const pending = planned.filter((window) => !window.covered).length;
+      expect(covered).toBe(3);
+
+      // The real run goes on a copy, so the next loop iteration plans against the same state.
+      const copyPath = join(mkdtempSync(join(tmpdir(), "tempad-plan-")), "copy.db");
+      database.exec(`VACUUM INTO '${copyPath}'`);
+      const clone = new Database(copyPath);
+      const result = await backfill(clone, makeConfig(), config, new FakeClassifier(), {
+        days: 15,
+        now,
+        log: () => {},
+        hostSlug,
+      });
+      expect(result.windowsClassified).toBe(pending);
+      expect(result.windowsSkipped).toBe(covered);
+      expect(pending).toBe(hostSlug === undefined ? 2 : 1);
+      clone.close();
+      rmSync(dirname(copyPath), { recursive: true, force: true });
+    }
+  });
+
+  test("a trace that predates w5_windows still covers its window, and a retracted one does not", () => {
+    const database = openDatabase(":memory:");
+    seedSession(database, {
+      id: "old",
+      endedAt: "2026-09-04T10:20:00.000Z",
+      messageTimestamps: ["2026-09-04T10:00:00.000Z", "2026-09-04T10:20:00.000Z"],
+    });
+    const sessions = selectBackfillSessions(database, { cutoff: "2026-09-01T00:00:00.000Z" });
+    ensureTables(database);
+    const insertTrace = (id: string, retractedAt: string | null) =>
+      database
+        .query(
+          `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at, retracted_at)
+           VALUES (?, 's', 't', 'p', 'claude', '2026-09-04T10:00:00.000Z', '2026-09-04T10:20:00.000Z', 'w', 'w', 'w', 'w', 'w', 0.9, 'assistant', 'old', '2026-09-04T11:00:00.000Z', ?)`,
+        )
+        .run(id, retractedAt);
+    insertTrace("T1", "2026-09-04T12:00:00.000Z");
+    expect(planBackfillWindows(database, sessions, { windowMinutes: 30 })[0]?.covered).toBe(false);
+    insertTrace("T2", null);
+    expect(planBackfillWindows(database, sessions, { windowMinutes: 30 })[0]?.covered).toBe(true);
   });
 });
