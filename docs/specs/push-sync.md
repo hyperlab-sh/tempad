@@ -162,6 +162,7 @@ batch_size = 500 # optional
 
 - `HOST_SLUG` must be unique per machine. Two machines with the same slug would each skip the other's rows on pull.
 - Every host should run the same tempad version; the schema gate enforces the minimum.
+- Every host must use the same `[[projects]]` rules in `tempad.toml`. Collectors compute `org`, `project` and the display name from the local rules, and those columns are content. Two hosts with different rules that both collect the same GitHub or Monday rows would overwrite each other's values on every sync. These columns cannot be host-local, because a pulled row needs them for reports. `tempad project reresolve` on one host rewrites matching sessions from every host under that host's rules, which is the intended explicit action.
 
 ## Tests
 
