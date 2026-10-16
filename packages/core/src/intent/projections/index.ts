@@ -38,11 +38,36 @@ export function applyIncremental(database: Database, event: EventRecord): void {
   run();
 }
 
-export function rebuildAll(database: Database, options: { until?: string } = {}): void {
+export interface RebuildOptions {
+  /** Replay only events with `at <= until` (time travel; see `stateAsOf`). */
+  until?: string;
+  /**
+   * `beforeCommit(database)` runs inside the rebuild's IMMEDIATE transaction,
+   * after every projection has been cleared and replayed and just before the
+   * commit. Whatever it writes commits atomically with the rebuilt
+   * projections, and a throw rolls the whole rebuild back. Push sync uses it
+   * to clear its rebuild-pending marker in `sync_meta`, so the marker can
+   * never be cleared by a rebuild that did not commit, nor survive one that
+   * did.
+   */
+  beforeCommit?: (database: Database) => void;
+}
+
+/**
+ * Truncates every projection and replays the event log into it.
+ *
+ * The events are read inside the same IMMEDIATE transaction that clears and
+ * replays. Reading them first and only then taking the write lock left a
+ * window in which another connection (a pull applying remote events, the w5
+ * runner) could commit an event the replay never saw, yet `projection_state`
+ * would still be stamped as complete. Holding the write lock across the read
+ * means no event can land between the read and the commit.
+ */
+export function rebuildAll(database: Database, options: RebuildOptions = {}): void {
   ensureTables(database);
   const store = new EventStore(database);
-  const events = store.read({ until: options.until });
   const run = database.transaction(() => {
+    const events = store.read({ until: options.until });
     for (const projection of registry.values()) {
       for (const table of projection.tables) database.exec(`DELETE FROM ${table}`);
       for (const event of events) projection.apply(database, event);
@@ -53,6 +78,7 @@ export function rebuildAll(database: Database, options: { until?: string } = {})
         )
         .run(projection.name, last);
     }
+    options.beforeCommit?.(database);
   });
-  run();
+  run.immediate();
 }
