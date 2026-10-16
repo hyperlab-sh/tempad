@@ -4,7 +4,7 @@ Reconstructs work history (hour by hour) from git, Monday.com and Claude Code se
 
 ## Layout
 
-- `packages/core` — TypeScript library + `tempad` bin: schema, collectors, reports. Bun runtime, `bun:sqlite`.
+- `packages/core` — the npm package `tempad` (was `@tempad/core`): TypeScript library + `tempad` bin, schema, collectors, reports, plus the `skills/` and `hooks/` the Claude Code plugin reuses. Bun runtime, `bun:sqlite`.
 - `apps/` — runnable programs. A Go TUI (charmbracelet) is planned.
 - `libs/` — private bundle-time packages. Never published.
 - `docs/specs/` — design specs. Read the relevant spec before changing a subsystem.
@@ -123,6 +123,15 @@ Ordering matters in `runOnce` (`src/w5/runner.ts`): `closeIdleStints` runs **bef
 `[[projects]]` rules in `tempad.toml` are either `pattern` (a `URLPattern` with named groups, e.g. `~/work/:org/:project/:rest*`) or `path` (one exact folder, `~` expanded, matching that folder and everything under it) — a rule has exactly one of the two. `path` rules need static `org`/`project` (there is nothing to extract a group from); `pattern` rules can supply `org`/`project` statically or via a named group. Either kind can add `name` for a human display label; `resolvePath` returns it as `ResolvedPath.name`, filled into `claude_sessions.project_name` by the Claude collector. Reports show `<name>` in place of `org/project` wherever every session in the group shares one (`projectLabel` in `src/report/format.ts`). List path rules before pattern rules — first match wins, and a path rule is normally more specific. `tempad project register` prepends new `path` rules for exactly this reason.
 
 `path` matching (`normalizePathForMatch`/`matchesPath` in `src/config/rules.ts`) normalizes both the rule's folder (at load time) and the `cwd`/query path (at match time) the same way: `~`-expand, resolve symlinks with `realpathSync` when the path exists on disk (fall back to plain `path.resolve` when it doesn't — a not-yet-created subfolder under a symlinked path won't resolve the symlink component until it exists), strip a trailing slash, then compare case-insensitively on darwin only (`process.platform`), exact elsewhere. `reresolveSessions` (`src/collect/claude.ts`) and `tempad project register|reresolve` (`src/cli.ts`, which always expands `~` with `os.homedir()`, never `process.env.HOME`) use the same normalization, so a hand-typed path with a trailing slash, different case, or reached through a symlink still matches the sessions it should.
+
+## Release
+
+- Two artifacts ship from this repo: the npm package `tempad` (`packages/core`) and the Claude Code plugin `tempad` (`.claude-plugin/plugin.json` at the root; the marketplace `hyperlab-sh/claude-plugins` lives elsewhere and this repo never carries a `marketplace.json`).
+- The version lives in `packages/core/package.json` and `.claude-plugin/plugin.json` and the two must match; `packages/core/test/release.test.ts` fails otherwise. Bump both together, move the `CHANGELOG.md` `[Unreleased]` entries under the new version, and commit.
+- The npm tarball is whitelisted by `files` in `packages/core/package.json`: `src` (migrations are read from `src/db/migrations` through `import.meta.dir`), `skills`, `hooks`, `README.md`, `LICENSE`. `tempad.example.toml` and `.env.example` are deliberately not shipped. Anything the runtime resolves with `import.meta.dir` must stay inside `packages/core`, or an installed copy breaks. `packages/core/LICENSE` is a copy of the root one (the test checks they match).
+- Check a release locally: `cd packages/core && bun pm pack`, install the tarball into an empty directory with fresh `HOME` and `TEMPAD_HOME`, and run `bunx tempad --help`. `bun publish --dry-run` lists the files (it then stops at "missing authentication" unless logged in).
+- Publishing is `bun publish` from `packages/core`, run by the operator. Agents never publish.
+- Outside the repo, the proto `bun` shim may pick a newer Bun than `.prototools` pins; for a faithful check call the pinned binary (`~/.proto/tools/bun/1.3.14/bun`).
 
 ## Gotchas
 
