@@ -913,3 +913,63 @@ describe("events_no_update after 0019", () => {
     for (const column of columns) expect(trigger.sql).toContain(`NEW.${column} IS OLD.${column}`);
   });
 });
+
+describe("openDatabase and the write lock", () => {
+  function lockedDatabase(): { directory: string; path: string; writer: Database } {
+    const directory = temporaryDirectory();
+    const path = join(directory, "tempad.db");
+    openDatabase(path, { hostSlug: "host-a" }).close();
+    const writer = openDatabase(path);
+    writer.exec("BEGIN IMMEDIATE");
+    writer.query("INSERT INTO sync_meta (key, value) VALUES ('probe', 'held')").run();
+    return { directory, path, writer };
+  }
+
+  test("every connection waits up to 5 seconds for a lock by default", () => {
+    const database = openDatabase(":memory:");
+    expect(database.query("PRAGMA busy_timeout").values()).toEqual([[5000]]);
+    database.close();
+  });
+
+  test("an unchanged host slug opens without writing while another connection holds the lock", () => {
+    const { directory, path, writer } = lockedDatabase();
+    try {
+      const started = performance.now();
+      const reader = openDatabase(path, { hostSlug: "host-a", busyTimeoutMs: 2000 });
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(reader.query("SELECT host_slug FROM sync_local WHERE id = 1").get()).toEqual({
+        host_slug: "host-a",
+      });
+      reader.close();
+      const plain = openDatabase(path, { busyTimeoutMs: 2000 });
+      plain.close();
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("a changed host slug waits for the lock, then fails with a clear error", () => {
+    const { directory, path, writer } = lockedDatabase();
+    try {
+      const started = performance.now();
+      expect(() => openDatabase(path, { hostSlug: "host-b", busyTimeoutMs: 300 })).toThrow(
+        /cannot record host slug "host-b" in sync_local/,
+      );
+      expect(performance.now() - started).toBeGreaterThanOrEqual(250);
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+    }
+    try {
+      const reopened = openDatabase(path, { hostSlug: "host-b" });
+      expect(reopened.query("SELECT host_slug FROM sync_local WHERE id = 1").get()).toEqual({
+        host_slug: "host-b",
+      });
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});

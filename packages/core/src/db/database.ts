@@ -40,10 +40,20 @@ export interface OpenDatabaseOptions {
    * migrations (0019 onward) against tables that already have their columns.
    */
   upToVersion?: number;
+  /**
+   * How long a statement waits for another connection's write lock before
+   * failing with SQLITE_BUSY. Defaults to 5000 ms. Tests pass a short value
+   * so a deliberately blocked open fails fast.
+   */
+  busyTimeoutMs?: number;
 }
 
 export function openDatabase(path: string, options: OpenDatabaseOptions = {}): Database {
   const database = new Database(path);
+  // First, before any other statement: a CLI command, the w5 hook and a sync
+  // can all open the same file at once, and without a busy timeout the loser
+  // of a lock race fails immediately instead of waiting its turn.
+  database.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 5000};`);
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA foreign_keys = ON;");
 
@@ -59,14 +69,42 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
 
   if (hasColumn(database, "events", "uid")) backfillEventUids(database);
   if (options.hostSlug !== undefined && hasTable(database, "sync_local")) {
-    database
-      .query(
-        "INSERT INTO sync_local (id, host_slug) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET host_slug = excluded.host_slug WHERE host_slug IS NOT excluded.host_slug",
-      )
-      .run(options.hostSlug);
+    try {
+      recordHostSlug(database, options.hostSlug);
+    } catch (error) {
+      database.close();
+      throw error;
+    }
   }
 
   return database;
+}
+
+/**
+ * Records this host's slug in `sync_local`, writing only when the row is
+ * missing or holds a different slug. Every CLI connection passes the slug, so
+ * an unconditional upsert would make every open a write: even a read-only
+ * `tempad report` would queue behind (or fail against) a long sync or rebuild
+ * holding the write lock. A plain read never waits on a WAL writer, so the
+ * common case (slug unchanged) opens without touching the lock at all.
+ */
+function recordHostSlug(database: Database, hostSlug: string): void {
+  const row = database.query("SELECT host_slug FROM sync_local WHERE id = 1").get() as {
+    host_slug: string | null;
+  } | null;
+  if (row !== null && row.host_slug === hostSlug) return;
+  try {
+    database
+      .query(
+        "INSERT INTO sync_local (id, host_slug) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET host_slug = excluded.host_slug",
+      )
+      .run(hostSlug);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `cannot record host slug "${hostSlug}" in sync_local (another process may hold the database write lock): ${message}`,
+    );
+  }
 }
 
 function hasTable(database: Database, table: string): boolean {
@@ -147,7 +185,9 @@ export interface LegacyEventRow {
  * The successor guard (`ulidAfter`) only matters when some event already
  * carries a uid at or above a row's deterministic one -- a NULL-uid row
  * inserted by hand after the migration, never a plain pre-0019 database. It
- * keeps id order there at the cost of determinism for that row.
+ * keeps id order there by adding a random increment to the previous uid, at
+ * the cost of determinism for that row (and any later row it pushes past).
+ * Rows that never hit the guard stay deterministic across copies.
  *
  * `uid IS NULL` is answered from the `events_uid` index, so this is a cheap
  * no-op on every open after the first.
