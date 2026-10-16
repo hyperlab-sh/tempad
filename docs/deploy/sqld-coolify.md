@@ -2,7 +2,7 @@
 
 `tempad sync` pushes to and pulls from one sqld (the libSQL server). This page covers running that server on Coolify and wiring each host to it. Design: `docs/specs/push-sync.md`.
 
-Every claim below was checked against the `tursodatabase/libsql` sources unless it carries "(unverified)". Checked on 2026-10-16 against `main`. Claims marked "(tested)" are also exercised by `packages/core/test/sync/sqld.integration.test.ts` against `libsql-server:latest`.
+Every claim below was checked against the `tursodatabase/libsql` sources unless it carries "(unverified)". Checked on 2026-10-16 against `main`. Claims marked "(tested)" are also exercised by `packages/core/test/sync/sqld.integration.test.ts` against `ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67` (`latest` as pulled on 2026-10-16, image created 2026-08-23).
 
 ## 1. The server
 
@@ -112,7 +112,7 @@ sqld stores SQLite databases under `/var/lib/sqld`. What I verified and what I d
 - **Recommended, simple and safe:** stop the service in Coolify, copy the volume, start it again. For example `docker run --rm -v <volume>:/data -v $PWD:/out alpine tar czf /out/sqld-$(date +%F).tgz -C /data .`. Do it from a scheduled job on the Coolify host or use Coolify's scheduled backups for volumes if your version offers them (unverified). A live copy of a WAL-mode SQLite directory can be inconsistent; I did not verify what sqld guarantees (unverified), so do not skip the stop.
 - Test a restore once: extract into a fresh volume, start the container, run the smoke check.
 
-**The remote is not the only copy.** Each host's local `tempad.db` already holds a complete copy of the source tables, so losing the server loses no data permanently. A fresh or reset server repopulates itself: the server holds a random `server_id` in its `sync_meta` table, and each host remembers the id it last synced with. When the id differs, or the server's clock is behind what the host has already pulled (a restore from an older backup), the host's next `tempad sync --push` re-sends every row, event and tombstone it authored, dirty or not, and pulls from the start. Once every host has pushed, the server is whole again (tested). A `--pull`-only run against such a server resets its cursors but leaves the re-seed to the next push. A restore that keeps the same `server_id` and a clock at or ahead of the hosts' cursors is not detected; back up the volume anyway and, after a restore, run `tempad sync` on every host.
+**The remote is not the only copy.** Each host's local `tempad.db` already holds a complete copy of the source tables, so losing the server loses no data permanently. A fresh or reset server repopulates itself: the server holds a random `server_id` in its `sync_meta` table, and each host remembers the id it last synced with. When the id differs, or the server's clock is behind what the host has already pulled (a restore from an older backup), the host's next `tempad sync --push` re-sends every row, event and tombstone it holds, dirty or not, including those other hosts wrote (with their original host and stamp), and pulls from the start. One surviving host is enough to make the server whole again, even when the others have been retired (tested). A `--pull`-only run against such a server resets its cursors but leaves the re-seed to the next push. A restore that keeps the same `server_id` and a clock at or ahead of the hosts' cursors is not detected; back up the volume anyway and, after a restore, run `tempad sync` on every host.
 
 ## 5. Client side
 
@@ -132,6 +132,8 @@ TEMPAD_SYNC_TOKEN=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...
 Accepted schemes are `libsql:`, `https:` and `wss:`. Plain `http:`/`ws:` work only for loopback hosts, so the token never crosses the network unencrypted. `libsql://` uses TLS in `@libsql/client` unless the URL carries `?tls=0` (checked in `@libsql/core` 0.18 `config.js`); with the Coolify setup above both `libsql://` and `https://` terminate at the proxy.
 
 Every host must run identical `[[projects]]` rules in `tempad.toml`. Org, project and display name are computed from the local rules and synced as data, so hosts with different rules overwrite each other's values on every sync (see `docs/specs/push-sync.md`).
+
+Two hosts started from a copy of the same pre-sync `tempad.db` stamp the shared legacy events with different `sync_host` values. That is harmless, because events deduplicate by uid.
 
 ### Smoke checks
 
