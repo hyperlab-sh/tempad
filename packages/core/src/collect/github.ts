@@ -308,8 +308,14 @@ export function createGithubCollector(
           else if (outcome === "updated") updated++;
         }
 
+        // Compare instants, not strings: rows written before `toUtcIso` keep the
+        // author's offset (`...-03:00`), and as text those sort by wall clock, so a
+        // row inside the window could fall below `lower` and its orphan go unchecked.
+        // julianday() reads `Z`, offset and bare `YYYY-MM-DD` forms alike.
         const storedShas = database
-          .query(`SELECT sha FROM gh_commits WHERE repo = ? AND authored_at >= ?`)
+          .query(
+            `SELECT sha FROM gh_commits WHERE repo = ? AND julianday(authored_at) >= julianday(?)`,
+          )
           .all(repository.fullName, lower) as { sha: string }[];
 
         for (const { sha } of storedShas) {
