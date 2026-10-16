@@ -221,7 +221,7 @@ export function queryStintTraceIntervals(
     .query(
       `SELECT a.id as id, a.outcome as outcome, q.title as questTitle
        FROM stints a
-       LEFT JOIN quests q ON q.id = a.quest_id
+       LEFT JOIN quests q ON q.id = a.quest_id AND q.retracted_at IS NULL
        WHERE a.retracted_at IS NULL AND a.dismissed_at IS NULL AND a.id IN (${[...stintIds].map(() => "?").join(", ")})`,
     )
     .all(...stintIds) as { id: string; outcome: string; questTitle: string | null }[];
@@ -280,7 +280,7 @@ export function queryDismissedMinutesByQuest(
     .query(
       `SELECT a.id as id, a.quest_id as questId, q.title as questTitle
        FROM stints a
-       JOIN quests q ON q.id = a.quest_id
+       JOIN quests q ON q.id = a.quest_id AND q.retracted_at IS NULL
        WHERE a.retracted_at IS NULL AND a.dismissed_at IS NOT NULL
          AND a.id IN (${[...stintIds].map(() => "?").join(", ")})`,
     )
@@ -324,7 +324,7 @@ export function queryStints(database: Database, range: DateRange): StintRow[] {
               a.opened_at as openedAt, a.closed_at as closedAt,
               q.title as questTitle, q.confirmed as questConfirmed, q.origin_kind as questOriginKind
        FROM stints a
-       LEFT JOIN quests q ON q.id = a.quest_id
+       LEFT JOIN quests q ON q.id = a.quest_id AND q.retracted_at IS NULL
        WHERE a.retracted_at IS NULL AND a.dismissed_at IS NULL AND a.id IN (${[...stintIds].map(() => "?").join(", ")})`,
     )
     .all(...stintIds) as {
