@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+### Added
+
+- `/tempad:setup` skill: inside Claude Code it checks for bun, installs the CLI with `bun add -g @hyperlab.sh/tempad` when `tempad --version` fails, collects the configuration in conversation, runs `tempad setup --non-interactive` (secrets go in the environment, never echoed) and verifies with `tempad saga list`.
+- `tempad --version` (and `-v`).
+
+### Changed
+
+- The skill `tempad-quest` is now `quest` (`packages/core/skills/quest`), invoked as `/tempad:quest` in the plugin. `tempad skill install` still writes it as `tempad-quest` under `~/.claude/skills` (a bare `quest` is too generic outside a plugin namespace) and rewrites the frontmatter name to match.
+- The `UserPromptSubmit` hook line names `/tempad:quest` when the hook runs from the plugin and `the tempad-quest skill` for legacy `settings.json` hooks.
+- `tempad init` is now `tempad setup`; `init` still works as a hidden alias that `--help` does not list. The source moved from `src/init` to `src/setup`.
+- "Not set up" and "missing variable" errors now say: run `/tempad:setup` in Claude Code, or `tempad setup` in a terminal.
+- README install order: add the marketplace, `claude plugin install tempad@hyperlab`, run `/tempad:setup`; the CLI route and other agents (`npx skills add hyperlab-sh/tempad --skill quest`) are optional subsections.
+
+### Migration
+
+A hand-copied `~/.claude/skills/tempad-quest` keeps working. Reinstall with `tempad skill install` to get the renamed source, or remove it and use the plugin.
+
+## [0.1.0] - 2026-10-16
+
 ### Added
 
 - Claude Code plugin `tempad` (`.claude-plugin/plugin.json`, `hooks/hooks.json`): installs the `tempad-quest` skill and the w5 hooks with `claude plugin install tempad@hyperlab`. The hooks run async where they can, are silent until tempad is configured, and stand down while legacy `settings.json` hooks exist.
