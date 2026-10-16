@@ -21,6 +21,7 @@ import { deriveOrgProject, registerProject } from "./config/project-register.ts"
 import { loadRules, normalizePathForMatch } from "./config/rules.ts";
 import { openDatabase } from "./db/database.ts";
 import { setSyncState } from "./db/sync-state.ts";
+import { runInit } from "./init/index.ts";
 import { runIntentCommand } from "./intent/cli.ts";
 import { loadIntentConfig } from "./intent/config.ts";
 import { ensureTables } from "./intent/projections";
@@ -51,7 +52,7 @@ const INTENT_COMMANDS = new Set([
 const USAGE_LINES: string[] = [
   "Usage:",
   "  tempad --help | -h | help",
-  "  tempad init   (create TEMPAD_HOME with .env and tempad.toml; not available yet)",
+  "  tempad init [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
   "  tempad sync [monday|github|claude] [--full]",
   "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
   '  tempad hero init "<name>"',
@@ -435,7 +436,10 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     return 0;
   }
 
-  // `tempad init` is dispatched here, before anything reads configuration.
+  // `init` needs no configuration and opens no database: it creates them.
+  if (command === "init") {
+    return runInit(rest);
+  }
 
   if (command === "sync") {
     return runSyncCommand(rest);
