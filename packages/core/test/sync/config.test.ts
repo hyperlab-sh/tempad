@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_SYNC_BATCH_SIZE, isSyncEnabled, loadSyncConfig } from "../../src/sync/config";
+import {
+  DEFAULT_SYNC_BATCH_SIZE,
+  isSyncEnabled,
+  loadSyncConfig,
+  validateSyncUrl,
+} from "../../src/sync/config";
 import { temporaryDirectory } from "./helpers";
 
 let home: string;
@@ -64,16 +69,89 @@ describe("loadSyncConfig", () => {
   });
 
   test("an unparseable url is rejected", () => {
-    toml('[sync]\nurl = "not a url"\n');
+    toml('[sync]\nurl = "not-a-url"\n');
     expect(() => loadSyncConfig(home, TOKEN)).toThrow("[sync].url is not a valid URL");
   });
 
-  for (const url of ["libsql://h.example", "https://h.example", "wss://h.example:443"]) {
+  for (const url of ["libsql://h.example", "https://h.example", "libsql://h.example:8080"]) {
     test(`TLS scheme accepted: ${url}`, () => {
       toml(`[sync]\nurl = "${url}"\n`);
       expect(loadSyncConfig(home, TOKEN)?.url).toBe(url);
     });
   }
+
+  for (const [url, rebuilt] of [
+    ["wss://h.example:443", "wss://h.example"],
+    ["https://H.Example/", "https://h.example"],
+    ["https://h.example/db/main", "https://h.example/db/main"],
+    ["http://127.0.0.%31:8080", "http://127.0.0.1:8080"],
+  ]) {
+    test(`the url handed on is rebuilt from the checked parse: ${url}`, () => {
+      toml(`[sync]\nurl = "${url}"\n`);
+      expect(loadSyncConfig(home, TOKEN)?.url).toBe(rebuilt as string);
+    });
+  }
+
+  // review-3 M2: WHATWG URL reads `\` as `/`, @libsql/core's parser does not.
+  for (const url of [
+    "http://127.0.0.1\\@evil.com:8080",
+    "ws://localhost\\@evil.com/",
+    "http://localhost\\.evil.com",
+    "https://h.example\\path",
+  ]) {
+    test(`a backslash is rejected: ${url}`, () => {
+      toml(`[sync]\nurl = '${url}'\n`);
+      expect(() => loadSyncConfig(home, TOKEN)).toThrow("must not contain backslashes");
+    });
+  }
+
+  for (const [label, url] of [
+    ["tab", "http://127.0.0.1\t@evil.com:8080"],
+    ["newline", "http://127.0.0.1\n@evil.com:8080"],
+    ["space", " http://127.0.0.1:8080"],
+    ["NUL", "http://127.0.0.1\u0000.evil.com"],
+    ["DEL", "http://127.0.0.1\u007f.evil.com"],
+  ]) {
+    test(`a control character or whitespace is rejected: ${label}`, () => {
+      // Straight to the validator: Bun.TOML.parse cannot be trusted to carry
+      // an escaped NUL (it failed with "Failed to parse JSON" depending on the
+      // working directory), and the check must not depend on the TOML layer.
+      expect(() => validateSyncUrl(url)).toThrow("control characters");
+    });
+  }
+
+  test("a control character reaches the guard through tempad.toml too", () => {
+    toml(`[sync]\nurl = "http://127.0.0.1\\t@evil.com:8080"\n`);
+    expect(() => loadSyncConfig(home, TOKEN)).toThrow("control characters");
+  });
+
+  test("the libsql client connects to exactly the host the guard checked", async () => {
+    // The real parser @libsql/client uses, resolved through the client.
+    const client = Bun.resolveSync("@libsql/client/web", join(import.meta.dir, "..", "..", "src"));
+    const { expandConfig } = (await import(Bun.resolveSync("@libsql/core/config", client))) as {
+      expandConfig: (
+        config: { url: string; authToken?: string },
+        preferHttp: boolean,
+      ) => { scheme: string; tls: boolean; authority?: { host: string; port?: number } };
+    };
+    for (const url of [
+      "http://127.0.0.1:8080",
+      "ws://localhost:8080",
+      "http://[::1]:8080",
+      "http://127.0.0.%31:8080",
+      "libsql://h.example",
+      "https://h.example:8443/db",
+    ]) {
+      toml(`[sync]\nurl = "${url}"\n`);
+      const accepted = loadSyncConfig(home, TOKEN)?.url as string;
+      const checked = new URL(accepted);
+      const seen = expandConfig({ url: accepted, authToken: "t" }, true);
+      expect(seen.authority?.host.replace(/^\[|\]$/g, "")).toBe(
+        checked.hostname.replace(/^\[|\]$/g, ""),
+      );
+      expect(seen.tls).toBe(checked.protocol !== "http:" && checked.protocol !== "ws:");
+    }
+  });
 
   for (const url of [
     "http://127.0.0.1:8080",

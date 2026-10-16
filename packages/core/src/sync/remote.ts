@@ -8,11 +8,13 @@
  * speaks only the remote protocols and needs no native binding.
  */
 import { createClient, type InValue } from "@libsql/client/web";
-import type { SyncConfig } from "./config";
+import { type SyncConfig, validateSyncUrl } from "./config";
 import type { RemoteStatement, SqlValue, SyncRemote } from "./engine";
 
 export function openRemote(config: SyncConfig): SyncRemote {
-  const client = createClient({ url: config.url, authToken: config.token });
+  // Re-validated here so the client only ever sees a url rebuilt from a
+  // checked parse, whoever built the config.
+  const client = createClient({ url: validateSyncUrl(config.url), authToken: config.token });
   return {
     async query(sql: string, args: SqlValue[] = []) {
       const result = await client.execute({ sql, args: args as InValue[] });
