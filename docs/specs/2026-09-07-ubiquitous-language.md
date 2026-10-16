@@ -9,16 +9,16 @@ declarations, plan grain) come in a later batch.
 
 ## The rename
 
-| old                                | new                     | notes                                                                        |
-| ---------------------------------- | ----------------------- | ---------------------------------------------------------------------------- |
-| Goal                               | **Saga**                | a direction; a quest _serves_ a saga                                         |
-| Activity                           | **Stint**               | a stretch of the user's attention pursuing one quest                         |
-| Action / Step                      | **Maneuver**            | inside a stint; docs and prompts only, nothing stored                        |
-| Trace                              | Trace                   | unchanged                                                                    |
-| Quest                              | Quest                   | unchanged                                                                    |
-| quest `parent` (contributes)       | quest **advances**      | relation verb; flag `--advances <quest>`                                     |
-| quest `origin` (side quest, nexus) | quest **deviates from** | relation verb; flag `--deviates-from <quest>`; payload field `deviates_from` |
-| quest → goal link                  | quest **serves**        | flag `--serves <saga>`; payload field `serves`                               |
+| old                                | new                     | notes                                                                                                                        |
+| ---------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Goal                               | **Saga**                | a direction; a quest _serves_ a saga                                                                                         |
+| Activity                           | **Stint**               | a stretch of the user's attention pursuing one quest                                                                         |
+| Action / Step                      | **Maneuver**            | inside a stint; docs and prompts only, nothing stored                                                                        |
+| Trace                              | Trace                   | unchanged                                                                                                                    |
+| Quest                              | Quest                   | unchanged                                                                                                                    |
+| quest `parent` (contributes)       | quest **advances**      | relation verb; flag `--advances <quest>`                                                                                     |
+| quest `origin` (side quest, nexus) | quest **deviates from** | relation verb; flag `--deviates-from <quest\|stint>`; payload field `deviates_from` (stint) or `deviates_from_quest` (quest) |
+| quest → goal link                  | quest **serves**        | flag `--serves <saga>`; payload field `serves`                                                                               |
 
 ## Glossary
 
@@ -45,11 +45,33 @@ how, Projects are whose and what for.
 Every relation has exactly one verb, and the flag, the payload field and the
 column all carry that verb:
 
-| relation                    | flag                      | payload field   | column                          |
-| --------------------------- | ------------------------- | --------------- | ------------------------------- |
-| quest serves a saga         | `--serves <saga>`         | `serves`        | `quests.serves`                 |
-| quest deviates from a quest | `--deviates-from <quest>` | `deviates_from` | `quests.deviates_from_stint_id` |
-| quest advances a quest      | `--advances <quest>`      | `advances`      | (not yet stored)                |
+| relation                    | flag                      | payload field         | column                          |
+| --------------------------- | ------------------------- | --------------------- | ------------------------------- |
+| quest serves a saga         | `--serves <saga>`         | `serves`              | `quests.serves`                 |
+| quest deviates from a stint | `--deviates-from <stint>` | `deviates_from`       | `quests.deviates_from_stint_id` |
+| quest deviates from a quest | `--deviates-from <quest>` | `deviates_from_quest` | `quests.deviates_from_quest_id` |
+| quest advances a quest      | `--advances <quest>`      | `advances`            | (not yet stored)                |
+
+A `quest.branched` event's subject is always the side quest. It names what it
+left either as a stint (`deviates_from`, written by `tempad quest branch <side>
+--deviates-from <stint>`, the w5 classifier and `tempad answer --origin current`)
+or as a quest (`deviates_from_quest`, written by `tempad quest declare --new ...
+--deviates-from <quest>`, `tempad quest branch <side> --deviates-from <quest>`
+and `tempad answer --origin current` when the session has no earlier stint of
+the quest being left). A side quest's parent quest is
+`COALESCE(deviates_from_quest_id, <that stint's quest_id>)`.
+
+**Legacy declare shape.** Before migration 0024, `tempad quest declare --new
+<side> --deviates-from <parent>` wrote the event inverted: subject = the parent,
+`deviates_from` = the new side quest's id, appended at the same `at` as the side
+quest's `quest.created`. The projection put a quest id into the parent's
+`deviates_from_stint_id`. Events are never rewritten, so the `quests` reducer
+(`branchRelation`, `src/intent/projections/quest.ts`) recognizes that signature
+(a `deviates_from` naming a quest other than the subject, created at the event's
+own `at`) and reads it as the new quest deviating from the subject. Any other
+quest id in `deviates_from` (a hand-run `quest branch` before it learned quest
+ids) reads as the subject deviating from that quest. `tempad rebuild` applies
+this to an existing database.
 
 `advances` has no column yet: nothing in this codebase wrote the old `parent`
 relation, so there was nothing to rename. The legacy map already translates a
@@ -196,7 +218,10 @@ These are projection tables, created lazily by `ensureTables` rather than by a
 migration, so on a database where the intent layer was never used they do not
 exist. `runMigration` (`src/db/database.ts`) therefore tolerates both
 "no such table" and "no such column" for a migration file consisting only of
-`ALTER`s (`ADD COLUMN`, `DROP COLUMN`, `RENAME`), and ignores SQL comment lines when splitting statements. Such a
+`ALTER`s (`ADD COLUMN`, `DROP COLUMN`, `RENAME`), and ignores SQL comment lines when splitting statements. It splits
+on `;` before dropping comment lines, so a semicolon inside a comment of such a
+file breaks the "only `ALTER`s" check and the file runs as one script that fails
+on a missing table: keep semicolons out of migration comments. Such a
 database simply gets the new names from the projection's own `createSql`.
 
 The per-statement tolerance inside that transaction is deliberately narrow and
