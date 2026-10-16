@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `tempad sync --forget` is the off switch for a host that leaves sync for good. After you remove `[sync]` from `tempad.toml`, it drops the 18 sync triggers, every tombstone, the pull cursors and the server identity in one transaction, and the database stops tracking changes for a server you no longer use. It refuses with exit 1 while `[sync]` is still enabled, prints `sync: forgot triggers=<n> tombstones=<n> cursors=<n> meta=<n>` (or `sync: nothing to forget`), needs no token and never touches the network, and leaves your data and the `sync_*` columns alone. Turning sync on again re-sends everything.
+
 ### Fixed
 
 - Commit dates with a UTC offset of +-15:00 or more (never emitted by git, only by imported history) were left in offset form by migration 0021, because SQLite's `strftime` returns NULL for them, while a host that pulled the same row stored UTC. Migration 0023 now rewrites them to the same UTC text, once, atomically with the version bump, without restamping or re-dirtying the row, so every host holds one text per instant and later opens pay nothing.

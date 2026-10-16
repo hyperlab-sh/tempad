@@ -115,6 +115,22 @@ const PULL_OWN_PENDING = "pull_own_pending";
 /** The last event / mirror row or tombstone this host saw land on the server. */
 const PUSH_PROBE_EVENT = "push_probe_event";
 const PUSH_PROBE_ROW = "push_probe_row";
+/** The server identity this database last synced with (stored after a completed re-seed). */
+const SERVER_ID = "server_id";
+
+/**
+ * Every local `sync_meta` key that ties this database to one particular remote
+ * (`tempad sync --forget` deletes them). `rebuild_pending` is not here: it says
+ * the local projections lack pulled events, which stays true whatever happens to
+ * the remote. `mirror_sync_enabled` belongs to `src/sync/triggers.ts`.
+ */
+export const REMOTE_BOUND_META_KEYS: readonly string[] = [
+  SERVER_ID,
+  RESEED_PENDING,
+  PULL_OWN_PENDING,
+  PUSH_PROBE_EVENT,
+  PUSH_PROBE_ROW,
+];
 
 const META_UPSERT =
   "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
@@ -129,7 +145,7 @@ function localMeta(database: Database, key: string): string | null {
   );
 }
 
-function defaultRebuild(database: Database, options: RebuildOptions): void {
+export function defaultRebuild(database: Database, options: RebuildOptions): void {
   registerAllProjections();
   rebuildAll(database, options);
 }
@@ -152,7 +168,7 @@ export function clearRebuildMarker(database: Database, token: string): void {
  * is cleared in `beforeCommit`, inside the rebuild's own transaction: a
  * rebuild that rolls back leaves it set, one that commits takes it along.
  */
-function rebuildIfPending(
+export function rebuildIfPending(
   database: Database,
   rebuild: NonNullable<SyncRunOptions["rebuildProjections"]>,
 ): boolean {
@@ -410,7 +426,7 @@ export async function runSyncEngine(
     (await remote.query("SELECT seq FROM sync_clock WHERE id = 1"))[0]?.seq ?? 0,
   );
 
-  const storedId = localMeta(database, "server_id");
+  const storedId = localMeta(database, SERVER_ID);
   const maxCursor = (
     database.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_cursors").get() as { seq: number }
   ).seq;
@@ -486,7 +502,7 @@ export async function runSyncEngine(
       // cursors were reset when the marker was set, so the pull below
       // still starts from 0.
       database.transaction(() => {
-        database.query(META_UPSERT).run("server_id", serverId);
+        database.query(META_UPSERT).run(SERVER_ID, serverId);
         database
           .query("DELETE FROM sync_meta WHERE key = ? AND value = ?")
           .run(RESEED_PENDING, serverId);
