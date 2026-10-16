@@ -12,6 +12,11 @@ import { runScryCommand } from "../../src/scry/cli";
 import type { Check, ScryReport } from "../../src/scry/types";
 import { enableMirrorSync } from "../../src/sync/triggers";
 import {
+  backfillWindowMinutes,
+  planBackfillWindows,
+  selectBackfillSessions,
+} from "../../src/w5/backfill";
+import {
   ago,
   classifyAll,
   DAY,
@@ -23,6 +28,7 @@ import {
   NOW,
   seedHero,
   seedSession,
+  w5Config,
 } from "./fixture";
 
 const homes: Home[] = [];
@@ -47,10 +53,18 @@ function track(home: Home): Home {
 }
 
 function scryJson(home: Home, ...flags: string[]): { code: number; report: ScryReport } {
+  return scryJsonAt(home, NOW, ...flags);
+}
+
+function scryJsonAt(
+  home: Home,
+  now: Date,
+  ...flags: string[]
+): { code: number; report: ScryReport } {
   process.env.TEMPAD_HOME = home.directory;
   const lines: string[] = [];
   const code = runScryCommand(["--json", ...flags], {
-    now: NOW,
+    now,
     stdout: (line) => lines.push(line),
   });
   return { code, report: JSON.parse(lines.join("\n")) as ScryReport };
@@ -167,25 +181,51 @@ describe("backfill recommendation", () => {
       sessionsInWindow: 9,
     });
     const backfill = report.recommendations.find((entry) => entry.id === "backfill");
-    expect(backfill?.command).toBe("tempad w5 backfill --days 4");
+    // The oldest pending session's end, exactly: the command covers it however late it is run.
+    expect(backfill?.command).toBe(`tempad w5 backfill --from ${ago(3 * DAY + HOUR)}`);
     expect(backfill?.reason).toContain("classifier call");
     expect(backfill?.condition).toBeUndefined();
   });
 
-  test("the printed --days reaches the oldest unclassified session even when it is a fraction of a day short", async () => {
+  test("the printed command covers the oldest unclassified session however late it is run", async () => {
     const home = track(await makeHealthyHome());
-    // 14 d 23 h 40 m old: 15 days would drop it twenty minutes after this report.
+    // 14 d 23 h 40 m old: a day count would drop it twenty minutes after this report.
     const endedAt = ago(15 * DAY - 20 * 60_000);
     seedSession(home.database, { id: "edge", endedAt });
+    seedSession(home.database, { id: "newer", endedAt: ago(DAY) });
     const { report } = scryJson(home);
-    expect(report.stats?.w5?.windowsPending).toBe(1);
+    expect(report.stats?.w5?.windowsPending).toBe(2);
     const command = report.recommendations.find((entry) => entry.id === "backfill")?.command;
-    expect(command).toBe("tempad w5 backfill --days 16");
-    // Twenty minutes later (the run), the recommended range still holds the session.
-    const days = Number(command?.split("--days ")[1]);
-    const later = new Date(NOW.getTime() + 20 * 60_000);
-    const cutoff = new Date(later.getTime() - days * DAY).toISOString();
-    expect(endedAt >= cutoff).toBe(true);
+    expect(command).toBe(`tempad w5 backfill --from ${endedAt}`);
+    // The bound is an instant, not an age: reports made hours or days later name the same one, so
+    // the command pasted at any later time still reaches the session.
+    for (const delay of [20 * 60_000, 5 * HOUR, 3 * DAY, 40 * DAY]) {
+      const later = scryJsonAt(home, new Date(NOW.getTime() + delay), "--days", "90").report;
+      expect(later.recommendations.find((entry) => entry.id === "backfill")?.command).toBe(command);
+    }
+    // And the plan from that bound holds exactly the windows the report counted.
+    const planned = planBackfillWindows(
+      home.database,
+      selectBackfillSessions(home.database, { cutoff: endedAt }),
+      { windowMinutes: backfillWindowMinutes(w5Config) },
+    ).filter((window) => !window.covered);
+    expect(planned.length).toBe(2);
+  });
+
+  test("the bound is the oldest pending session's end, not an older one that would pull in classified work", async () => {
+    const home = track(await makeHealthyHome());
+    seedSession(home.database, { id: "pending", endedAt: ago(5 * DAY) });
+    const { report } = scryJson(home);
+    const from = report.recommendations.find((entry) => entry.id === "backfill")?.command;
+    expect(from).toBe(`tempad w5 backfill --from ${ago(5 * DAY)}`);
+    // Classified healthy-* sessions are newer than that; the plan from it holds one pending window.
+    const cutoff = ago(5 * DAY);
+    const pending = planBackfillWindows(
+      home.database,
+      selectBackfillSessions(home.database, { cutoff }),
+      { windowMinutes: backfillWindowMinutes(w5Config) },
+    ).filter((window) => !window.covered);
+    expect(pending.map((window) => window.sessionId)).toEqual(["pending"]);
   });
 
   test("--days narrows the window, so older unclassified sessions are not recommended", async () => {
@@ -248,12 +288,12 @@ describe("classification jobs", () => {
     insertFailedJob(
       home.database,
       "unknown claude session: 11111111-2222-3333-4444-555555555555",
-      ago(DAY),
+      ago(20 * 60_000),
     );
     insertFailedJob(
       home.database,
       "unknown claude session: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-      ago(2 * DAY),
+      ago(30 * 60_000),
     );
     insertFailedJob(home.database, "claude cli exited with code 1", ago(3 * DAY));
     insertFailedJob(home.database, "ancient failure", ago(30 * DAY));
@@ -295,13 +335,74 @@ describe("classification jobs", () => {
   test("unknown-session failures for sessions still missing recommend collecting, once per session count", async () => {
     const home = track(await makeHealthyHome());
     insertFailedJob(home.database, "unknown claude session: healthy-0", ago(DAY), "healthy-0");
-    insertFailedJob(home.database, "unknown claude session: gone-a", ago(DAY), "gone-a");
+    insertFailedJob(home.database, "unknown claude session: gone-a", ago(20 * 60_000), "gone-a");
     insertFailedJob(home.database, "unknown claude session: gone-a", ago(2 * DAY), "gone-a");
-    insertFailedJob(home.database, "unknown claude session: gone-b", ago(2 * DAY), "gone-b");
+    insertFailedJob(home.database, "unknown claude session: gone-b", ago(10 * 60_000), "gone-b");
     const { report } = scryJson(home);
     const entry = report.recommendations.find((item) => item.id === "w5-unknown-session");
     expect(entry?.command).toBe("tempad sync claude");
     expect(entry?.reason).toContain("2 sessions named by failed jobs");
+  });
+
+  describe("sessions missing for failures before the last claude collection", () => {
+    // The collector last ran at ago(HOUR) (makeHome). A failure at or before that instant was
+    // followed by a collection that did not find the session, so collecting again cannot help.
+    const collectedAt = ago(HOUR);
+    const plus = (milliseconds: number) =>
+      new Date(Date.parse(collectedAt) + milliseconds).toISOString();
+
+    async function run(failures: [string, string][]) {
+      const home = track(await makeHealthyHome());
+      for (const [sessionId, requestedAt] of failures) {
+        insertFailedJob(
+          home.database,
+          `unknown claude session: ${sessionId}`,
+          requestedAt,
+          sessionId,
+        );
+      }
+      return scryJson(home).report;
+    }
+
+    test("a failure one millisecond after the collection recommends it", async () => {
+      const report = await run([["late", plus(1)]]);
+      expect(recommendationIds(report)).toContain("w5-unknown-session");
+    });
+
+    test("a failure at the instant of the collection does not (the collector had the session's chance)", async () => {
+      const report = await run([["same", collectedAt]]);
+      expect(recommendationIds(report)).not.toContain("w5-unknown-session");
+      expect(checkOf(report, "w5-queue").details.join("\n")).toContain(
+        "1 session named by failed jobs has no transcript in the database even after the last claude collection",
+      );
+    });
+
+    test("a failure before the collection does not, and says nothing is left to collect", async () => {
+      const report = await run([
+        ["early-a", plus(-1)],
+        ["early-b", ago(3 * DAY)],
+      ]);
+      expect(recommendationIds(report)).not.toContain("w5-unknown-session");
+      const details = checkOf(report, "w5-queue").details.join("\n");
+      expect(details).toContain("2 sessions named by failed jobs have no transcript");
+      expect(details).toContain("nothing to collect");
+      expect(details).not.toContain("are in the database now");
+    });
+
+    test("a mix counts only the sessions that failed after the collection", async () => {
+      const report = await run([
+        ["early", ago(2 * DAY)],
+        ["late", plus(60_000)],
+        // Failed on both sides of the boundary: the newest failure decides.
+        ["both", ago(2 * DAY)],
+        ["both", plus(1)],
+      ]);
+      const entry = report.recommendations.find((item) => item.id === "w5-unknown-session");
+      expect(entry?.reason).toContain("2 sessions named by failed jobs");
+      expect(checkOf(report, "w5-queue").details.join("\n")).toContain(
+        "1 session named by failed jobs has no transcript",
+      );
+    });
   });
 
   test("a recommended full collect replaces the claude-only one", async () => {
@@ -310,7 +411,7 @@ describe("classification jobs", () => {
     insertFailedJob(
       home.database,
       "unknown claude session: 11111111-2222-3333-4444-555555555555",
-      ago(DAY),
+      ago(30 * 60_000),
       "missing-session",
     );
     const ids = recommendationIds(scryJson(home).report);
@@ -377,6 +478,71 @@ describe("projections", () => {
     const { code, report } = scryJson(home);
     expect(code).toBe(1);
     expect(checkOf(report, "projections").details.join("\n")).toContain("lacks column(s) doubt");
+  });
+
+  describe("at schema 24 (side quests keep the parent on the side quest)", () => {
+    async function homeWithSideQuest() {
+      const home = track(await makeHealthyHome());
+      const store = new EventStore(home.database);
+      const common = {
+        scope: "session" as const,
+        declaredBy: "hero" as const,
+        heroId: "H1",
+        plan: [],
+      };
+      const parent = declareQuest(store, home.database, {
+        ...common,
+        sessionId: "healthy-0",
+        newQuest: { title: "Parent", outcome: "ship", commitment: "promised" },
+        at: ago(3 * HOUR),
+      });
+      declareQuest(store, home.database, {
+        ...common,
+        sessionId: "healthy-0",
+        newQuest: {
+          title: "Side",
+          outcome: "unblock",
+          commitment: "exploratory",
+          origin: parent.questId,
+          trigger: "blocked on a flaky test",
+          kind: "blocker",
+        },
+        at: ago(2 * HOUR),
+      });
+      return { home, parentId: parent.questId };
+    }
+
+    test("a side quest's parent is replayed into quests.deviates_from_quest_id and the check passes", async () => {
+      const { home, parentId } = await homeWithSideQuest();
+      const stored = home.database
+        .query("SELECT deviates_from_quest_id AS parent FROM quests WHERE title = 'Side'")
+        .get() as { parent: string };
+      expect(stored.parent).toBe(parentId);
+      const { code, report } = scryJson(home);
+      expect(code).toBe(0);
+      const projections = checkOf(report, "projections");
+      expect(projections.status).toBe("ok");
+      expect(report.stats?.database.schemaVersion).toBe(report.stats?.database.latestSchemaVersion);
+      expect(report.stats?.database.schemaVersion).toBeGreaterThanOrEqual(24);
+    });
+
+    test("a stored parent that differs from the replay fails the check", async () => {
+      const { home } = await homeWithSideQuest();
+      home.database.exec("UPDATE quests SET deviates_from_quest_id = NULL WHERE title = 'Side'");
+      const { code, report } = scryJson(home);
+      expect(code).toBe(1);
+      expect(checkOf(report, "projections").status).toBe("fail");
+    });
+
+    test("a database without the column fails the check and names it", async () => {
+      const { home } = await homeWithSideQuest();
+      home.database.exec("ALTER TABLE quests DROP COLUMN deviates_from_quest_id");
+      const { code, report } = scryJson(home);
+      expect(code).toBe(1);
+      expect(checkOf(report, "projections").details.join("\n")).toContain(
+        "lacks column(s) deviates_from_quest_id",
+      );
+    });
   });
 
   test("an extra column fails the check and names the column", async () => {

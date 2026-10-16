@@ -27,7 +27,6 @@ import type {
   W5Stats,
 } from "./types";
 
-const BACKFILL_MARGIN_MS = 60 * 60 * 1000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** A collector that has not run for this long is called stale. */
@@ -344,23 +343,61 @@ interface QueueResult {
   stuck: number;
 }
 
-/** Failed jobs whose session was missing when they ran, and how many of those sessions still are. */
-function unknownSessionFailures(
-  database: Database,
-  since: string,
-): { total: number; missingSessions: number } {
-  const row = safely<{ total: number; missing: number } | null>(null, () => {
+interface UnknownSessionFailures {
+  /** Failed `unknown claude session` jobs in the window, whatever became of their session. */
+  total: number;
+  /** Sessions still missing whose newest failure came after the last claude collector run: collecting may find them. */
+  collectable: number;
+  /** Sessions still missing although the collector has run since their last failure: no transcript to find. */
+  uncollectable: number;
+}
+
+/**
+ * Failed jobs whose session was missing when they ran, split by whether a
+ * `sync claude` could still help. The collector's last run (`sync_state`) is
+ * the line: a session whose newest failure predates it was looked for and not
+ * found, so recommending the command again would fire until the failure ages
+ * out of the window, however often the user runs it.
+ */
+function unknownSessionFailures(database: Database, since: string): UnknownSessionFailures {
+  const rows = safely<{ session_id: string; newest: string; total: number }[]>([], () => {
     return database
       .query(
-        `SELECT COUNT(*) AS total,
-                COUNT(DISTINCT CASE WHEN NOT EXISTS (SELECT 1 FROM claude_sessions s WHERE s.id = j.session_id) THEN j.session_id END) AS missing
+        `SELECT j.session_id AS session_id,
+                MAX(COALESCE(j.requested_at, j.finished_at)) AS newest,
+                COUNT(*) AS total
            FROM w5_jobs j
           WHERE j.state = 'failed' AND j.error LIKE 'unknown claude session%'
-            AND COALESCE(j.finished_at, j.requested_at) >= ?`,
+            AND COALESCE(j.finished_at, j.requested_at) >= ?
+            AND NOT EXISTS (SELECT 1 FROM claude_sessions s WHERE s.id = j.session_id)
+          GROUP BY j.session_id`,
       )
-      .get(since) as { total: number; missing: number };
+      .all(since) as { session_id: string; newest: string; total: number }[];
   });
-  return { total: row?.total ?? 0, missingSessions: row?.missing ?? 0 };
+  const total = safely<{ n: number }>({ n: 0 }, () => {
+    return database
+      .query(
+        `SELECT COUNT(*) AS n FROM w5_jobs
+            WHERE state = 'failed' AND error LIKE 'unknown claude session%'
+              AND COALESCE(finished_at, requested_at) >= ?`,
+      )
+      .get(since) as { n: number };
+  }).n;
+  const lastCollected = safely<string | null>(null, () => {
+    const row = database
+      .query("SELECT last_sync_at FROM sync_state WHERE source = 'claude'")
+      .get() as {
+      last_sync_at: string;
+    } | null;
+    return row?.last_sync_at ?? null;
+  });
+  let collectable = 0;
+  let uncollectable = 0;
+  for (const row of rows) {
+    if (lastCollected === null || row.newest > lastCollected) collectable += 1;
+    else uncollectable += 1;
+  }
+  return { total, collectable, uncollectable };
 }
 
 function queueCheck(database: Database, now: Date, home: string): QueueResult {
@@ -420,18 +457,22 @@ function queueCheck(database: Database, now: Date, home: string): QueueResult {
       reason: `${failedLast7Days} classification jobs failed in the last 7 days; the log has the error`,
     });
     const unknown = unknownSessionFailures(database, since);
-    if (unknown.total > 0) {
-      if (unknown.missingSessions > 0) {
-        recommendations.push({
-          id: "w5-unknown-session",
-          command: "tempad sync claude",
-          reason: `${plural(unknown.missingSessions, "session")} named by failed jobs (\`unknown claude session\`) ${unknown.missingSessions === 1 ? "is" : "are"} still not in the database; collect ${unknown.missingSessions === 1 ? "it" : "them"}, then backfill`,
-        });
-      } else {
-        details.push(
-          `all ${unknown.total} \`unknown claude session\` failures are for sessions that are in the database now: the job ran before the session was collected, and the backfill below covers them`,
-        );
-      }
+    if (unknown.collectable > 0) {
+      recommendations.push({
+        id: "w5-unknown-session",
+        command: "tempad sync claude",
+        reason: `${plural(unknown.collectable, "session")} named by failed jobs (\`unknown claude session\`) ${unknown.collectable === 1 ? "is" : "are"} not in the database and failed after the last claude collection; collect ${unknown.collectable === 1 ? "it" : "them"}, then backfill`,
+      });
+    }
+    if (unknown.uncollectable > 0) {
+      details.push(
+        `${plural(unknown.uncollectable, "session")} named by failed jobs ${unknown.uncollectable === 1 ? "has" : "have"} no transcript in the database even after the last claude collection (not under CLAUDE_DIRS, or deleted): nothing to collect`,
+      );
+    }
+    if (unknown.total > 0 && unknown.collectable === 0 && unknown.uncollectable === 0) {
+      details.push(
+        `all ${unknown.total} \`unknown claude session\` failures are for sessions that are in the database now: the job ran before the session was collected, and the backfill below covers them`,
+      );
     }
   }
   return {
@@ -505,10 +546,6 @@ function coverageCheck(input: ScryInput): CoverageResult {
       stats,
     };
   }
-  const oldestEnd = oldest === null ? now.getTime() : Date.parse(oldest);
-  // Backfill keeps sessions that ended at or after `now - days`; the margin covers the time between
-  // this report and the run, so the oldest pending session is not dropped in between.
-  const days = Math.max(1, Math.ceil((now.getTime() - oldestEnd + BACKFILL_MARGIN_MS) / DAY_MS));
   return {
     check: check(
       "w5-coverage",
@@ -520,8 +557,10 @@ function coverageCheck(input: ScryInput): CoverageResult {
     recommendations: [
       {
         id: "backfill",
-        command: `tempad w5 backfill --days ${days}`,
-        reason: `${plural(stale.length, "window")} in ${plural(pendingSessions.size, "session")} have no trace; spends one classifier call per window`,
+        // An exact lower bound, not a day count: it covers the oldest pending session however long
+        // the user waits before running it (`--days` is measured from the moment of the run).
+        command: `tempad w5 backfill --from ${oldest ?? new Date(now.getTime() - windowDays * DAY_MS).toISOString()}`,
+        reason: `${plural(stale.length, "window")} in ${plural(pendingSessions.size, "session")} have no trace${inFlight.length > 0 ? ` (plus ${plural(inFlight.length, "window")} still in flight, which it also classifies)` : ""}; spends one classifier call per window`,
       },
     ],
     stats,

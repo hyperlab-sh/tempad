@@ -205,7 +205,7 @@ Notable `[w5]` defaults: `backend = "claude-cli"`, `mode = "declared"`, `timeout
 ```sh
 tempad sync [monday|github|claude] [--full]
 tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path]
-tempad w5 backfill      # classify recent sessions the hook missed
+tempad w5 backfill      # classify recent sessions the hook missed (--days <n>, or --from <iso> for an exact start)
 tempad review           # open doubts and unconfirmed quests
 tempad scry             # health check: is the data sound, is a backfill or eval due?
 tempad --help           # every command
@@ -215,7 +215,7 @@ tempad --help           # every command
 
 ### `tempad scry`
 
-A read-only health check of the data. It prints **Health** (config, schema, `quick_check`, projections against a replay of the event log, collector freshness, failed or stuck w5 jobs, unclassified windows, work waiting for a human, sync state), **Stats** (rows per source, quests, stints, windows, jobs) and **Recommendations**: each is a command you can paste plus one line on why. A backfill is recommended when sessions in the last `[w5].backfill_days` days (or `--days <n>`) have windows nobody classified; an eval is only ever listed as conditional, because the database does not record which model, prompts or settings produced a classification, so the data cannot say one is due.
+A read-only health check of the data. It prints **Health** (config, schema, `quick_check`, projections against a replay of the event log, collector freshness, failed or stuck w5 jobs, unclassified windows, work waiting for a human, sync state), **Stats** (rows per source, quests, stints, windows, jobs) and **Recommendations**: each is a command you can paste plus one line on why. A backfill is recommended when sessions in the last `[w5].backfill_days` days (or `--days <n>`) have windows nobody classified, as `tempad w5 backfill --from <time>` with the exact end of the oldest such session, so it still covers it when you run it later; an eval is only ever listed as conditional, because the database does not record which model, prompts or settings produced a classification, so the data cannot say one is due.
 
 ```sh
 tempad scry                # human-readable
