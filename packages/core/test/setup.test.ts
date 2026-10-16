@@ -12,7 +12,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { ENV_VARS, loadConfig, parseDotEnv } from "../src/config/env.ts";
+import { ENV_VARS, loadConfig, parseDotEnv, SETUP_VARS } from "../src/config/env.ts";
 import { loadRules } from "../src/config/rules.ts";
 import { defaultIntentConfig, loadIntentConfig } from "../src/intent/config.ts";
 import { flagNameFor, formatEnvValue, renderEnvFile } from "../src/setup/env-file.ts";
@@ -60,7 +60,7 @@ afterEach(() => {
 
 /** `--flag value` pairs for the given values, derived from ENV_VARS like the command does. */
 function flagsFor(values: Record<string, string>): string[] {
-  return ENV_VARS.flatMap((variable) =>
+  return SETUP_VARS.flatMap((variable) =>
     values[variable.name] === undefined
       ? []
       : [`--${flagNameFor(variable)}`, values[variable.name] as string],
@@ -157,8 +157,8 @@ function nonInteractive(values: Record<string, string>, extra: string[] = []): s
 
 describe("flag names", () => {
   test("every variable has a distinct flag derived from its name", () => {
-    const flags = ENV_VARS.map(flagNameFor);
-    expect(new Set(flags).size).toBe(ENV_VARS.length);
+    const flags = SETUP_VARS.map(flagNameFor);
+    expect(new Set(flags).size).toBe(SETUP_VARS.length);
     expect(flags).toContain("monday-api-token");
     expect(flags).toContain("gh-orgs");
     expect(flags).toContain("tz");
@@ -166,6 +166,17 @@ describe("flag names", () => {
 });
 
 describe("non-interactive", () => {
+  test("TEMPAD_SYNC_TOKEN is no flag, is not required, and is never written", async () => {
+    expect(
+      (await harness().run(nonInteractive(VALID, ["--tempad-sync-token", "x"]))) as number,
+    ).toBe(2);
+    const h = harness({ env: { TEMPAD_SYNC_TOKEN: "sync-secret-jwt" } });
+    expect(await h.run(nonInteractive(VALID, ["--no-verify"]))).toBe(0);
+    const text = readFileSync(join(tempadHome, ".env"), "utf8");
+    expect(text).not.toContain("TEMPAD_SYNC_TOKEN");
+    expect(text).not.toContain("sync-secret-jwt");
+  });
+
   test("writes .env (0600) and tempad.toml, creating the home with 0700", async () => {
     const h = harness();
     const code = await h.run(nonInteractive(VALID, ["--no-verify"]));
@@ -192,7 +203,7 @@ describe("non-interactive", () => {
       process.env.TEMPAD_HOME = tempadHome;
       const config = loadConfig(
         "test",
-        ENV_VARS.map((variable) => variable.key),
+        SETUP_VARS.map((variable) => variable.key),
       );
       expect(config.mondayApiToken).toBe(MONDAY_TOKEN);
       expect(config.mondayUser).toBe('Jane "JD" Doe # intern');
@@ -266,7 +277,7 @@ describe("non-interactive", () => {
     const h = harness();
     const code = await h.run([...NON_INTERACTIVE, tempadHome]);
     expect(code).toBe(1);
-    for (const variable of ENV_VARS.filter((candidate) => !candidate.optional)) {
+    for (const variable of SETUP_VARS.filter((candidate) => !candidate.optional)) {
       expect(h.stderr()).toContain(`${variable.name} (--${flagNameFor(variable)})`);
     }
     expect(h.stderr()).not.toContain("--gh-token");
@@ -591,7 +602,7 @@ describe("env file format", () => {
   test("renderEnvFile lists every variable, carries extras, and is parseable", () => {
     const text = renderEnvFile(VALID, { ANTHROPIC_API_KEY: "sk-extra" });
     const parsed = parseDotEnv(text);
-    for (const variable of ENV_VARS.filter((candidate) => !candidate.optional)) {
+    for (const variable of SETUP_VARS.filter((candidate) => !candidate.optional)) {
       expect(parsed[variable.name]).toBeDefined();
       expect(text).toContain(`# ${variable.description}`);
     }
@@ -660,7 +671,7 @@ describe("secrets in output", () => {
 
 /** One answer line per variable, in ENV_VARS order; unlisted variables answer with Enter. */
 function answers(given: Record<string, string>): string {
-  return ENV_VARS.map((variable) => `${given[variable.name] ?? ""}\n`).join("");
+  return SETUP_VARS.map((variable) => `${given[variable.name] ?? ""}\n`).join("");
 }
 
 const DETECTED = {
@@ -735,7 +746,7 @@ describe("interactive wizard", () => {
     });
     // Insert a bad time zone answer before the real (Enter) one.
     const lines = input.split("\n");
-    const tzIndex = ENV_VARS.findIndex((variable) => variable.name === "TZ");
+    const tzIndex = SETUP_VARS.findIndex((variable) => variable.name === "TZ");
     lines.splice(tzIndex, 0, "Nowhere/Land");
     const h = harness({ isTTY: true, input: lines.join("\n") });
     const code = await h.run(["--home", tempadHome, "--no-verify"]);
@@ -856,6 +867,16 @@ describe("interactive wizard", () => {
       expect(written.HOST_SLUG).toBe("renamed");
       expect(written.ANTHROPIC_API_KEY).toBe("sk-ant-keep-me");
       expect(statSync(join(tempadHome, ".env")).mode & 0o777).toBe(0o600);
+    });
+
+    test("never asks for TEMPAD_SYNC_TOKEN, and keeps a line the user added by hand, unprinted", async () => {
+      const envPath = join(tempadHome, ".env");
+      writeFileSync(envPath, `${readFileSync(envPath, "utf8")}TEMPAD_SYNC_TOKEN=sync-secret-jwt\n`);
+      const h = harness({ isTTY: true, input: `y\n${answers({})}` });
+      expect(await h.run(["--home", tempadHome, "--no-verify"])).toBe(0);
+      expect(h.everything()).not.toContain("TEMPAD_SYNC_TOKEN");
+      expect(h.everything()).not.toContain("sync-secret-jwt");
+      expect(parseDotEnv(readFileSync(envPath, "utf8")).TEMPAD_SYNC_TOKEN).toBe("sync-secret-jwt");
     });
 
     test("--force skips the confirmation but keeps lines tempad does not own", async () => {

@@ -19,6 +19,7 @@ export const REPORT_CONFIG: Config = {
   hostSlug: "test-host",
   tz: TIME_ZONE,
   since: "2026-01-01",
+  syncToken: "unused",
   home: "/tmp/tempad-reports-test-home",
 };
 

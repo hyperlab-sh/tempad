@@ -14,6 +14,8 @@ export interface Config {
   hostSlug: string;
   tz: string;
   since: string;
+  /** Bearer JWT for the push-sync server; only commands run with `[sync]` enabled ask for it. */
+  syncToken: string;
   home: string;
 }
 
@@ -39,6 +41,17 @@ export interface EnvVar {
   kind: EnvVarKind;
   /** Optional variables never make a command fail when absent. */
   optional?: true;
+  /**
+   * `false` keeps the variable out of `tempad setup` (no prompt, no flag, not written to `.env`):
+   * it is set by hand and only read by commands that list it in `needs`. A line for it in an
+   * existing `.env` survives setup like any other line tempad does not own.
+   */
+  setup?: false;
+  /**
+   * Completes `<NAME> ...` when the variable is missing, replacing the generic
+   * `<command> needs <NAME>` wording, for variables whose need depends on other configuration.
+   */
+  requiredWhen?: string;
 }
 
 /**
@@ -124,7 +137,21 @@ export const ENV_VARS: readonly EnvVar[] = [
     secret: false,
     kind: "string",
   },
+  {
+    name: "TEMPAD_SYNC_TOKEN",
+    key: "syncToken",
+    description: "Push-sync server token (JWT); only needed when [sync] is enabled in tempad.toml",
+    secret: true,
+    kind: "string",
+    setup: false,
+    requiredWhen: "is required when [sync] is enabled",
+  },
 ];
+
+/** The variables `tempad setup` asks for, flags for and writes: `ENV_VARS` minus `setup: false`. */
+export const SETUP_VARS: readonly EnvVar[] = ENV_VARS.filter(
+  (variable) => variable.setup !== false,
+);
 
 /** Raised when a command's required configuration is missing or malformed. */
 export class ConfigError extends Error {
@@ -215,12 +242,10 @@ export const NOT_SET_UP_MESSAGE = `tempad is not set up yet; ${SETUP_HINT}`;
  */
 function guardedNames(): string[] {
   return [
+    // Includes TEMPAD_SYNC_TOKEN: a project's .env must never pick the server credential.
     ...ENV_VARS.map((variable) => variable.name),
     "TEMPAD_HOME",
     "ANTHROPIC_API_KEY",
-    // Push sync's bearer token: a project's .env must never pick the server
-    // credential (loadSyncConfig prefers process.env over TEMPAD_HOME/.env).
-    "TEMPAD_SYNC_TOKEN",
   ];
 }
 
@@ -262,6 +287,10 @@ function parseBoolean(value: string): boolean | undefined {
   return undefined;
 }
 
+function conditionalFor(name: string): string | undefined {
+  return ENV_VARS.find((variable) => variable.name === name)?.requiredWhen;
+}
+
 /**
  * Reads `process.env`, then `<home>/.env` (process.env wins), and validates only the
  * variables in `needs`. Every missing variable is named in one `ConfigError`. Required
@@ -289,11 +318,20 @@ export function loadConfig<K extends ConfigKey>(
     .filter((variable) => !variable.optional && isMissing(variable))
     .map((variable) => variable.name);
   if (missing.length > 0) {
-    throw new ConfigError(
-      `${command} needs ${missing.join(", ")}; set ${missing.length === 1 ? "it" : "them"} in ${join(home, ".env")} or ${SETUP_HINT}`,
-      command,
-      missing,
-    );
+    const sentences: string[] = [];
+    const plain = missing.filter((name) => !conditionalFor(name));
+    if (plain.length > 0) {
+      sentences.push(
+        `${command} needs ${plain.join(", ")}; set ${plain.length === 1 ? "it" : "them"} in ${join(home, ".env")} or ${SETUP_HINT}`,
+      );
+    }
+    for (const name of missing) {
+      const condition = conditionalFor(name);
+      if (condition) {
+        sentences.push(`${name} ${condition}; set it in ${join(home, ".env")} or the environment`);
+      }
+    }
+    throw new ConfigError(sentences.join(". "), command, missing);
   }
 
   const loaded: Record<string, unknown> = { home };

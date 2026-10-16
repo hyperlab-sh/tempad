@@ -11,7 +11,8 @@ export interface PushSyncRequest {
   database: Database;
   home: string;
   hostSlug: string;
-  env: Record<string, string | undefined>;
+  /** `loadConfig`'s `syncToken`; undefined when the command did not ask for it (sync disabled). */
+  syncToken: string | undefined;
   push: boolean;
   pull: boolean;
 }
@@ -46,7 +47,7 @@ export async function runPushSync(
   request: PushSyncRequest,
   openRemote?: (config: NonNullable<ReturnType<typeof loadSyncConfig>>) => SyncRemote,
 ): Promise<SyncRunSummary | null> {
-  const config = loadSyncConfig(request.home, request.env);
+  const config = loadSyncConfig(request.home, request.syncToken);
   if (config === null) return null;
   const open = openRemote ?? (await import("./remote")).openRemote;
   let remote: SyncRemote | undefined;

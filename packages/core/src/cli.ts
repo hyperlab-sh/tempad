@@ -204,7 +204,13 @@ async function runSyncCommand(args: string[]): Promise<number> {
     return 1;
   }
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
-  if (syncEnabled && !needs.includes("hostSlug")) needs.push("hostSlug");
+  // Push sync needs the host tag and the server token, and only when [sync] is enabled:
+  // without it the token is never read.
+  if (syncEnabled) {
+    for (const key of ["hostSlug", "syncToken"] as const) {
+      if (!needs.includes(key)) needs.push(key);
+    }
+  }
   const label = source === undefined ? "tempad sync" : `tempad sync ${source}`;
   const { config, database } = prepareCommand(label, needs);
 
@@ -235,7 +241,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
       database,
       home: config.home,
       hostSlug: config.hostSlug,
-      env: process.env,
+      syncToken: syncEnabled ? config.syncToken : undefined,
       push: directional ? values.push : true,
       pull: directional ? values.pull : true,
     });

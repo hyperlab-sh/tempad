@@ -1,3 +1,4 @@
+import { childEnvironment } from "../config/child-env";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "./classifier";
 import { classifyWithRetry } from "./classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt";
@@ -18,6 +19,8 @@ const KILL_GRACE_MS = 5_000;
 export const defaultSpawn: CliSpawn = async (argv, options) => {
   const child = Bun.spawn(argv, {
     cwd: options.cwd,
+    // The model needs no tempad credential, least of all the sync server's.
+    env: childEnvironment(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

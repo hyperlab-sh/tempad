@@ -33,6 +33,7 @@ function makeConfig(home = "/tmp/tempad-test-home"): Config {
     hostSlug: "test-host",
     tz: "America/Sao_Paulo",
     since: "2026-07-01",
+    syncToken: "unused",
     home,
   };
 }

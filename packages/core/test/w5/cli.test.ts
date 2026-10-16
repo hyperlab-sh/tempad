@@ -47,6 +47,7 @@ function makeConfig(home: string): Config {
     hostSlug: "host",
     tz: "UTC",
     since: "2020-01-01",
+    syncToken: "unused",
     home,
   };
 }
@@ -61,13 +62,29 @@ describe("w5 enqueue", () => {
         spawnCalls.push(options);
       };
 
-      const code = await runW5Command(["enqueue", "--session", "s1"], {
-        database,
-        config: makeConfig(dir),
-        intentConfig: defaultIntentConfig(),
-        stdout: () => {},
-        spawn,
-      });
+      process.env.TEMPAD_SYNC_TOKEN = "sync-secret-jwt";
+      process.env.MONDAY_API_TOKEN = "monday-secret";
+      process.env.GH_TOKEN = "github-secret";
+      process.env.ANTHROPIC_API_KEY = "sk-ant-passes-through";
+      let code: number;
+      try {
+        code = await runW5Command(["enqueue", "--session", "s1"], {
+          database,
+          config: makeConfig(dir),
+          intentConfig: defaultIntentConfig(),
+          stdout: () => {},
+          spawn,
+        });
+      } finally {
+        for (const name of [
+          "TEMPAD_SYNC_TOKEN",
+          "MONDAY_API_TOKEN",
+          "GH_TOKEN",
+          "ANTHROPIC_API_KEY",
+        ]) {
+          delete process.env[name];
+        }
+      }
 
       expect(code).toBe(0);
       expect(spawnCalls).toHaveLength(1);
@@ -76,6 +93,11 @@ describe("w5 enqueue", () => {
       expect(spawnCalls[0]?.cmd).toContain("run");
       // The detached run inherits the hook's cwd (a user's project); its .env must not load.
       expect(spawnCalls[0]?.cmd).toContain("--no-env-file");
+      expect(spawnCalls[0]?.env?.TEMPAD_SYNC_TOKEN).toBeUndefined();
+      expect(spawnCalls[0]?.env?.MONDAY_API_TOKEN).toBeUndefined();
+      expect(spawnCalls[0]?.env?.GH_TOKEN).toBeUndefined();
+      expect(spawnCalls[0]?.env?.ANTHROPIC_API_KEY).toBe("sk-ant-passes-through");
+      expect(spawnCalls[0]?.env?.TEMPAD_HOME).toBe(dir);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

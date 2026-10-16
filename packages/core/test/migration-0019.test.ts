@@ -603,6 +603,7 @@ describe("mirror sync triggers", () => {
         hostSlug: "host-a",
         tz: "UTC",
         since: "2020-01-01T00:00:00Z",
+        syncToken: "unused",
         home,
       };
 
