@@ -458,7 +458,7 @@ async function runIntentDispatch(command: string, rest: string[]): Promise<numbe
 }
 
 async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[]): Promise<number> {
-  const plan = planW5Command(command, rest);
+  const plan = planW5Command(command, rest, { syncEnabled: isSyncEnabled(tempadHome()) });
   if (plan === null) {
     printUsage();
     return 2;
