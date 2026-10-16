@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env";
+import type { HomeConfig } from "../config/env";
 import type { W5Config } from "../intent/config";
 import { hasAnyDeclaration } from "../intent/declarations";
 import { applyIncremental, ensureTables } from "../intent/projections";
@@ -109,7 +109,7 @@ function chunkByWindow<T extends { ts: string }>(messages: T[], windowMinutes: n
 
 export async function backfill(
   database: Database,
-  _config: Config,
+  _config: HomeConfig,
   intentConfig: W5Config,
   classifier: Classifier,
   options: BackfillOptions,

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { join } from "node:path";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import { loadRules, resolveBoard } from "../config/rules.ts";
 import { getSyncState } from "../db/sync-state.ts";
 import type { Collector, SyncOptions, SyncSummary } from "./types.ts";
@@ -417,9 +417,16 @@ function upsertItem(
   return rowChanged(database) ? "updated" : "unchanged";
 }
 
-export const mondayCollector: Collector = {
+export const MONDAY_NEEDS = ["mondayApiToken", "mondayUser"] as const;
+
+export const mondayCollector: Collector<(typeof MONDAY_NEEDS)[number]> = {
   name: "monday",
-  async sync(database: Database, config: Config, options: SyncOptions): Promise<SyncSummary> {
+  needs: MONDAY_NEEDS,
+  async sync(
+    database: Database,
+    config: LoadedConfig<(typeof MONDAY_NEEDS)[number]>,
+    options: SyncOptions,
+  ): Promise<SyncSummary> {
     const fetchFn = options.fetch ?? fetch;
     const warnings: string[] = [];
     let inserted = 0;

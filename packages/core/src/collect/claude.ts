@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import {
   expandHome,
   loadRules,
@@ -417,7 +417,7 @@ interface SyncFileResult {
 async function syncFile(
   filePath: string,
   claudeDir: string,
-  config: Config,
+  config: LoadedConfig<"hostSlug">,
   rules: ReturnType<typeof loadRules>,
   queries: ClaudeQueries,
   since: string | undefined,
@@ -523,7 +523,7 @@ async function syncFile(
 
 export async function syncOneSessionFile(
   database: Database,
-  config: Config,
+  config: LoadedConfig<"claudeDirs" | "hostSlug">,
   filePath: string,
 ): Promise<SyncSummary> {
   const rulesPath = join(config.home, "tempad.toml");
@@ -612,10 +612,17 @@ export function reresolveSessions(
   return moved;
 }
 
-export const claudeCollector: Collector = {
-  name: "claude",
+export const CLAUDE_NEEDS = ["claudeDirs", "since", "hostSlug"] as const;
 
-  async sync(database: Database, config: Config, options: SyncOptions): Promise<SyncSummary> {
+export const claudeCollector: Collector<(typeof CLAUDE_NEEDS)[number]> = {
+  name: "claude",
+  needs: CLAUDE_NEEDS,
+
+  async sync(
+    database: Database,
+    config: LoadedConfig<(typeof CLAUDE_NEEDS)[number]>,
+    options: SyncOptions,
+  ): Promise<SyncSummary> {
     const warnings: string[] = [];
     let sessionsInserted = 0;
     let sessionsUpdated = 0;

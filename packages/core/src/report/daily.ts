@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import { queryImpacts } from "../intent/api.ts";
 import { formatEvidenceRef } from "../intent/evidence-ref.ts";
 import { projectLabel } from "./format.ts";
@@ -37,7 +37,7 @@ function projectKeyString(key: ProjectKey): string {
   return `${key.org}/${key.project}`;
 }
 
-function render(database: Database, config: Config, options: ReportOptions): string {
+function render(database: Database, config: LoadedConfig<"tz">, options: ReportOptions): string {
   const timeZone = config.tz;
   const prDate = options.prDate ?? "merged";
   const range = {

@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { Config } from "../config/env.ts";
+import type { LoadedConfig } from "../config/env.ts";
 import {
   querySideQuests,
   queryStintTraceIntervals,
@@ -31,7 +31,7 @@ function projectKeyString(key: ProjectKey): string {
   return `${key.org}/${key.project}`;
 }
 
-function render(database: Database, config: Config, options: ReportOptions): string {
+function render(database: Database, config: LoadedConfig<"tz">, options: ReportOptions): string {
   const timeZone = config.tz;
   const range = {
     from: options.from,
