@@ -210,32 +210,26 @@ project = "coolify"
       expect(resolvePath(realRule, viaLink).name).toBe("Dev Server");
       expect(resolvePath(realRule, join(viaLink, "deploy/scripts")).name).toBe("Dev Server");
       expect(resolvePath(realRule, join(linkDir, "coolify2")).name).toBeNull();
+
+      // Rule registered through the link for a folder that does not exist yet.
+      const newRule = loadRules(pathRuleToml(join(linkDir, "newproj")));
+      expect(resolvePath(newRule, join(root, "real", "newproj", "x")).name).toBe("Dev Server");
     });
   });
 
   test("path rule resolves symlinks so a linked cwd matches the real folder's rule", () => {
-    const root = mkdtempSync(join(tmpdir(), "tempad-rules-symlink-"));
-    const realDir = join(root, "real", "coolify");
-    const linkDir = join(root, "link");
-    mkdirSync(realDir, { recursive: true });
-    symlinkSync(realDir, linkDir);
+    withTempRoot((root) => {
+      const realDir = join(root, "real", "coolify");
+      const linkDir = join(root, "link");
+      mkdirSync(realDir, { recursive: true });
+      symlinkSync(realDir, linkDir);
 
-    try {
-      const path = writeToml(`
-[[projects]]
-path = "${realDir.replace(/\\/g, "\\\\")}"
-name = "Dev Server"
-org = "mosaic"
-project = "coolify"
-`);
-      const rules = loadRules(path);
+      const rules = loadRules(pathRuleToml(realDir));
       expect(resolvePath(rules, linkDir).name).toBe("Dev Server");
 
       mkdirSync(join(realDir, "deploy"), { recursive: true });
       expect(resolvePath(rules, join(linkDir, "deploy")).name).toBe("Dev Server");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    });
   });
 
   test("path rules match before pattern rules when listed first", () => {

@@ -76,7 +76,8 @@ function stripTrailingSlash(path: string): string {
  * `path` rule's configured folder (at load time) and the `cwd` it's matched
  * against (at match time), so `~/work/x/`, a symlinked component, or a
  * differently-cased path (on case-insensitive filesystems) all normalize to
- * the same string before comparison.
+ * the same string before comparison. A dangling symlink counts as missing
+ * (`existsSync` follows links), so it is left unresolved.
  */
 export function normalizePathForMatch(path: string, home: string): string {
   const expanded = expandHome(path, home);
