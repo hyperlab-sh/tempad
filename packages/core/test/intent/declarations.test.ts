@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { encodeTime } from "ulid";
 import { openDatabase } from "../../src/db/database";
 import {
   activeDeclaredQuests,
@@ -123,6 +124,65 @@ describe("declarations", () => {
     expect(
       currentDeclaredQuest(database, { sessionId: "s1", at: "2026-09-07T10:30:00.000Z" })?.questId,
     ).toBe(second.questId);
+  });
+
+  test("two declarations at the same instant: the higher uid wins, whatever the local id order", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const store = new EventStore(database);
+    const heroId = seedHero(database, store);
+    for (const [questId, title] of [
+      ["QA", "Alpha"],
+      ["QB", "Beta"],
+    ]) {
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hero",
+          kind: "quest.created",
+          subject: questId as string,
+          payload: { owner: { kind: "hero", id: heroId }, title, confirmed: true },
+        }),
+      );
+    }
+    const at = "2026-09-07T09:00:00.000Z";
+    // Pulled from two hosts: QA's declaration arrived first (lower id) but was
+    // made later (higher uid) than QB's.
+    for (const [questId, uid] of [
+      ["QA", `${encodeTime(Date.parse(at), 10)}0000000000000009`],
+      ["QB", `${encodeTime(Date.parse(at), 10)}0000000000000001`],
+    ]) {
+      database
+        .query(
+          `INSERT INTO events (at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host, sync_dirty)
+           VALUES (?, ?, 'hero', 's1', 'quest.declared', ?, ?, ?, 'host-b', 0)`,
+        )
+        .run(
+          at,
+          at,
+          questId as string,
+          JSON.stringify({
+            session_id: "s1",
+            quest_id: questId,
+            plan: [],
+            scope: "session",
+            declared_by: "hero",
+            at,
+          }),
+          uid as string,
+        );
+    }
+
+    expect(currentDeclaredQuest(database, { sessionId: "s1", at })?.questId).toBe("QA");
+    expect(
+      activeDeclaredQuests(database, { sessionId: "s1", at }).map((quest) => [
+        quest.questId,
+        quest.alias,
+      ]),
+    ).toEqual([
+      ["QB", "Q1"],
+      ["QA", "Q2"],
+    ]);
   });
 
   test("a subagent declaration is scoped to its parent session and does not leak to the parent's own query", () => {

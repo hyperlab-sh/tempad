@@ -21,25 +21,12 @@ function temporaryPath(name: string): string {
  * own `createSql`, and old-vocabulary rows in `events`.
  */
 function seedPreRenameDatabase(path: string): void {
-  // Let the production runner apply 0001-0010 (it knows not to split trigger
-  // bodies on their semicolons, and tolerates the ALTERs that target
-  // projection tables the intent layer has not created yet). Migration 0011 is
-  // held back by pinning `user_version` to 10 afterwards, so the assertions
-  // below exercise the real 0011 through `openDatabase`.
-  const staging = openDatabase(path);
-
-  // `openDatabase` just ran every migration up to head, including plain
-  // `ALTER TABLE ... ADD COLUMN`s that are not on the lazily-created
-  // projection tables (so not covered by the "no such table" tolerance) --
-  // 0017's two columns on the always-present `gh_pull_requests`. Rewinding
-  // `user_version` to 10 below and re-opening later replays those same
-  // ALTERs against a table that already has them. Drop them back off before
-  // the rewind so 0017 (and any future plain ALTER on a real table) can
-  // re-apply cleanly, exactly as it would on a real pre-0011 database.
-  staging.exec("ALTER TABLE gh_pull_requests DROP COLUMN first_authored_at;");
-  staging.exec("ALTER TABLE gh_pull_requests DROP COLUMN updated_at;");
-
-  staging.exec("PRAGMA user_version = 10;");
+  // Let the production runner apply exactly 0001-0010 (it knows not to split
+  // trigger bodies on their semicolons, and tolerates the ALTERs that target
+  // projection tables the intent layer has not created yet), leaving
+  // `user_version` at 10, so the assertions below exercise the real 0011
+  // onward through `openDatabase`.
+  const staging = openDatabase(path, { upToVersion: 10 });
 
   // The projection tables as `ensureTables` created them on main, already
   // carrying the columns 0006-0010 would have added.
@@ -72,7 +59,7 @@ describe("the real 0001-0011 chain over a pre-rename database", () => {
 
     expect(
       (database.query("PRAGMA user_version").get() as { user_version: number }).user_version,
-    ).toBe(18);
+    ).toBe(19);
     expect(database.query("PRAGMA integrity_check").get()).toEqual({
       integrity_check: "ok",
     });

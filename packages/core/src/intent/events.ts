@@ -51,7 +51,14 @@ export interface EventInput {
 }
 
 export interface EventRecord {
+  /** Local row id. Differs between hosts; never an ordering or identity key. */
   id: number;
+  /**
+   * Global id (ULID) and replay order key. Null only for a row inserted by
+   * hand, outside `EventStore`, since the database was opened; `openDatabase`
+   * backfills those on the next open.
+   */
+  uid: string | null;
   at: string;
   recordedAt: string;
   actor: Actor;
@@ -59,4 +66,8 @@ export interface EventRecord {
   kind: EventKind;
   subject: string;
   payload: Record<string, unknown>;
+  /** Origin host's `HOST_SLUG`; null when appended with no `sync_local` row. */
+  syncHost: string | null;
+  /** True until push has sent the event; false once pushed, or when pulled. */
+  syncDirty: boolean;
 }

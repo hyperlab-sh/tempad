@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { encodeTime } from "ulid";
 import { openDatabase } from "../../src/db/database";
 import { newUlid } from "../../src/intent/ids";
-import { applyIncremental, ensureTables } from "../../src/intent/projections";
+import { applyIncremental, ensureTables, rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import { dedupe } from "../../src/w5/dedupe";
@@ -270,5 +271,41 @@ describe("w5 dedupe", () => {
       retracted_at: string | null;
     };
     expect(quest1.retracted_at).toBeNull();
+  });
+
+  test("keeps the trace with the lowest uid, not the lowest local id (a pulled event arrived later)", () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    const heroId = seedHero(database, store);
+    createQuest(store, database, "Q1", heroId, true);
+    openStint(store, database, "A1", "Q1", "2026-08-31T14:00:00.000Z");
+    recordTrace(store, database, {
+      id: "T-local",
+      stintId: "A1",
+      sessionId: "s1",
+      startedAt: "2026-08-31T14:00:00.000Z",
+      endedAt: "2026-08-31T14:30:00.000Z",
+    });
+    // The same window, classified on another host earlier (lower uid) but
+    // pulled here afterwards (higher local id).
+    const local = database.query("SELECT payload FROM events WHERE subject = 'T-local'").get() as {
+      payload: string;
+    };
+    database
+      .query(
+        `INSERT INTO events (at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host, sync_dirty)
+         VALUES ('2026-08-31T14:30:00.000Z', '2026-08-31T15:00:00.000Z', 'backfill', 's1', 'trace.recorded', 'T-pulled', ?, ?, 'host-b', 0)`,
+      )
+      .run(
+        local.payload,
+        `${encodeTime(Date.parse("2026-08-31T15:00:00.000Z"), 10)}0000000000000000`,
+      );
+    rebuildAll(database);
+
+    const result = dedupe(database, { dryRun: false });
+    expect(result).toEqual({ traces: 1, stints: 0, quests: 0 });
+    expect(
+      database.query("SELECT id FROM traces WHERE retracted_at IS NULL ORDER BY id").all(),
+    ).toEqual([{ id: "T-pulled" }]);
   });
 });

@@ -96,16 +96,23 @@ function seedHero(database: ReturnType<typeof openDatabase>) {
 
 function seedSession(
   database: ReturnType<typeof openDatabase>,
-  input: { id: string; endedAt: string; messageTimestamps?: string[] },
+  input: { id: string; endedAt: string; messageTimestamps?: string[]; hostSlug?: string },
 ) {
   database
     .query(
       `INSERT INTO claude_sessions
         (id, claude_dir, project_dir, file_path, cwd, org, project, title, git_branch,
          started_at, ended_at, message_count, tool_call_count, models, host_slug, file_mtime)
-       VALUES (?, '/c', 'p', ?, '/w/p', 'personal', 'p', 't', 'main', ?, ?, 1, 0, '[]', 'host', ?)`,
+       VALUES (?, '/c', 'p', ?, '/w/p', 'personal', 'p', 't', 'main', ?, ?, 1, 0, '[]', ?, ?)`,
     )
-    .run(input.id, `/c/p/${input.id}.jsonl`, input.endedAt, input.endedAt, input.endedAt);
+    .run(
+      input.id,
+      `/c/p/${input.id}.jsonl`,
+      input.endedAt,
+      input.endedAt,
+      input.hostSlug ?? "host",
+      input.endedAt,
+    );
   const timestamps = input.messageTimestamps ?? [input.endedAt];
   for (const [index, ts] of timestamps.entries()) {
     database
@@ -149,6 +156,76 @@ describe("backfill", () => {
 
     expect(secondResult.sessionsClassified).toBe(0);
     expect(secondResult.windowsClassified).toBe(0);
+  });
+
+  test("hostSlug limits backfill to sessions that ran on that host; unset classifies every host", async () => {
+    const seed = () => {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSession(database, {
+        id: "here-1",
+        endedAt: "2026-09-04T15:00:00.000Z",
+        hostSlug: "host-a",
+      });
+      seedSession(database, {
+        id: "there",
+        endedAt: "2026-09-04T15:30:00.000Z",
+        hostSlug: "host-b",
+      });
+      seedSession(database, {
+        id: "here-2",
+        endedAt: "2026-09-04T16:00:00.000Z",
+        hostSlug: "host-a",
+      });
+      return database;
+    };
+    const classifiedSessions = (database: ReturnType<typeof openDatabase>) =>
+      (
+        database.query("SELECT DISTINCT session_id FROM traces ORDER BY session_id").all() as {
+          session_id: string;
+        }[]
+      ).map((row) => row.session_id);
+
+    const local = seed();
+    const localResult = await backfill(local, makeConfig(), config, new FakeClassifier(), {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: () => {},
+      hostSlug: "host-a",
+    });
+    expect(localResult.sessionsClassified).toBe(2);
+    expect(classifiedSessions(local)).toEqual(["here-1", "here-2"]);
+
+    // Combined with an explicit range, the host filter still applies.
+    const ranged = seed();
+    const rangedResult = await backfill(ranged, makeConfig(), config, new FakeClassifier(), {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: () => {},
+      from: "2026-09-04T00:00:00.000Z",
+      to: "2026-09-04T15:45:00.000Z",
+      hostSlug: "host-b",
+    });
+    expect(rangedResult.sessionsClassified).toBe(1);
+    expect(classifiedSessions(ranged)).toEqual(["there"]);
+
+    const unknownHost = seed();
+    const noneResult = await backfill(unknownHost, makeConfig(), config, new FakeClassifier(), {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: () => {},
+      hostSlug: "host-z",
+    });
+    expect(noneResult.sessionsClassified).toBe(0);
+
+    const everyHost = seed();
+    const everyResult = await backfill(everyHost, makeConfig(), config, new FakeClassifier(), {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: () => {},
+    });
+    expect(everyResult.sessionsClassified).toBe(3);
+    expect(classifiedSessions(everyHost)).toEqual(["here-1", "here-2", "there"]);
   });
 
   test("coverage is segment-independent: a window a classifier splits into 2+ segments is still recognized as covered on the next run", async () => {

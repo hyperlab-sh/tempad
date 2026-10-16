@@ -23,8 +23,9 @@ interface DuplicateTraceRow {
  * A duplicate group is traces sharing `(session_id, started_at, ended_at)` --
  * the same backfill window classified more than once by a crashed-then-
  * relaunched run (see `isWindowCovered` in `src/w5/backfill.ts`). Within a
- * group the earliest trace (lowest event id, i.e. `rowid` on the append-only
- * `events` table) is kept; the rest are retracted.
+ * group the earliest trace (lowest `trace.recorded` event uid, the replay
+ * order every host computes identically -- not the local integer id) is kept;
+ * the rest are retracted.
  */
 function findDuplicateTraces(database: Database): DuplicateTraceRow[][] {
   const groups = database
@@ -45,7 +46,7 @@ function findDuplicateTraces(database: Database): DuplicateTraceRow[][] {
          JOIN events e ON e.kind = 'trace.recorded' AND e.subject = t.id
          WHERE t.retracted_at IS NULL
            AND t.session_id = ? AND t.started_at = ? AND t.ended_at = ?
-         ORDER BY e.id ASC`,
+         ORDER BY e.uid ASC, e.id ASC`,
       )
       .all(group.session_id, group.started_at, group.ended_at) as DuplicateTraceRow[];
     return traces;

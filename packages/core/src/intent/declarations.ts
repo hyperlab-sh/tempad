@@ -159,7 +159,7 @@ function resolveDeclaration(
     .query(
       `SELECT payload FROM events
         WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
-        ORDER BY at DESC, id DESC`,
+        ORDER BY at DESC, uid DESC, id DESC`,
     )
     .all(sessionId, at) as { payload: string }[];
 
@@ -236,7 +236,7 @@ export function activeDeclaredQuests(
       `SELECT payload, at FROM events
         WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ?
           AND json_extract(payload, '$.scope') = ? AND at <= ?
-        ORDER BY at ASC, id ASC`,
+        ORDER BY at ASC, uid ASC, id ASC`,
     )
     .all(input.sessionId, scope, input.at) as { payload: string; at: string }[];
 
