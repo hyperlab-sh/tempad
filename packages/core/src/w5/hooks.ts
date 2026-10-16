@@ -298,6 +298,10 @@ export function buildAdditionalContext(
   const lines: string[] = [];
   for (const question of questions) {
     if (context !== undefined && question.kind === "declare") {
+      // The question may predate a declaration the session has made since; the
+      // declaration line above already names its active quests, so asking to
+      // declare would contradict it.
+      if (context.activeQuests.length > 0) continue;
       lines.push(buildDeclareHandback(context.sessionId));
       continue;
     }

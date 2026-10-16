@@ -349,6 +349,13 @@ function runReview(args: string[], context: W5Context): number {
     // expired doubt is answerable straight from `tempad review`; older kinds keep
     // their generic line.
     if (question.kind === "declare" && question.sessionId !== null) {
+      // Same rule as the hook's context: a session that has an active quest has
+      // declared, whatever it was lacking when the question expired.
+      const declaredSince = activeDeclaredQuests(context.database, {
+        sessionId: question.sessionId,
+        at: new Date().toISOString(),
+      });
+      if (declaredSince.length > 0) continue;
       context.stdout(
         `question ${question.id} expired — ${buildDeclareHandback(question.sessionId)}`,
       );

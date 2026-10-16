@@ -499,6 +499,27 @@ describe("verifier hand-back text", () => {
       "not part of your active quests (Ship marko-ui [Q1]) (looks like: a competitor comparison)",
     );
     expect(text).toContain("tempad answer Q1 --belongs");
+    // The session has an active quest, so a stale declare question stays silent.
+    expect(text).not.toContain("w5 has no declared quest for this session");
+  });
+
+  test("buildAdditionalContext renders a declare question only while nothing is active", () => {
+    const text = buildAdditionalContext(
+      [
+        {
+          id: "Q2",
+          traceId: "T2",
+          sessionId: "s1",
+          kind: "declare",
+          state: "asked",
+          turnsWatched: 1,
+          turnsAtAsk: 1,
+          isSwitch: false,
+        },
+      ],
+      { activeQuests: [], sessionId: "s1", guessFor: () => null },
+    );
+
     expect(text).toContain("w5 has no declared quest for this session");
     expect(text).toContain("tempad quest declare --session s1");
   });

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { W5Config } from "../intent/config";
+import { activeDeclaredQuests } from "../intent/declarations";
 import { applyIncremental } from "../intent/projections";
 import type { EventStore } from "../intent/store";
 
@@ -158,6 +159,29 @@ function resolveByContext(
   );
 }
 
+/**
+ * `declare` questions the session has since answered by declaring a quest. The
+ * question is queued while the session has declared nothing and then watched for
+ * `watchTurns` turns, so the declaration usually lands between queueing and
+ * asking (or while the question is already asked); `w5 context` would then tell
+ * a session that has an active quest that it has none. Uses the same
+ * `activeDeclaredQuests` fold as the hook's `active quests:` line, so a quest
+ * that was ended (`--done`) or retracted does not count and the question stands.
+ */
+function declareQuestionsAnsweredByDeclaration(
+  database: Database,
+  input: AdvanceQuestionsInput,
+): string[] {
+  const open = database
+    .query(
+      "SELECT id FROM questions WHERE session_id = ? AND kind = 'declare' AND state IN ('watching', 'asked')",
+    )
+    .all(input.sessionId) as { id: string }[];
+  if (open.length === 0) return [];
+  const active = activeDeclaredQuests(database, { sessionId: input.sessionId, at: input.now });
+  return active.length === 0 ? [] : open.map((row) => row.id);
+}
+
 export function advanceQuestions(
   store: EventStore,
   database: Database,
@@ -178,6 +202,7 @@ export function advanceQuestions(
     .all(input.sessionId) as RawQuestionRow[];
 
   const resolvedSet = new Set(input.resolvedByContext);
+  for (const id of declareQuestionsAnsweredByDeclaration(database, input)) resolvedSet.add(id);
 
   for (const raw of watchingRows) {
     const row = toQuestionRow(raw);
@@ -258,6 +283,12 @@ export function advanceQuestions(
   for (const raw of askedRows) {
     const row = toQuestionRow(raw);
     if (asked.some((a) => a.id === row.id)) continue;
+
+    if (resolvedSet.has(row.id)) {
+      resolveByContext(store, database, row.id, input.now);
+      resolved.push({ ...row, state: "resolved_by_context" });
+      continue;
+    }
 
     const newTurnsWatched = row.turnsWatched + input.turnsSinceLastRun;
     watchQuestion(store, database, row.id, newTurnsWatched, input.now);
