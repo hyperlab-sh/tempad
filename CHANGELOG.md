@@ -6,16 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-16
+
+### Added
+
+- **Push sync: one history across several machines (optional).** Each machine still keeps its own `tempad.db`. With a `[sync]` section in `tempad.toml`, they all push to and pull from one self-hosted [sqld](https://github.com/tursodatabase/libsql) server. To enable it, add `[sync]` with a `url` (`libsql://`, `https://` or `wss://`; plain `http://` or `ws://` only for loopback hosts) to `TEMPAD_HOME/tempad.toml`, and put `TEMPAD_SYNC_TOKEN=<a JWT signed with the server's key>` in `TEMPAD_HOME/.env` or the environment. Plain `tempad sync` then collects, pushes and pulls; `tempad sync --push` and `--pull` (or both) run one direction only, without collecting. Without `[sync]`, tempad never opens a network connection for sync and never loads the libSQL client. Server setup (Coolify, JWT keys, backups, smoke checks) is in [`docs/deploy/sqld-coolify.md`](docs/deploy/sqld-coolify.md); the protocol and conflict rule are in `docs/specs/push-sync.md`; the README has a "Sync across machines" section. What an operator should know:
+  - Events are an append-only log replayed in global `uid` order. Mirrors (GitHub, Monday, Claude sessions and messages) use last-writer-wins on `(sync_updated_at, sync_host)`, and deletes travel as tombstones. Projections are never synced: a pull that brings new events rebuilds them, and a pull that stops part-way is repaired by a durable marker on the next run.
+  - `[sync].batch_size` (default 500) bounds a push or pull page; `[sync].enabled = false` turns sync off without removing the section. `[sync].url` takes no query string, fragment or `user:pass@`, and the client only ever receives a URL rebuilt from the checked parse.
+  - Every host must run identical `[[projects]]` rules, because org, project and display name are synced as data.
+  - A server that was lost, replaced or restored from a backup is detected and re-seeded from any one host with everything that host holds, other hosts' rows included. After restoring the server from a backup, run `DELETE FROM sync_meta WHERE key = 'server_id'` on it so every host re-seeds. A host reinstalled under the same `HOST_SLUG`, or one whose `tempad.db` was restored from an older backup, pulls its own history back instead of skipping it.
+  - A host running an older tempad stops with `remote holds data from tempad schema N; upgrade tempad on this host` instead of writing into a newer database.
+  - Two events with the same uid and different content are a loud error, never a silent drop.
+  - `w5 backfill` and `w5 eval` classify only this host's sessions when sync is enabled, so a session pulled from another machine is never classified twice.
+  - A malformed `[sync]` prints one `sync: <reason>` line and exits 1 for `tempad sync`, `w5 backfill` and `w5 eval`; it does not break commands that never sync (`w5 hook install|uninstall`, `w5 enqueue`, `w5 context`, `tempad quiet`, `tempad review`).
+- **Cross-host identity merge.** Each machine ran its own `hero init`, `party add` and `client add`. When logs are combined, the first created event in uid order is canonical: one hero, one party per slug, one client per slug, one open membership per (hero, party). Later duplicates become aliases, so memberships, sagas and quests land on the canonical rows; leaving a party on one host ends only the join it names, and `tempad party leave` ends every open join. Two hosts merging a pair of quests in opposite directions cannot loop: the earlier merge in uid order wins. A single-host log records no alias and its projections are unchanged.
+- `TEMPAD_SYNC_TOKEN` is a configuration variable like the others, loaded per command. Only `tempad sync` with `[sync]` enabled requires it, and `tempad setup` never prompts for it or overwrites a line you added by hand.
+
+### Changed
+
+- Events now carry a global `uid` (a ULID) that is the replay order instead of the local row id. Existing databases are backfilled by migration 0019 with deterministic uids, so machines that started from a copy of one `tempad.db` agree on the uids of their shared history. On a single machine the order is unchanged.
+- Secrets no longer reach child processes. `MONDAY_API_TOKEN`, `TEMPAD_SYNC_TOKEN` and `GH_TOKEN` are removed from the environment of everything tempad spawns (the classifier's `claude -p`, the detached `w5 run`, `hooks/w5-common.sh`), except that the git/`gh` collector and setup's probes keep `GH_TOKEN` because `gh` reads it. Variables tempad does not own, such as `ANTHROPIC_API_KEY`, pass through.
+- Every database connection now waits up to 5 seconds for a lock instead of failing at once, and opening the database no longer takes the write lock when the host slug is unchanged. Read-only commands such as `tempad report` no longer fail with `SQLITE_BUSY` while a sync, rebuild or w5 run is writing.
+
 ### Fixed
 
+- `tempad rebuild` read the event log before taking the write lock, so an event committed by the w5 runner (or a pull) in between was missing from the projections while they were marked current. It now reads and replays inside one transaction.
+- A project rule whose folder does not exist (a deleted subfolder, or a folder registered before it was created) now matches the same location reached through a symlinked parent, such as a `~/work` that points to `/work`.
 - The push-sync triggers on the six mirror tables ran on every host, including hosts that never configured `[sync]`: every collected row was stamped and every deleted row left a tombstone that nothing would ever read, tripling the cost of a 20000-row insert (124 ms against 41 ms) and growing the database. The triggers now exist only once sync has run (`sync_meta('mirror_sync_enabled')`). The first `tempad sync` restamps every mirror row as written at that moment (so a row changed while sync was off is not beaten by an older version another host pushed) and installs them; with sync off, inserts, updates and deletes cost what they did before push sync, and report output is unchanged.
-
 - The GitHub collector's reconcile step compared `gh_commits.authored_at` to the window start as text. Rows stored before commit dates were normalized to UTC keep the author's offset (`2026-09-07T23:00:00-03:00`), so one near the window boundary could be skipped and its orphaned sha (after a history rewrite) never deleted. It now compares against a UTC-normalized bound, which is valid because every stored value is UTC: migration 0021 rewrites the legacy rows, and a pull rewrites any offset-form `gh_commits` dates that older pushes left on the sync server.
 
 ### Migration
 
-- `0022_sync_trigger_gate.sql` drops the mirror sync triggers and, on a database that never synced, deletes its tombstones. A database that has synced (non-empty `sync_meta`, a pull cursor, or anything marked pushed) keeps its triggers and every pending row, event and tombstone.
+- `0019_push_sync.sql` adds the push-sync columns: `uid`, `sync_host` and `sync_dirty` on `events`, and `sync_host`, `sync_updated_at` and `sync_dirty` on the six mirror tables (`gh_repos`, `gh_commits`, `gh_pull_requests`, `monday_items`, `claude_sessions`, `claude_messages`). It also adds the triggers that stamp and dirty mirror rows and record tombstones, and the `sync_local`, `sync_cursors` and `sync_tombstones` tables. It backfills event uids on first open; nothing is sent anywhere until `[sync]` is configured.
+- `0020_sync_meta.sql` adds the local `sync_meta` table, which holds the last-synced server id and the sync markers.
 - `0021_normalize_commit_dates.sql` rewrites legacy offset-form `gh_commits.authored_at` and `committed_at` to UTC (`2026-09-08T02:00:00.000Z`), the form the collector writes today. Rows already in UTC are untouched, a second run changes nothing, and push-sync state (`sync_updated_at`, `sync_host`, `sync_dirty`) is left as it was.
+- `0022_sync_trigger_gate.sql` drops the 18 mirror sync triggers that 0019 installs, and on a database that never synced deletes its tombstones, so a host that never configures `[sync]` pays nothing for push sync. The triggers come back on the first `tempad sync`, which also restamps every mirror row as written at that moment. A database that has already synced (non-empty `sync_meta`, a pull cursor, or anything marked pushed) keeps its triggers and every pending row, event and tombstone.
+
+### Docs
+
+- README: a "Sync across machines" section; the no-configuration list names `setup` (and the hidden `init` alias) and quotes the current not-set-up message.
+- `docs/deploy/sqld-coolify.md`: how to self-host the sqld server on Coolify, pinned by tag and digest, with the required JWT auth, per-host tokens, backups, the restore runbook and smoke checks. An empty `SQLD_AUTH_JWT_KEY` disables auth; the page says so.
+- `docs/specs/push-sync.md`: the sync design, including the audit of cross-host projection keys.
+- The `quest` skill's "neither CLI exists" and "not set up" branches no longer dead-end for users without the plugin; they get the plugin route or `bun add -g @hyperlab.sh/tempad && tempad setup`. The `setup` skill finds the global bin directory with `bun pm bin -g` instead of assuming `~/.bun/bin`, and tells the user to add it to `PATH`.
 
 ## [0.1.1] - 2026-10-16
 
