@@ -70,7 +70,8 @@ Safe on existing databases: only `ADD COLUMN`, new tables, new triggers, and a t
 The remote database is a generic store, created with `IF NOT EXISTS` by the sync module on first contact. It deliberately does not mirror local DDL, so a local migration never needs a remote migration.
 
 ```sql
-sync_meta(key TEXT PRIMARY KEY, value TEXT)          -- 'schema_version' = highest local user_version seen
+sync_meta(key TEXT PRIMARY KEY, value TEXT)          -- 'schema_version' = highest local user_version seen,
+                                                     -- 'server_id' = random ULID written on first contact
 sync_clock(id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL)
 sync_rows(tbl TEXT, pk TEXT, data TEXT,              -- data: JSON object of columns; NULL = tombstone
           sync_host TEXT NOT NULL, sync_updated_at TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -100,6 +101,7 @@ Known trade-off: the stamp is the writer's wall clock. Machines are expected to 
 
 - **Push needs no cursor.** The dirty flag is the cursor: push sends events and rows whose `sync_host IS NULL`, plus tombstones whose `sync_host IS NULL`. After a batch commits remotely, it is marked locally with `UPDATE ... SET sync_host = <own> WHERE <key> = ? AND sync_host IS NULL AND sync_updated_at = <pushed stamp>`, so a row a collector changed between read and mark stays dirty for the next run.
 - **Pull uses a server sequence.** Every push batch runs in one remote write transaction that first does `UPDATE sync_clock SET seq = seq + 1 RETURNING seq` and writes that value into every row it changes. sqld serializes write transactions, so a committed `seq` is never overtaken by a lower one. Pull reads `WHERE seq > :cursor AND sync_host != :own ORDER BY seq` in pages and advances `sync_cursors` only after the page is applied locally.
+- **Server identity.** The remote `sync_meta.server_id` is created once, on first contact with an empty server. The host stores the id it last synced with locally (`sync_cursors` gains no row for it; a local `sync_meta(key, value)` table holds `server_id`, added by the sync module's own migration). When the remote id differs from the stored one (server rebuilt from scratch, restored from an older backup, or URL pointed elsewhere), the run treats the server as unknown: it pushes every row, event and tombstone whose `sync_host` is NULL or its own slug, and resets both pull cursors to 0. That re-seeds a lost server from each host's copy without any manual step; pulling from 0 is safe because the local apply uses the same conflict rule.
 
 ## Event order across hosts
 
