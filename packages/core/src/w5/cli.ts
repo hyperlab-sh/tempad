@@ -11,7 +11,11 @@ import {
   requireFields,
 } from "../config/env";
 import type { IntentConfig } from "../intent/config";
-import { activeDeclaredQuests } from "../intent/declarations";
+import {
+  activeDeclaredQuests,
+  sessionEverDeclared,
+  sessionHasActiveDeclaration,
+} from "../intent/declarations";
 import { isSyncEnabled } from "../sync/config";
 import { backfill } from "./backfill";
 import { AnthropicClassifier, type Classifier } from "./classifier";
@@ -200,6 +204,10 @@ function runContext(args: string[], context: W5Context): number {
   );
   const text = buildAdditionalContext(questions, {
     activeQuests: active.map((quest) => ({ title: quest.title, alias: quest.alias })),
+    hasActiveDeclaration: sessionHasActiveDeclaration(context.database, {
+      sessionId: values.session,
+      at: new Date().toISOString(),
+    }),
     sessionId: values.session,
     guessFor: (questionId) => guesses.get(questionId) ?? null,
   });
@@ -349,13 +357,11 @@ function runReview(args: string[], context: W5Context): number {
     // expired doubt is answerable straight from `tempad review`; older kinds keep
     // their generic line.
     if (question.kind === "declare" && question.sessionId !== null) {
-      // Same rule as the hook's context: a session that has an active quest has
-      // declared, whatever it was lacking when the question expired.
-      const declaredSince = activeDeclaredQuests(context.database, {
-        sessionId: question.sessionId,
-        at: new Date().toISOString(),
-      });
-      if (declaredSince.length > 0) continue;
+      // Review looks back: a session that declared a quest at any point (even one
+      // it later ended) did declare, so "no declared quest" would be false. Only
+      // a retracted declaration does not count. The live hook is stricter (it
+      // asks about quests active *now*).
+      if (sessionEverDeclared(context.database, question.sessionId)) continue;
       context.stdout(
         `question ${question.id} expired — ${buildDeclareHandback(question.sessionId)}`,
       );

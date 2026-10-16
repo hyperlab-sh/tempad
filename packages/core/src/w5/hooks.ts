@@ -289,6 +289,12 @@ export function buildAdditionalContext(
   questions: QuestionRow[],
   context?: {
     activeQuests: { title: string; alias: string }[];
+    /**
+     * Whether the session has a quest declared and not ended, resolved the way
+     * the window resolves it (`sessionHasActiveDeclaration`), which also counts a
+     * subagent's own quest -- `activeQuests` is the session-scope fold only.
+     */
+    hasActiveDeclaration: boolean;
     sessionId: string;
     guessFor: (questionId: string) => string | null;
   },
@@ -298,10 +304,9 @@ export function buildAdditionalContext(
   const lines: string[] = [];
   for (const question of questions) {
     if (context !== undefined && question.kind === "declare") {
-      // The question may predate a declaration the session has made since; the
-      // declaration line above already names its active quests, so asking to
-      // declare would contradict it.
-      if (context.activeQuests.length > 0) continue;
+      // The question may predate a declaration the session has made since, so
+      // asking to declare would contradict it.
+      if (context.hasActiveDeclaration) continue;
       lines.push(buildDeclareHandback(context.sessionId));
       continue;
     }

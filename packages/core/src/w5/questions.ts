@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { W5Config } from "../intent/config";
-import { activeDeclaredQuests } from "../intent/declarations";
+import { sessionHasActiveDeclaration } from "../intent/declarations";
 import { applyIncremental } from "../intent/projections";
 import type { EventStore } from "../intent/store";
 
@@ -164,9 +164,11 @@ function resolveByContext(
  * question is queued while the session has declared nothing and then watched for
  * `watchTurns` turns, so the declaration usually lands between queueing and
  * asking (or while the question is already asked); `w5 context` would then tell
- * a session that has an active quest that it has none. Uses the same
- * `activeDeclaredQuests` fold as the hook's `active quests:` line, so a quest
- * that was ended (`--done`) or retracted does not count and the question stands.
+ * a session that has an active quest that it has none. Uses
+ * `sessionHasActiveDeclaration`, the resolution `buildWindow` applies when it
+ * decides a window needs a `declare` question (a subagent's own or its parent's
+ * quests included), so a quest that was ended (`--done`) or retracted does not
+ * count and the question stands.
  */
 function declareQuestionsAnsweredByDeclaration(
   database: Database,
@@ -178,8 +180,9 @@ function declareQuestionsAnsweredByDeclaration(
     )
     .all(input.sessionId) as { id: string }[];
   if (open.length === 0) return [];
-  const active = activeDeclaredQuests(database, { sessionId: input.sessionId, at: input.now });
-  return active.length === 0 ? [] : open.map((row) => row.id);
+  return sessionHasActiveDeclaration(database, { sessionId: input.sessionId, at: input.now })
+    ? open.map((row) => row.id)
+    : [];
 }
 
 export function advanceQuestions(

@@ -311,3 +311,89 @@ export function hasAnyDeclaration(database: Database, sessionId: string): boolea
     .get(sessionId);
   return row !== null;
 }
+
+/**
+ * The `parent_session_id` on the session's latest declaration at `at`, or null
+ * when that declaration is session-scoped (or there is none). Parent linkage
+ * lives entirely on the `quest.declared` payload -- no schema or collector
+ * column -- and `activeDeclaredQuests`/`currentDeclaredQuest` only resolve
+ * session-scope declarations, so a subagent's parent has to be read from here.
+ */
+export function latestDeclaredParentSessionId(
+  database: Database,
+  sessionId: string,
+  at: string,
+): string | null {
+  const row = database
+    .query(
+      `SELECT payload FROM events
+        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
+        ORDER BY at DESC, uid DESC, id DESC LIMIT 1`,
+    )
+    .get(sessionId, at) as { payload: string } | null;
+  if (row === null) return null;
+  const payload = JSON.parse(row.payload) as { scope?: string; parent_session_id?: string };
+  if (payload.scope !== "subagent") return null;
+  return payload.parent_session_id ?? null;
+}
+
+/**
+ * Whether the session has a quest declared and not ended at `at`, resolved
+ * exactly as `buildWindow` resolves it (the parent id from the latest
+ * declaration first, then the subagent's own quest or the parent's active
+ * ones; a plain session's own active quests otherwise). This is what decides
+ * that a window needs no `declare` question, so everything that must agree with
+ * it -- the hook's `declare` hand-back, the run that promotes a `declare`
+ * question -- asks this one function instead of re-deriving it.
+ */
+export function sessionHasActiveDeclaration(
+  database: Database,
+  input: { sessionId: string; at: string },
+): boolean {
+  const parentSessionId = latestDeclaredParentSessionId(database, input.sessionId, input.at);
+  if (parentSessionId === null) {
+    return activeDeclaredQuests(database, { sessionId: input.sessionId, at: input.at }).length > 0;
+  }
+  return (
+    currentDeclaredQuestForSubagent(database, {
+      sessionId: input.sessionId,
+      parentSessionId,
+      at: input.at,
+    }) !== null ||
+    activeDeclaredQuests(database, { sessionId: parentSessionId, at: input.at }).length > 0
+  );
+}
+
+/**
+ * Whether the session ever declared a quest, including one it later ended with
+ * `--done` and including a subagent's declaration or its parent's. A
+ * declaration whose quest was retracted does not count: it never happened as
+ * far as every report is concerned. Used by `tempad review`, which looks back
+ * at sessions that may long since have ended their quests; the live hook uses
+ * `sessionHasActiveDeclaration` instead.
+ */
+export function sessionEverDeclared(database: Database, sessionId: string): boolean {
+  const sessionIds = new Set([sessionId]);
+  const rows = database
+    .query(
+      `SELECT payload FROM events
+        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ?`,
+    )
+    .all(sessionId) as { payload: string }[];
+  for (const row of rows) {
+    const parent = (JSON.parse(row.payload) as { parent_session_id?: string }).parent_session_id;
+    if (parent) sessionIds.add(parent);
+  }
+  const placeholders = [...sessionIds].map(() => "?").join(", ");
+  const declared = database
+    .query(
+      `SELECT 1 FROM events
+         JOIN quests ON quests.id = json_extract(events.payload, '$.quest_id')
+        WHERE events.kind = 'quest.declared'
+          AND json_extract(events.payload, '$.session_id') IN (${placeholders})
+          AND quests.retracted_at IS NULL
+        LIMIT 1`,
+    )
+    .get(...sessionIds);
+  return declared !== null;
+}

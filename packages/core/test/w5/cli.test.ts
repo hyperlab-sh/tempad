@@ -436,7 +436,7 @@ describe("w5 context", () => {
           payload: { turnsAtAsk: 3 },
         }),
       );
-      const declare = (done = false, questId?: string) =>
+      const declareInSession = (done = false, questId?: string) =>
         declareQuest(store, database, {
           sessionId: "s1",
           ...(questId
@@ -449,7 +449,7 @@ describe("w5 context", () => {
           heroId,
           done,
         });
-      return { database, store, declare };
+      return { database, store, declareInSession };
     }
 
     async function contextOutput(database: ReturnType<typeof openDatabase>): Promise<string> {
@@ -464,12 +464,31 @@ describe("w5 context", () => {
     }
 
     test("an asked declare question is not rendered once the session has an active quest", async () => {
-      const { database, declare } = seedAsked();
-      declare();
+      const { database, declareInSession } = seedAsked();
+      declareInSession();
 
       const output = await contextOutput(database);
 
       expect(output).toContain("active quests: Ship X [Q1]");
+      expect(output).not.toContain("no declared quest");
+    });
+
+    test("an asked declare question is not rendered once the session declared as a subagent", async () => {
+      const { database, store } = seedAsked();
+      const heroId = (database.query("SELECT id FROM heroes").get() as { id: string }).id;
+      declareQuest(store, database, {
+        sessionId: "s1",
+        parentSessionId: "parent",
+        newQuest: { title: "Sub errand", outcome: "o", commitment: "personal" },
+        plan: [],
+        scope: "subagent",
+        declaredBy: "agent",
+        at: "2026-09-07T09:00:00.000Z",
+        heroId,
+      });
+
+      const output = await contextOutput(database);
+
       expect(output).not.toContain("no declared quest");
     });
 
@@ -481,9 +500,9 @@ describe("w5 context", () => {
     });
 
     test("it is still rendered when the only declared quest was ended", async () => {
-      const { database, declare } = seedAsked();
-      const { questId } = declare();
-      declare(true, questId);
+      const { database, declareInSession } = seedAsked();
+      const { questId } = declareInSession();
+      declareInSession(true, questId);
 
       const output = await contextOutput(database);
 
@@ -631,6 +650,103 @@ describe("tempad review", () => {
     expect(output).not.toContain("Q-s1");
     expect(output).toContain("Q-s2 expired");
     expect(output).toContain("--session s2");
+  });
+
+  describe("an expired declare question", () => {
+    function seedExpired() {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      const store = new EventStore(database);
+      const heroId = newUlid();
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hero",
+          kind: "hero.created",
+          subject: heroId,
+          payload: { name: "S" },
+        }),
+      );
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hook",
+          kind: "question.asked",
+          subject: "Q-s1",
+          sessionId: "s1",
+          payload: { trace: "T", kind: "declare", text: "declare" },
+        }),
+      );
+      applyIncremental(
+        database,
+        store.append({ actor: "system", kind: "question.expired", subject: "Q-s1", payload: {} }),
+      );
+      const declareInSession = (extra: Partial<Parameters<typeof declareQuest>[2]> = {}) =>
+        declareQuest(store, database, {
+          sessionId: "s1",
+          newQuest: { title: "Ship X", outcome: "ship it", commitment: "personal" },
+          plan: [],
+          scope: "session",
+          declaredBy: "agent",
+          at: "2026-09-07T09:00:00.000Z",
+          heroId,
+          ...extra,
+        });
+      const review = () => {
+        const lines: string[] = [];
+        runReviewCommand([], {
+          database,
+          config: makeConfig(mkdtempSync(join(tmpdir(), "tempad-cli-test-"))),
+          intentConfig: defaultIntentConfig(),
+          stdout: (line) => lines.push(line),
+        });
+        return lines.join("\n");
+      };
+      return { database, store, heroId, declareInSession, review };
+    }
+
+    test("is hidden for a session that declared a quest and later ended it", () => {
+      const { declareInSession, review } = seedExpired();
+      const { questId } = declareInSession();
+      declareInSession({
+        newQuest: undefined,
+        questId,
+        done: true,
+        at: "2026-09-07T10:00:00.000Z",
+      });
+
+      expect(review()).not.toContain("Q-s1");
+    });
+
+    test("is hidden for a session whose parent declared (subagent declaration)", () => {
+      const { declareInSession, review } = seedExpired();
+      declareInSession({ scope: "subagent", parentSessionId: "parent" });
+
+      expect(review()).not.toContain("Q-s1");
+    });
+
+    test("is still listed when the only declaration was for a retracted quest", () => {
+      const { database, store, declareInSession, review } = seedExpired();
+      const { questId } = declareInSession();
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hero",
+          kind: "retracted",
+          subject: questId,
+          payload: { retracts: "x", reason: "mistake" },
+        }),
+      );
+
+      const output = review();
+
+      expect(output).toContain("Q-s1 expired");
+      expect(output).toContain("--session s1");
+    });
+
+    test("is listed for a session that never declared", () => {
+      expect(seedExpired().review()).toContain("Q-s1 expired");
+    });
   });
 
   test("omits a doubt older than the review window", () => {

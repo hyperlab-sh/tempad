@@ -734,7 +734,7 @@ describe("advanceQuestions and a session that has declared since the question wa
       ).state;
     // The session's first declaration (`--new`), then the agent re-declaring the
     // same quest (`--quest <id> --by agent`), the shape the live session left.
-    const declare = (at: string) => {
+    const declareInSession = (at: string) => {
       const first = declareQuest(store, database, {
         sessionId: "s1",
         newQuest: { title: "Ship X", outcome: "ship it", commitment: "personal" },
@@ -755,12 +755,12 @@ describe("advanceQuestions and a session that has declared since the question wa
       });
       return first.questId;
     };
-    return { database, store, heroId, questionId, stateOf, declare };
+    return { database, store, heroId, questionId, stateOf, declareInSession };
   }
 
   test("a watching declare question is resolved, not asked, once the session declared a quest", () => {
-    const { database, store, questionId, stateOf, declare } = seed();
-    declare("2026-09-04T15:25:00.000Z");
+    const { database, store, questionId, stateOf, declareInSession } = seed();
+    declareInSession("2026-09-04T15:25:00.000Z");
 
     const result = advance(database, store, "2026-09-04T15:40:00.000Z", 3);
 
@@ -770,19 +770,19 @@ describe("advanceQuestions and a session that has declared since the question wa
   });
 
   test("an already asked declare question is resolved once the session declares", () => {
-    const { database, store, stateOf, declare } = seed();
+    const { database, store, stateOf, declareInSession } = seed();
     expect(advance(database, store, "2026-09-04T15:40:00.000Z", 3).asked).toHaveLength(1);
     expect(stateOf()).toBe("asked");
 
-    declare("2026-09-04T15:45:00.000Z");
+    declareInSession("2026-09-04T15:45:00.000Z");
     advance(database, store, "2026-09-04T15:50:00.000Z", 1);
 
     expect(stateOf()).toBe("resolved_by_context");
   });
 
   test("a declare question survives when the only declared quest has been ended", () => {
-    const { database, store, heroId, questionId, stateOf, declare } = seed();
-    const questId = declare("2026-09-04T15:25:00.000Z");
+    const { database, store, heroId, questionId, stateOf, declareInSession } = seed();
+    const questId = declareInSession("2026-09-04T15:25:00.000Z");
     declareQuest(store, database, {
       sessionId: "s1",
       questId,
@@ -801,8 +801,8 @@ describe("advanceQuestions and a session that has declared since the question wa
   });
 
   test("a declare question survives when the only declared quest was retracted", () => {
-    const { database, store, questionId, stateOf, declare } = seed();
-    const questId = declare("2026-09-04T15:25:00.000Z");
+    const { database, store, questionId, stateOf, declareInSession } = seed();
+    const questId = declareInSession("2026-09-04T15:25:00.000Z");
     applyIncremental(
       database,
       store.append({
@@ -818,6 +818,67 @@ describe("advanceQuestions and a session that has declared since the question wa
 
     expect(result.asked.map((question) => question.id)).toEqual([questionId]);
     expect(stateOf()).toBe("asked");
+  });
+
+  test("a subagent's declaration (--parent) resolves its declare question, never promoting it", () => {
+    const { database, store, heroId, questionId, stateOf } = seed();
+    declareQuest(store, database, {
+      sessionId: "s1",
+      parentSessionId: "parent",
+      newQuest: { title: "Sub errand", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-04T15:25:00.000Z",
+      heroId,
+    });
+
+    const result = advance(database, store, "2026-09-04T15:40:00.000Z", 3);
+
+    expect(result.asked).toHaveLength(0);
+    expect(result.resolved.map((question) => question.id)).toEqual([questionId]);
+    expect(stateOf()).toBe("resolved_by_context");
+  });
+
+  test("a subagent whose parent has an active quest resolves its declare question", () => {
+    const { database, store, heroId, stateOf } = seed();
+    const parent = declareQuest(store, database, {
+      sessionId: "parent",
+      newQuest: { title: "Parent quest", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "session",
+      declaredBy: "hero",
+      at: "2026-09-04T15:20:00.000Z",
+      heroId,
+    });
+    // The subagent declared the parent's quest as its own, then ended it.
+    declareQuest(store, database, {
+      sessionId: "s1",
+      parentSessionId: "parent",
+      questId: parent.questId,
+      plan: [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-04T15:25:00.000Z",
+      heroId,
+    });
+    declareQuest(store, database, {
+      sessionId: "s1",
+      parentSessionId: "parent",
+      questId: parent.questId,
+      plan: [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-04T15:26:00.000Z",
+      heroId,
+      done: true,
+    });
+
+    // The window resolves a subagent through its parent's active quests too, so a
+    // declare question is not needed while the parent has one.
+    advance(database, store, "2026-09-04T15:40:00.000Z", 3);
+
+    expect(stateOf()).toBe("resolved_by_context");
   });
 
   test("a declaration in another session does not resolve the question", () => {
@@ -839,7 +900,7 @@ describe("advanceQuestions and a session that has declared since the question wa
   });
 
   test("belongs questions are untouched by a declaration", () => {
-    const { database, store, declare } = seed();
+    const { database, store, declareInSession } = seed();
     const traceId = seedStintAndTrace(database, {
       stintId: "A2",
       questId: "Q1",
@@ -847,7 +908,7 @@ describe("advanceQuestions and a session that has declared since the question wa
       isSwitch: false,
     });
     const belongsId = seedQuestion(database, store, { traceId, sessionId: "s1", kind: "belongs" });
-    declare("2026-09-04T15:25:00.000Z");
+    declareInSession("2026-09-04T15:25:00.000Z");
 
     const result = advance(database, store, "2026-09-04T15:40:00.000Z", 3);
 

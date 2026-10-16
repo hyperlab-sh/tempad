@@ -490,6 +490,7 @@ describe("verifier hand-back text", () => {
       ],
       {
         activeQuests: [{ title: "Ship marko-ui", alias: "Q1" }],
+        hasActiveDeclaration: true,
         sessionId: "s1",
         guessFor: (questionId) => (questionId === "Q1" ? "a competitor comparison" : null),
       },
@@ -517,7 +518,7 @@ describe("verifier hand-back text", () => {
           isSwitch: false,
         },
       ],
-      { activeQuests: [], sessionId: "s1", guessFor: () => null },
+      { activeQuests: [], hasActiveDeclaration: false, sessionId: "s1", guessFor: () => null },
     );
 
     expect(text).toContain("w5 has no declared quest for this session");
