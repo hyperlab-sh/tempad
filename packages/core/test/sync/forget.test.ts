@@ -6,7 +6,7 @@ import { openDatabase } from "../../src/db/database";
 import { rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { ForgottenServerError, runSyncEngine } from "../../src/sync/engine";
-import { forgetSync, UnpushedChangesError } from "../../src/sync/forget";
+import { forgetSync, rejoinServer, UnpushedChangesError } from "../../src/sync/forget";
 import {
   enableMirrorSync,
   isMirrorSyncEnabled,
@@ -156,8 +156,7 @@ describe("forgetSync", () => {
     expect(count(database, "sync_cursors")).toBe(0);
     // Every remote-bound key is gone; only the id of the server left stays,
     // so a later run can refuse to rejoin it.
-    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
-    expect(metaValue(database, "forgotten_server_id")).toBe(serverId);
+    expect(metaKeys(database)).toEqual([`forgotten_server_id:${serverId}`]);
     expect(stampSnapshot(database)).toEqual(stamps);
     expect(sourceSnapshot(database)).toEqual(rows);
     database.close();
@@ -194,8 +193,80 @@ describe("forgetSync", () => {
     const summary = forgetSync(database);
     expect(summary).not.toBeNull();
     expect(summary?.metaKeysDeleted).toEqual(["server_id"]);
-    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
-    expect(metaValue(database, "forgotten_server_id")).toBe("srv-1");
+    expect(metaKeys(database)).toEqual(["forgotten_server_id:srv-1"]);
+    database.close();
+  });
+
+  test("only reseed_pending set: that id is remembered, and a sync against it is refused", async () => {
+    const remote = new FakeRemote();
+    const other = openDatabase(join(directory, "other.db"), { hostSlug: "host-b" });
+    await runSyncEngine(other, remote, { hostSlug: "host-b", batchSize: 500, ...both });
+    other.close();
+    const serverId = (
+      remote.database.query("SELECT value FROM sync_meta WHERE key = 'server_id'").get() as {
+        value: string;
+      }
+    ).value;
+
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('reseed_pending', ?)").run(serverId);
+    expect(forgetSync(database)?.metaKeysDeleted).toEqual(["reseed_pending"]);
+    expect(metaKeys(database)).toEqual([`forgotten_server_id:${serverId}`]);
+
+    const error = await sync(database, remote).catch((thrown) => thrown);
+    expect(error).toBeInstanceOf(ForgottenServerError);
+    expect(error.message).toContain(`tempad sync --rejoin ${serverId}`);
+    database.close();
+  });
+
+  test("server_id and a different reseed_pending are both remembered", () => {
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'srv-old')").run();
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('reseed_pending', 'srv-new')").run();
+    forgetSync(database);
+    expect(metaKeys(database)).toEqual([
+      "forgotten_server_id:srv-new",
+      "forgotten_server_id:srv-old",
+    ]);
+    database.close();
+  });
+
+  test("forget A, use B, forget B: A and B are both still refused", async () => {
+    const serverA = new FakeRemote();
+    const database = await syncedHost(serverA);
+    forgetSync(database);
+    database.close();
+
+    const serverB = new FakeRemote();
+    const onB = openDatabase(databasePath, { hostSlug: "host-a" });
+    await sync(onB, serverB);
+    // Clean after the sync: nothing unpushed, so the second forget goes through.
+    expect(forgetSync(onB)).not.toBeNull();
+    expect(metaKeys(onB).filter((key) => key.startsWith("forgotten_server_id:"))).toHaveLength(2);
+
+    expect(await sync(onB, serverA).catch((thrown) => thrown)).toBeInstanceOf(ForgottenServerError);
+    expect(await sync(onB, serverB).catch((thrown) => thrown)).toBeInstanceOf(ForgottenServerError);
+    onB.close();
+  });
+
+  test("a leftover after a forget forgets again without the unpushed-changes check", async () => {
+    const database = await syncedHost(new FakeRemote());
+    forgetSync(database);
+    // Triggers are gone, so a new row is sync_dirty = 1 with nowhere to push it.
+    addCommit(database, "c-after", "acme/web", "written after the forget");
+    database.query("INSERT INTO sync_cursors (stream, seq) VALUES ('rows', 3)").run();
+    expect(forgetSync(database)?.cursorsCleared).toBe(1);
+    database.close();
+  });
+
+  test("rejoinServer takes one id out of the set and reports whether it was there", async () => {
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'srv-1')").run();
+    forgetSync(database);
+    expect(rejoinServer(database, "srv-2")).toBe(false);
+    expect(metaKeys(database)).toEqual(["forgotten_server_id:srv-1"]);
+    expect(rejoinServer(database, "srv-1")).toBe(true);
+    expect(metaKeys(database)).toEqual([]);
     database.close();
   });
 
@@ -204,7 +275,7 @@ describe("forgetSync", () => {
     const serverId = metaValue(database, "server_id");
     forgetSync(database);
     expect(forgetSync(database)).toBeNull();
-    expect(metaValue(database, "forgotten_server_id")).toBe(serverId);
+    expect(metaKeys(database)).toEqual([`forgotten_server_id:${serverId}`]);
     database.close();
   });
 
@@ -354,11 +425,12 @@ describe("forgetSync", () => {
     reopened.close();
   });
 
-  test("deleting the remembered id is the explicit way back to the old server", async () => {
+  test("rejoining the remembered id is the explicit way back to the old server", async () => {
     const remote = new FakeRemote();
     const database = await syncedHost(remote);
+    const serverId = metaValue(database, "server_id");
     forgetSync(database);
-    database.query("DELETE FROM sync_meta WHERE key = 'forgotten_server_id'").run();
+    expect(rejoinServer(database, serverId)).toBe(true);
     await expect(sync(database, remote)).resolves.toBeDefined();
     database.close();
   });
@@ -414,7 +486,7 @@ describe("forgetSync", () => {
 
     expect(rebuilds).toBe(1);
     expect(count(database, "parties")).toBe(1);
-    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
+    expect(metaKeys(database).map((key) => key.split(":")[0])).toEqual(["forgotten_server_id"]);
     database.close();
     other.close();
   });
@@ -584,6 +656,36 @@ describe("tempad sync --forget", () => {
     expect(forced.code).toBe(0);
     expect(forced.stdout).toContain("sync: forgot triggers=18");
   });
+
+  test("--rejoin removes one remembered id and prints it; an unknown id is a no-op", async () => {
+    await syncedHome();
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    const serverId = metaValue(database, "server_id");
+    database.close();
+    expect((await cli(["sync", "--forget"])).code).toBe(0);
+
+    const unknown = await cli(["sync", "--rejoin", "nope"]);
+    expect(unknown).toEqual({
+      code: 0,
+      stdout: "sync: server nope was not forgotten; nothing to do\n",
+      stderr: "",
+    });
+    const result = await cli(["sync", "--rejoin", serverId]);
+    expect(result).toEqual({
+      code: 0,
+      stdout: `sync: rejoin allowed for server ${serverId}\n`,
+      stderr: "",
+    });
+    const kept = openDatabase(databasePath, { hostSlug: "host-a" });
+    expect(metaKeys(kept)).toEqual([]);
+    kept.close();
+  });
+
+  for (const extra of [["--forget"], ["--force"], ["--push"], ["--full"], ["claude"]]) {
+    test(`--rejoin with ${extra.join(" ")} is a usage error`, async () => {
+      expect((await cli(["sync", "--rejoin", "x", ...extra])).code).toBe(2);
+    });
+  }
 
   test("--force without --forget is a usage error", async () => {
     const result = await cli(["sync", "--force"]);

@@ -30,7 +30,7 @@ import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
 import { runSetup } from "./setup/index.ts";
 import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
-import { forgetSync, formatForgetSummary } from "./sync/forget.ts";
+import { forgetSync, formatForgetSummary, rejoinServer } from "./sync/forget.ts";
 import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
   planW5Command,
@@ -59,7 +59,7 @@ const USAGE_LINES: string[] = [
   "Usage:",
   "  tempad --help | -h | help | --version",
   "  tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
-  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget [--force]   (--forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only; refuses while changes never reached the server unless --force)",
+  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget [--force] | --rejoin <server-id>   (--rejoin: let sync use a server --forget left, accepting overwrites; --forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only; refuses while changes never reached the server unless --force)",
   "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
   '  tempad hero init "<name>"',
   '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
@@ -181,6 +181,21 @@ function runForgetCommand(syncEnabled: boolean, force: boolean): number {
   return 0;
 }
 
+/** `tempad sync --rejoin <server-id>`: local only; lets the next sync use a server `--forget` left. */
+function runRejoinCommand(serverId: string): number {
+  const { database } = prepareCommand("tempad sync --rejoin", []);
+  try {
+    console.log(
+      rejoinServer(database, serverId)
+        ? `sync: rejoin allowed for server ${serverId}`
+        : `sync: server ${serverId} was not forgotten; nothing to do`,
+    );
+  } finally {
+    database.close();
+  }
+  return 0;
+}
+
 async function runSyncCommand(args: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args,
@@ -190,6 +205,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
       pull: { type: "boolean", default: false },
       forget: { type: "boolean", default: false },
       force: { type: "boolean", default: false },
+      rejoin: { type: "string" },
     },
     strict: true,
     allowPositionals: true,
@@ -212,7 +228,14 @@ async function runSyncCommand(args: string[]): Promise<number> {
     printUsage();
     return 2;
   }
-  // --force only qualifies --forget.
+  // --rejoin stands alone too, and --force only qualifies --forget.
+  if (
+    values.rejoin !== undefined &&
+    (source !== undefined || values.full || directional || values.forget || values.force)
+  ) {
+    printUsage();
+    return 2;
+  }
   if (values.force && !values.forget) {
     printUsage();
     return 2;
@@ -237,6 +260,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
     return 1;
   }
   if (values.forget) return runForgetCommand(syncEnabled, values.force);
+  if (values.rejoin !== undefined) return runRejoinCommand(values.rejoin);
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   // Push sync needs the host tag and the server token, and only when [sync] is enabled:
   // without it the token is never read.

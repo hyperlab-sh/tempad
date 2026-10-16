@@ -15,7 +15,7 @@
 import type { Database } from "bun:sqlite";
 import {
   defaultRebuild,
-  FORGOTTEN_SERVER_ID,
+  forgottenServerKey,
   REMOTE_BOUND_META_KEYS,
   rebuildIfPending,
   type SyncRunOptions,
@@ -61,9 +61,10 @@ function count(database: Database, sql: string, args: string[] = []): number {
  *
  * Throws `UnpushedChangesError`, changing nothing, when a tombstone, event or
  * mirror row is still `sync_dirty` and `force` is not set: the forget would
- * delete the tombstones and no later run could push the rest. The id of the
- * server this database was tied to is kept as `FORGOTTEN_SERVER_ID`, so a later
- * run refuses to rejoin it (see `ForgottenServerError`).
+ * delete the tombstones and no later run could push the rest. The ids of
+ * the servers this database was tied to are added to the set of
+ * `forgotten_server_id:<id>` keys, so a later run refuses to rejoin them (see
+ * `ForgottenServerError`).
  */
 export function forgetSync(
   database: Database,
@@ -96,7 +97,9 @@ export function forgetSync(
       ) {
         return null;
       }
-      if (!force) {
+      // Only while sync is on: once a forget has dropped the triggers, new rows
+      // default to sync_dirty = 1 with nothing to push them to.
+      if (!force && isMirrorSyncEnabled(database)) {
         const deletes = count(
           database,
           "SELECT COUNT(*) AS n FROM sync_tombstones WHERE sync_dirty = 1",
@@ -110,22 +113,23 @@ export function forgetSync(
         }
         if (deletes + changes > 0) throw new UnpushedChangesError(deletes, changes);
       }
-      // The server this database was tied to: the stored id, else the one a
-      // re-seed in flight was started against. Never overwritten with nothing.
-      const serverId = (
+      // Every server this database was tied to: the stored id and the one a
+      // re-seed in flight was started against (they can differ). Added to the
+      // set, never replacing an earlier entry.
+      const servers = (
         database
           .query(
-            "SELECT value FROM sync_meta WHERE key IN ('reseed_pending', 'server_id') ORDER BY key = 'reseed_pending' DESC LIMIT 1",
+            "SELECT DISTINCT value FROM sync_meta WHERE key IN ('reseed_pending', 'server_id')",
           )
-          .get() as { value: string } | null
-      )?.value;
+          .all() as { value: string }[]
+      ).map((row) => row.value);
       database.query(`DELETE FROM sync_meta WHERE key IN (${placeholders})`).run(...metaKeys);
-      if (serverId !== undefined) {
+      for (const serverId of servers) {
         database
           .query(
-            "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO sync_meta (key, value) VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ON CONFLICT (key) DO NOTHING",
           )
-          .run(FORGOTTEN_SERVER_ID, serverId);
+          .run(forgottenServerKey(serverId));
       }
       database.exec("DELETE FROM sync_cursors");
       // With the marker gone this drops the triggers and prunes the tombstones.
@@ -138,4 +142,16 @@ export function forgetSync(
 export function formatForgetSummary(summary: ForgetSummary | null): string {
   if (summary === null) return "sync: nothing to forget";
   return `sync: forgot triggers=${summary.triggersDropped} tombstones=${summary.tombstonesDeleted} cursors=${summary.cursorsCleared} meta=${summary.metaKeysDeleted.length}`;
+}
+
+/**
+ * `tempad sync --rejoin <server-id>`: take one id out of the forgotten set so
+ * the next sync may use that server again, accepting the overwrites a rejoin
+ * brings (see `ForgottenServerError`). False when the id was not remembered.
+ */
+export function rejoinServer(database: Database, serverId: string): boolean {
+  return (
+    database.query("DELETE FROM sync_meta WHERE key = ?").run(forgottenServerKey(serverId))
+      .changes > 0
+  );
 }
