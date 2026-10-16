@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../src/db/database.ts";
+import * as migrationFiles from "../src/db/migration-files.ts";
 
 describe("openDatabase", () => {
   test("opening twice is idempotent, user_version is 23, tables exist", () => {
@@ -50,4 +52,32 @@ describe("openDatabase", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+describe("openDatabase when a migration throws", () => {
+  const cases = [
+    { name: "before the trigger gate", versions: [1], bad: 1 },
+    { name: "from the trigger gate on", versions: [], bad: 24 },
+  ];
+  for (const { name, versions, bad } of cases) {
+    test(`closes the handle and rethrows (${name})`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "tempad-db-test-"));
+      const dbPath = join(dir, "tempad.db");
+      const real = migrationFiles.loadMigrations();
+      const chain = [
+        ...(versions.length === 0 ? real : []),
+        { version: bad, sql: "THIS IS NOT SQL;" },
+      ];
+      const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
+      const close = spyOn(Database.prototype, "close");
+      try {
+        expect(() => openDatabase(dbPath)).toThrow();
+        expect(close).toHaveBeenCalledTimes(1);
+      } finally {
+        close.mockRestore();
+        load.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
