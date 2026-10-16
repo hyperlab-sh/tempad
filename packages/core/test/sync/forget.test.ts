@@ -688,13 +688,27 @@ describe("tempad sync --forget", () => {
     }
   });
 
+  test("an unknown flag's line is just the sentence", async () => {
+    expect((await cli(["sync", "--bogus"])).stderr.split("\n")[0]).toBe(
+      "sync: Unknown option '--bogus'.",
+    );
+  });
+
+  test("--rejoin '' with a conflicting flag is a usage error, not the blank-id error", async () => {
+    for (const extra of [["--push"], ["--forget"], ["--full"], ["claude"]]) {
+      const result = await cli(["sync", "--rejoin", "", ...extra]);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("Usage:");
+    }
+  });
+
   for (const args of [["--rejoin"], ["--bogus"], ["--rejoin", "x", "--bogus"], ["-z"]]) {
     test(`sync ${args.join(" ")} is a one-line usage error with the usage text, no stack`, async () => {
       const result = await cli(["sync", ...args]);
       expect(result.code).toBe(2);
       expect(result.stdout).toBe("");
       const lines = result.stderr.split("\n");
-      expect(lines[0]).toMatch(/^sync: /);
+      expect(lines[0]).toMatch(/^sync: [^.]+\.$/);
       expect(result.stderr).toContain("Usage:");
       expect(result.stderr).toContain("tempad sync [monday|github|claude]");
       expect(result.stderr).not.toMatch(/\n\s+at |TypeError|ERR_PARSE_ARGS|node:internal/);

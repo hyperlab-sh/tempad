@@ -227,15 +227,13 @@ async function runSyncCommand(args: string[]): Promise<number> {
   } catch (error) {
     if (!isParseArgsError(error)) throw error;
     // One line naming the problem, then the usage, never the library's stack.
-    console.error(`sync: ${error.message.split("\n")[0]}`);
+    // Node appends hints after the first sentence ("... place it at the end ..."); keep the sentence.
+    const reason = (error.message.split("\n")[0] ?? "").split(". ")[0]?.replace(/\.$/, "");
+    console.error(`sync: ${reason}.`);
     printUsage();
     return 2;
   }
   const { values, positionals } = parsed;
-  if (values.rejoin !== undefined && values.rejoin.trim() === "") {
-    console.error("sync: --rejoin needs a server id");
-    return 1;
-  }
   const source = positionals[0];
   // --push/--pull run only those directions and skip the collectors, so they
   // take no source and no --full.
@@ -286,7 +284,13 @@ async function runSyncCommand(args: string[]): Promise<number> {
     return 1;
   }
   if (values.forget) return runForgetCommand(syncEnabled, values.force);
-  if (values.rejoin !== undefined) return runRejoinCommand(values.rejoin);
+  if (values.rejoin !== undefined) {
+    if (values.rejoin.trim() === "") {
+      console.error("sync: --rejoin needs a server id");
+      return 1;
+    }
+    return runRejoinCommand(values.rejoin);
+  }
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   // Push sync needs the host tag and the server token, and only when [sync] is enabled:
   // without it the token is never read.
