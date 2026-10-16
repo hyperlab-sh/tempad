@@ -93,6 +93,16 @@ const REBUILD_PENDING = "rebuild_pending";
  * another host's writes can erase the decision.
  */
 const RESEED_PENDING = "reseed_pending";
+/**
+ * Set (to a fresh ULID) whenever the cursors are reset to 0, cleared
+ * (compare-and-delete) once a pull has run to the end. While it is set the
+ * pull takes this host's own rows and events too: a machine reinstalled or
+ * restored under the same HOST_SLUG starts with an empty database and must
+ * get back what it pushed before. Own rows tie on `(stamp, host)` or lose
+ * to a newer local version, and own events dedupe by uid, so the only cost
+ * is bandwidth during one full pull.
+ */
+const PULL_OWN_PENDING = "pull_own_pending";
 /** The last event / mirror row or tombstone this host saw land on the server. */
 const PUSH_PROBE_EVENT = "push_probe_event";
 const PUSH_PROBE_ROW = "push_probe_row";
@@ -370,6 +380,7 @@ export async function runSyncEngine(
     // re-seed push completes, whatever runs in between.
     database.transaction(() => {
       database.query(META_UPSERT).run(RESEED_PENDING, serverId);
+      database.query(META_UPSERT).run(PULL_OWN_PENDING, newUlid());
       database.exec("DELETE FROM sync_cursors");
     })();
   }
@@ -414,10 +425,19 @@ export async function runSyncEngine(
     // were reset above) and leaves the marker and the id alone, so the next
     // push still re-seeds.
     const pageSize = options.pageSize ?? options.batchSize;
-    const rowCounts = await pullRows(database, remote, own, pageSize, shapes);
+    // After a cursor reset, own rows are pulled too (see PULL_OWN_PENDING);
+    // otherwise they are skipped, since this host already holds them.
+    const pullOwn = localMeta(database, PULL_OWN_PENDING);
+    const skipHost = pullOwn === null ? own : null;
+    const rowCounts = await pullRows(database, remote, own, skipHost, pageSize, shapes);
     summary.pulled.rows = rowCounts.rows;
     summary.pulled.tombstones = rowCounts.tombstones;
-    summary.pulled.events = await pullEvents(database, remote, own, pageSize);
+    summary.pulled.events = await pullEvents(database, remote, skipHost, pageSize);
+    if (pullOwn !== null) {
+      database
+        .query("DELETE FROM sync_meta WHERE key = ? AND value = ?")
+        .run(PULL_OWN_PENDING, pullOwn);
+    }
   }
 
   if (rebuildIfPending(database, rebuild)) summary.rebuilt = true;
@@ -647,9 +667,11 @@ function writeCursor(database: Database, stream: "rows" | "events", seq: number)
  * skips the rest of a batch that shares it.
  */
 function pageQuery(table: "sync_rows" | "sync_events", columns: string, order: string): string {
+  // `sync_host IS NOT ?`: bound to a slug it skips that host's rows; bound
+  // to NULL it skips none (the server always stores a host).
   return `SELECT ${columns}, seq FROM ${table}
-           WHERE seq > ? AND sync_host != ?
-             AND seq <= (SELECT MAX(seq) FROM (SELECT seq FROM ${table} WHERE seq > ? AND sync_host != ? ORDER BY seq LIMIT ?))
+           WHERE seq > ? AND sync_host IS NOT ?
+             AND seq <= (SELECT MAX(seq) FROM (SELECT seq FROM ${table} WHERE seq > ? AND sync_host IS NOT ? ORDER BY seq LIMIT ?))
            ORDER BY seq, ${order}`;
 }
 
@@ -839,6 +861,7 @@ async function pullRows(
   database: Database,
   remote: SyncRemote,
   own: string,
+  skipHost: string | null,
   pageSize: number,
   shapes: Map<string, MirrorShape>,
 ): Promise<{ rows: number; tombstones: number }> {
@@ -849,9 +872,9 @@ async function pullRows(
     const cursor = readCursor(database, "rows");
     const page = (await remote.query(sql, [
       cursor,
-      own,
+      skipHost,
       cursor,
-      own,
+      skipHost,
       pageSize,
     ])) as unknown as (RemoteRow & {
       seq: number;
@@ -874,7 +897,7 @@ async function pullRows(
 async function pullEvents(
   database: Database,
   remote: SyncRemote,
-  own: string,
+  skipHost: string | null,
   pageSize: number,
 ): Promise<number> {
   const content = new Set(
@@ -888,7 +911,13 @@ async function pullEvents(
   let inserted = 0;
   for (;;) {
     const cursor = readCursor(database, "events");
-    const page = (await remote.query(sql, [cursor, own, cursor, own, pageSize])) as unknown as {
+    const page = (await remote.query(sql, [
+      cursor,
+      skipHost,
+      cursor,
+      skipHost,
+      pageSize,
+    ])) as unknown as {
       uid: string;
       data: string;
       sync_host: string;
