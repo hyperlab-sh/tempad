@@ -29,7 +29,7 @@ import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
 import { runSetup } from "./setup/index.ts";
-import { isSyncEnabled } from "./sync/config.ts";
+import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
 import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
   planW5Command,
@@ -195,7 +195,14 @@ async function runSyncCommand(args: string[]): Promise<number> {
   // machine that has never configured GitHub. `runSync` types the result as the full
   // config; each collector's own `LoadedConfig` is what it actually reads. Push sync
   // needs the host tag, and only when `[sync]` is enabled.
-  const syncEnabled = isSyncEnabled(tempadHome());
+  let syncEnabled: boolean;
+  try {
+    syncEnabled = isSyncEnabled(tempadHome());
+  } catch (error) {
+    if (!(error instanceof SyncConfigError)) throw error;
+    console.error(`sync: ${error.message}`);
+    return 1;
+  }
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   if (syncEnabled && !needs.includes("hostSlug")) needs.push("hostSlug");
   const label = source === undefined ? "tempad sync" : `tempad sync ${source}`;
@@ -458,7 +465,7 @@ async function runIntentDispatch(command: string, rest: string[]): Promise<numbe
 }
 
 async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[]): Promise<number> {
-  const plan = planW5Command(command, rest, { syncEnabled: isSyncEnabled(tempadHome()) });
+  const plan = planW5Command(command, rest, { syncEnabled: () => isSyncEnabled(tempadHome()) });
   if (plan === null) {
     printUsage();
     return 2;
@@ -558,6 +565,11 @@ async function main(): Promise<number> {
   } catch (error) {
     if (error instanceof ConfigError || error instanceof NotSetUpError) {
       console.error(error.message);
+      return 1;
+    }
+    // A malformed [sync] reached by a command that needs it (w5 backfill/eval).
+    if (error instanceof SyncConfigError) {
+      console.error(`sync: ${error.message}`);
       return 1;
     }
     throw error;

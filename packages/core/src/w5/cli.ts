@@ -433,7 +433,14 @@ const W5_DATABASE_SUBCOMMANDS = new Set([
 export function planW5Command(
   command: "w5" | "quiet" | "review",
   args: string[],
-  options: { syncEnabled?: boolean } = {},
+  options: {
+    /**
+     * Whether `[sync]` is enabled; a function is called only for the
+     * subcommands that depend on it (backfill, eval), so a malformed
+     * `[sync]` never breaks the hook, quiet or review commands.
+     */
+    syncEnabled?: boolean | (() => boolean);
+  } = {},
 ): CommandPlan | null {
   if (command === "quiet" || command === "review") {
     return {
@@ -449,14 +456,18 @@ export function planW5Command(
     return { label, needs: [], opensDatabase: false, silentWhenUnconfigured: false };
   }
   if (!W5_DATABASE_SUBCOMMANDS.has(subcommand)) return null;
-  const sync: readonly ConfigKey[] = options.syncEnabled ? W5_SYNC_NEEDS : [];
+  const sync = (): readonly ConfigKey[] => {
+    const enabled =
+      typeof options.syncEnabled === "function" ? options.syncEnabled() : options.syncEnabled;
+    return enabled ? W5_SYNC_NEEDS : [];
+  };
   const needs: readonly ConfigKey[] =
     subcommand === "run"
       ? W5_RUN_NEEDS
       : subcommand === "eval"
-        ? [...W5_EVAL_NEEDS, ...sync]
+        ? [...W5_EVAL_NEEDS, ...sync()]
         : subcommand === "backfill"
-          ? sync
+          ? sync()
           : [];
   return {
     label,
