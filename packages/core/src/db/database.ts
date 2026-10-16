@@ -3,20 +3,24 @@ import { createHash } from "node:crypto";
 import { encodeTime } from "ulid";
 import { ulidAfter } from "../intent/ids";
 import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
-import { loadMigrations } from "./migration-files";
+import { loadMigrations, type MigrationFile } from "./migration-files";
 
 /**
  * From this version on, the push-sync mirror triggers exist only while
- * `sync_meta.mirror_sync_enabled` is set (src/sync/triggers.ts). The last
- * pending migration from here runs `reconcileMirrorTriggers` once, inside its
- * own transaction, so a migration that drops a trigger to change it has it
- * back, from `mirror-triggers.sql`, before that migration commits.
+ * `sync_meta.mirror_sync_enabled` is set (src/sync/triggers.ts). Every pending
+ * migration from here applies inside ONE transaction, which runs
+ * `reconcileMirrorTriggers` once at its end, after the last of them, and then
+ * commits (see `applyMigrations`).
  *
- * Only the last one: `mirror-triggers.sql` describes the head schema, so
- * installing it after an intermediate step (say 22, on the way to a 25 that
- * adds a mirror column the triggers name) would make any 23 or 24 statement
- * touching that mirror fail. Between intermediate steps the triggers are as
- * the previous step left them.
+ * One transaction, because 0022 drops the triggers: were each step its own
+ * commit, a database with sync enabled would sit without triggers between
+ * 0022's commit and the last step's, and a w5 hook or collector holding the
+ * database open could write a mirror row there that is never stamped or
+ * tombstoned, so it never pushes (and the marker being set already, nothing
+ * would ever restamp it). Reconciling only at the end, because
+ * `mirror-triggers.sql` describes the head schema: installing it after an
+ * intermediate step (say 22, on the way to a 25 that adds a mirror column the
+ * triggers name) would make any 23 or 24 statement touching that mirror fail.
  */
 const TRIGGER_GATE_VERSION = 22;
 
@@ -61,12 +65,12 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
       migration.version > currentVersion &&
       (options.upToVersion === undefined || migration.version <= options.upToVersion),
   );
-  const last = pending.at(-1)?.version;
-  for (const migration of pending) {
-    applyMigration(database, migration, {
-      reconcileTriggers: migration.version === last && migration.version >= TRIGGER_GATE_VERSION,
-    });
+  // Below the gate, one transaction per migration; from it on, one for all.
+  for (const migration of pending.filter((each) => each.version < TRIGGER_GATE_VERSION)) {
+    applyMigrations(database, [migration], { reconcileTriggers: false });
   }
+  const gated = pending.filter((each) => each.version >= TRIGGER_GATE_VERSION);
+  if (gated.length > 0) applyMigrations(database, gated, { reconcileTriggers: true });
 
   if (hasColumn(database, "events", "uid")) backfillEventUids(database);
   if (userVersion(database) >= TRIGGER_GATE_VERSION) {
@@ -248,8 +252,9 @@ function backfillEventUids(database: Database): void {
 }
 
 /**
- * Runs one migration and its `user_version` bump inside a single transaction,
- * so a failure part-way through leaves the database exactly as it was.
+ * Runs `migrations` (ascending) and the `user_version` bump inside a single
+ * transaction, so a failure part-way through leaves the database exactly as
+ * it was before the first of them.
  *
  * Without this, a migration that dies on its fifth statement would leave the
  * first four applied and `user_version` un-bumped: the next start would replay
@@ -258,30 +263,47 @@ function backfillEventUids(database: Database): void {
  * tolerated messages. That is recovery by coincidence; a transaction makes it
  * a property.
  *
- * SQLite runs DDL transactionally, so `ALTER TABLE` and `PRAGMA user_version`
- * both roll back with everything else.
+ * `openDatabase` calls it once per migration below `TRIGGER_GATE_VERSION`
+ * and once for every pending migration from it on. Recovery follows from
+ * that: a failure below the gate keeps every earlier migration committed and
+ * the next start resumes at the failed one; a failure anywhere from the gate
+ * on rolls back the whole block, 0022 included, so the database stays at the
+ * version below the block with the triggers that version had. A chain that
+ * crosses the gate (18 to 23) commits 19, 20 and 21 one by one and then 22
+ * and 23 together: below the gate every step keeps the triggers 0019
+ * installed, so committing them separately opens no gap and keeps their
+ * progress on a later failure, while the block from the gate is the stretch
+ * whose intermediate commits would expose a database with no triggers.
+ *
+ * With `reconcileTriggers`, `reconcileMirrorTriggers` runs once after the last
+ * migration's SQL, before the version bump and the commit.
+ *
+ * SQLite runs DDL transactionally, so `ALTER TABLE`, `DROP TRIGGER` and
+ * `PRAGMA user_version` all roll back with everything else.
  */
-function applyMigration(
+function applyMigrations(
   database: Database,
-  migration: { version: number; sql: string },
+  migrations: readonly MigrationFile[],
   options: { reconcileTriggers: boolean },
 ): void {
   // IMMEDIATE takes the write lock up front (waiting out `busy_timeout`), and
-  // the version is read again under it. `openDatabase` decided this migration
-  // was due from a read taken before the lock: a second process (the w5 hook
-  // beside a CLI command) can have applied it in between, and running it twice
-  // fails on the first `ADD COLUMN`.
+  // the version is read again under it. `openDatabase` decided these
+  // migrations were due from a read taken before the lock: a second process
+  // (the w5 hook beside a CLI command) can have applied some or all of them in
+  // between, and running one twice fails on the first `ADD COLUMN`. Only the
+  // ones still above the version run; when none is, nothing changes.
   database.exec("BEGIN IMMEDIATE");
   try {
-    const applied = (database.query("PRAGMA user_version;").get() as { user_version: number })
-      .user_version;
-    if (applied >= migration.version) {
+    const applied = userVersion(database);
+    const due = migrations.filter((migration) => migration.version > applied);
+    const last = due.at(-1);
+    if (last === undefined) {
       database.exec("ROLLBACK");
       return;
     }
-    runMigration(database, migration.sql);
+    for (const migration of due) runMigration(database, migration.sql);
     if (options.reconcileTriggers) reconcileMirrorTriggers(database);
-    database.exec(`PRAGMA user_version = ${migration.version};`);
+    database.exec(`PRAGMA user_version = ${last.version};`);
     database.exec("COMMIT");
   } catch (error) {
     database.exec("ROLLBACK");
@@ -316,7 +338,7 @@ function applyMigration(
  *   column: the column is already there, so adding it again is a no-op.
  *
  * Every other error propagates and rolls the whole migration back
- * (see `applyMigration`). Skipping is safe only because these statements are
+ * (see `applyMigrations`). Skipping is safe only because these statements are
  * idempotent with respect to a table the projection creates correctly from
  * scratch; it is not a general "ignore migration errors" path.
  */
