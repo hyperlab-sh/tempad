@@ -193,20 +193,27 @@ export interface LegacyEventRow {
  * no-op on every open after the first.
  */
 function backfillEventUids(database: Database): void {
-  const rows = database
-    .query(
-      "SELECT id, recorded_at, kind, subject, payload FROM events WHERE uid IS NULL ORDER BY id",
-    )
-    .all() as LegacyEventRow[];
-  if (rows.length === 0) return;
+  const pending = database.query("SELECT 1 AS pending FROM events WHERE uid IS NULL LIMIT 1").get();
+  if (pending === null) return;
 
-  const maximum = (
-    database.query("SELECT MAX(uid) AS uid FROM events").get() as {
-      uid: string | null;
-    }
-  ).uid;
-  const update = database.query("UPDATE events SET uid = ? WHERE id = ?");
+  // The rows and the maximum are read inside the write transaction. Two
+  // processes opening the same pre-0019 database both see NULL uids; reading
+  // before taking the lock would let the second hand out uids computed against
+  // a maximum the first has already moved.
   const run = database.transaction(() => {
+    const rows = database
+      .query(
+        "SELECT id, recorded_at, kind, subject, payload FROM events WHERE uid IS NULL ORDER BY id",
+      )
+      .all() as LegacyEventRow[];
+    if (rows.length === 0) return;
+
+    const maximum = (
+      database.query("SELECT MAX(uid) AS uid FROM events").get() as {
+        uid: string | null;
+      }
+    ).uid;
+    const update = database.query("UPDATE events SET uid = ? WHERE id = ?");
     let previous = maximum;
     let previousTime = 0;
     for (const row of rows) {
@@ -221,7 +228,7 @@ function backfillEventUids(database: Database): void {
       previousTime = time;
     }
   });
-  run();
+  run.immediate();
 }
 
 /**
@@ -239,8 +246,19 @@ function backfillEventUids(database: Database): void {
  * both roll back with everything else.
  */
 function applyMigration(database: Database, migration: { version: number; sql: string }): void {
-  database.exec("BEGIN");
+  // IMMEDIATE takes the write lock up front (waiting out `busy_timeout`), and
+  // the version is read again under it. `openDatabase` decided this migration
+  // was due from a read taken before the lock: a second process (the w5 hook
+  // beside a CLI command) can have applied it in between, and running it twice
+  // fails on the first `ADD COLUMN`.
+  database.exec("BEGIN IMMEDIATE");
   try {
+    const applied = (database.query("PRAGMA user_version;").get() as { user_version: number })
+      .user_version;
+    if (applied >= migration.version) {
+      database.exec("ROLLBACK");
+      return;
+    }
     runMigration(database, migration.sql);
     database.exec(`PRAGMA user_version = ${migration.version};`);
     database.exec("COMMIT");
