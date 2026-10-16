@@ -131,7 +131,7 @@ In `TEMPAD_HOME/.env` (tempad has no default for this and throws at startup when
 TEMPAD_SYNC_TOKEN=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...
 ```
 
-Accepted schemes are `libsql:`, `https:` and `wss:`. Plain `http:`/`ws:` work only for loopback hosts, so the token never crosses the network unencrypted. `libsql://` always uses TLS. `@libsql/client` would turn TLS off for `?tls=0` and read a token from `?authToken=` (checked in `@libsql/core` 0.18 `config.js`), so tempad rejects any query string or fragment in `[sync].url`, and any `user:pass@` userinfo. The token comes only from `TEMPAD_SYNC_TOKEN`. With the Coolify setup above, both `libsql://` and `https://` terminate at the proxy.
+Accepted schemes are `libsql:`, `https:` and `wss:`. Plain `http:`/`ws:` work only for loopback hosts, so the token never crosses the network unencrypted. `libsql://` always uses TLS. `@libsql/client` would turn TLS off for `?tls=0` and read a token from `?authToken=` (checked in `@libsql/core` 0.18 `config.js`), so tempad rejects any query string or fragment in `[sync].url`, and any `user:pass@` userinfo, backslash, whitespace or control character. The client is handed a URL rebuilt from the checked parse, never the string as written. The token comes only from `TEMPAD_SYNC_TOKEN`. With the Coolify setup above, both `libsql://` and `https://` terminate at the proxy.
 
 Every host must run identical `[[projects]]` rules in `tempad.toml`. Org, project and display name are computed from the local rules and synced as data, so hosts with different rules overwrite each other's values on every sync (see `docs/specs/push-sync.md`).
 
