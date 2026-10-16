@@ -160,7 +160,7 @@ Each command checks only the variables it needs and fails naming the command and
 | `TZ`                  | IANA time zone that places work on days, e.g. `Europe/Berlin`             | `report *`, `w5 eval`        |
 | `SINCE`               | Earliest date to sync, `YYYY-MM-DD`                                       | `sync github`, `sync claude` |
 
-`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `--version`, `setup` (and its hidden alias `init`), `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run /tempad:setup in Claude Code, or `tempad setup` in a terminal`.
+`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review`, `scry` (plus `HOST_SLUG` when `[sync]` is enabled) and most `w5` subcommands need no variables. `--help`, `--version`, `setup` (and its hidden alias `init`), `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run /tempad:setup in Claude Code, or `tempad setup` in a terminal`.
 
 `ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad setup --force` keeps that line when it rewrites the file.
 
@@ -207,10 +207,24 @@ tempad sync [monday|github|claude] [--full]
 tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path]
 tempad w5 backfill      # classify recent sessions the hook missed
 tempad review           # open doubts and unconfirmed quests
+tempad scry             # health check: is the data sound, is a backfill or eval due?
 tempad --help           # every command
 ```
 
 `--full` clears a source's last-sync cursor so it rescans back to `SINCE`.
+
+### `tempad scry`
+
+A read-only health check of the data. It prints **Health** (config, schema, `quick_check`, projections against a replay of the event log, collector freshness, failed or stuck w5 jobs, unclassified windows, work waiting for a human, sync state), **Stats** (rows per source, quests, stints, windows, jobs) and **Recommendations**: each is a command you can paste plus one line on why. A backfill is recommended when sessions in the last `[w5].backfill_days` days (or `--days <n>`) have windows nobody classified; an eval is only ever listed as conditional, because the database does not record which model, prompts or settings produced a classification, so the data cannot say one is due.
+
+```sh
+tempad scry                # human-readable
+tempad scry --json         # the same report as JSON
+tempad scry --fast         # skip quick_check and the projection replay
+tempad scry --days 30      # look further back for unclassified windows
+```
+
+Exit 0 when no check failed (warnings and recommendations alone do not fail), 1 when one did, 2 on a usage error. It opens the database read-only, so it applies no migration, repairs nothing and never touches the network.
 
 ### Declaring quests
 
