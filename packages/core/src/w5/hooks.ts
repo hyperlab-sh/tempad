@@ -24,6 +24,15 @@ interface SettingsFile {
   [key: string]: unknown;
 }
 
+/**
+ * One line `tempad w5 hook install` prints after writing settings.json. The
+ * Claude Code plugin is the recommended route; both can be installed because the
+ * plugin's hook scripts stand down while a settings.json hook marked
+ * `"tempad": true` exists (see `packages/core/hooks/w5-common.sh`).
+ */
+export const PLUGIN_RECOMMENDATION_MESSAGE =
+  "Recommended: install the Claude Code plugin instead (claude plugin install tempad@hyperlab). Installing both is safe; the plugin's hooks stand down while these settings.json hooks exist.";
+
 const PACKAGE_ROOT = join(import.meta.dir, "..", "..");
 const HOOKS_DIR = join(PACKAGE_ROOT, "hooks");
 const CLI_PATH = join(PACKAGE_ROOT, "src", "cli.ts");
