@@ -3,6 +3,7 @@ import {
   type ActiveDeclaredQuest,
   activeDeclaredQuests,
   currentDeclaredQuestForSubagent,
+  latestDeclaredParentSessionId,
 } from "../intent/declarations";
 import { type ClassifierWindow, type DeclaredQuestSlice, planAliasPrefix } from "./classifier";
 
@@ -70,33 +71,6 @@ const ACTIVITY_SLICE_SELECT = `
     LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
    WHERE stints.retracted_at IS NULL
      AND stints.dismissed_at IS NULL`;
-
-/**
- * The `parent_session_id` on the session's latest declaration at `at`, or null
- * when its latest declaration is session-scoped (or there is none). Parent
- * linkage lives entirely on the `quest.declared` payload -- no schema or
- * collector column -- so this is the only place it needs to be read.
- */
-function latestDeclaredParentSessionId(
-  database: Database,
-  sessionId: string,
-  at: string,
-): string | null {
-  const row = database
-    .query(
-      `SELECT payload FROM events
-        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
-        ORDER BY at DESC, uid DESC, id DESC LIMIT 1`,
-    )
-    .get(sessionId, at) as { payload: string } | null;
-  if (row === null) return null;
-  const payload = JSON.parse(row.payload) as {
-    scope?: string;
-    parent_session_id?: string;
-  };
-  if (payload.scope !== "subagent") return null;
-  return payload.parent_session_id ?? null;
-}
 
 /**
  * Aliases are assigned fresh here, never persisted: `activeDeclaredQuests`

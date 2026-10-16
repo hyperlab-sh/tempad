@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { askQuestion, assignStint, recordTrace } from "../intent/api";
+import { latestDeclaredParentSessionId } from "../intent/declarations";
 import type { Actor } from "../intent/events";
 import { currentHeroId } from "../intent/identity";
 import { newUlid } from "../intent/ids";
@@ -494,30 +495,6 @@ function resolveStintForSegmentDeclared(
   // Neither a known prefix nor a listed alias: validation repairs this shape
   // before apply sees it, so reaching here means a hand-built result.
   return open(segment.what);
-}
-
-/**
- * The `parent_session_id` on the session's latest declaration at `at`, or null
- * when that declaration is session-scoped. `currentDeclaredQuest` only resolves
- * session-scope declarations, so a subagent's parent has to be read from the
- * event payload that carries it.
- */
-function latestDeclaredParentSessionId(
-  database: Database,
-  sessionId: string,
-  at: string,
-): string | null {
-  const row = database
-    .query(
-      `SELECT payload FROM events
-        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
-        ORDER BY at DESC, uid DESC, id DESC LIMIT 1`,
-    )
-    .get(sessionId, at) as { payload: string } | null;
-  if (row === null) return null;
-  const payload = JSON.parse(row.payload) as { scope?: string; parent_session_id?: string };
-  if (payload.scope !== "subagent") return null;
-  return payload.parent_session_id ?? null;
 }
 
 export function applyResult(
