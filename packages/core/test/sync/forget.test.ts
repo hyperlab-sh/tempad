@@ -657,7 +657,7 @@ describe("tempad sync --forget", () => {
     expect(forced.stdout).toContain("sync: forgot triggers=18");
   });
 
-  test("--rejoin removes one remembered id and prints it; an unknown id is a no-op", async () => {
+  test("--rejoin removes one remembered id and prints it; an unknown id exits 1", async () => {
     await syncedHome();
     const database = openDatabase(databasePath, { hostSlug: "host-a" });
     const serverId = metaValue(database, "server_id");
@@ -666,9 +666,9 @@ describe("tempad sync --forget", () => {
 
     const unknown = await cli(["sync", "--rejoin", "nope"]);
     expect(unknown).toEqual({
-      code: 0,
-      stdout: "sync: server nope was not forgotten; nothing to do\n",
-      stderr: "",
+      code: 1,
+      stdout: "",
+      stderr: "sync: --rejoin: server nope was not forgotten; nothing to rejoin\n",
     });
     const result = await cli(["sync", "--rejoin", serverId]);
     expect(result).toEqual({
@@ -680,6 +680,40 @@ describe("tempad sync --forget", () => {
     expect(metaKeys(kept)).toEqual([]);
     kept.close();
   });
+
+  test("--rejoin with an empty or blank id exits 1", async () => {
+    for (const id of ["", "  "]) {
+      const result = await cli(["sync", "--rejoin", id]);
+      expect(result).toEqual({ code: 1, stdout: "", stderr: "sync: --rejoin needs a server id\n" });
+    }
+  });
+
+  test("an unknown flag's line is just the sentence", async () => {
+    expect((await cli(["sync", "--bogus"])).stderr.split("\n")[0]).toBe(
+      "sync: Unknown option '--bogus'.",
+    );
+  });
+
+  test("--rejoin '' with a conflicting flag is a usage error, not the blank-id error", async () => {
+    for (const extra of [["--push"], ["--forget"], ["--full"], ["claude"]]) {
+      const result = await cli(["sync", "--rejoin", "", ...extra]);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("Usage:");
+    }
+  });
+
+  for (const args of [["--rejoin"], ["--bogus"], ["--rejoin", "x", "--bogus"], ["-z"]]) {
+    test(`sync ${args.join(" ")} is a one-line usage error with the usage text, no stack`, async () => {
+      const result = await cli(["sync", ...args]);
+      expect(result.code).toBe(2);
+      expect(result.stdout).toBe("");
+      const lines = result.stderr.split("\n");
+      expect(lines[0]).toMatch(/^sync: [^.]+\.$/);
+      expect(result.stderr).toContain("Usage:");
+      expect(result.stderr).toContain("tempad sync [monday|github|claude]");
+      expect(result.stderr).not.toMatch(/\n\s+at |TypeError|ERR_PARSE_ARGS|node:internal/);
+    });
+  }
 
   for (const extra of [["--forget"], ["--force"], ["--push"], ["--full"], ["claude"]]) {
     test(`--rejoin with ${extra.join(" ")} is a usage error`, async () => {

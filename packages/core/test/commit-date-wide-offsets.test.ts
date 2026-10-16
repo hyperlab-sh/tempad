@@ -148,6 +148,15 @@ function snapshot(database: Database): Row[] {
     .all() as Row[];
 }
 
+function syncColumns(rows: Row[]) {
+  return rows.map(({ sha, sync_host, sync_updated_at, sync_dirty }) => ({
+    sha,
+    sync_host,
+    sync_updated_at,
+    sync_dirty,
+  }));
+}
+
 function expectedText(value: string): string {
   // Offset form that parses becomes what the collector writes; UTC and unreadable text are kept.
   const offsetForm = /[-+]\d{2}:\d{2}$/.test(value);
@@ -341,6 +350,7 @@ describe("commit dates with offsets of +-15:00 or more", () => {
   test("a chain from 0020 runs 0021 in SQL and the step after it, atomically with 0022", () => {
     const old = openDatabase(path, { upToVersion: 20 });
     seed(old);
+    const before = syncColumns(snapshot(old));
     old.close();
 
     const database = openDatabase(path);
@@ -350,6 +360,8 @@ describe("commit dates with offsets of +-15:00 or more", () => {
       expect(row.authored_at).toBe(expectedText(original.authoredAt));
       expect(row.committed_at).toBe(expectedText(original.committedAt));
     }
+    // 0021 and 0023 rewrite content without restamping, re-tagging or re-dirtying.
+    expect(syncColumns(snapshot(database))).toEqual(before);
     database.close();
   });
 

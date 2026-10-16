@@ -67,11 +67,16 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
       (options.upToVersion === undefined || migration.version <= options.upToVersion),
   );
   // Below the gate, one transaction per migration; from it on, one for all.
-  for (const migration of pending.filter((each) => each.version < TRIGGER_GATE_VERSION)) {
-    applyMigrations(database, [migration], { reconcileTriggers: false });
+  try {
+    for (const migration of pending.filter((each) => each.version < TRIGGER_GATE_VERSION)) {
+      applyMigrations(database, [migration], { reconcileTriggers: false });
+    }
+    const gated = pending.filter((each) => each.version >= TRIGGER_GATE_VERSION);
+    if (gated.length > 0) applyMigrations(database, gated, { reconcileTriggers: true });
+  } catch (error) {
+    database.close();
+    throw error;
   }
-  const gated = pending.filter((each) => each.version >= TRIGGER_GATE_VERSION);
-  if (gated.length > 0) applyMigrations(database, gated, { reconcileTriggers: true });
 
   if (hasColumn(database, "events", "uid")) backfillEventUids(database);
   if (userVersion(database) >= TRIGGER_GATE_VERSION) {
