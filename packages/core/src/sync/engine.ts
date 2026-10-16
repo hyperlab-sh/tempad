@@ -63,6 +63,8 @@ export interface SyncRunSummary {
 }
 
 export class SchemaGateError extends Error {}
+/** The remote is the server this database forgot (`tempad sync --forget`). */
+export class ForgottenServerError extends Error {}
 
 /** The remote schema: generic, never a copy of local DDL. */
 export const REMOTE_SCHEMA: readonly string[] = [
@@ -117,12 +119,22 @@ const PUSH_PROBE_EVENT = "push_probe_event";
 const PUSH_PROBE_ROW = "push_probe_row";
 /** The server identity this database last synced with (stored after a completed re-seed). */
 const SERVER_ID = "server_id";
+/**
+ * The id of the server `tempad sync --forget` left (written by it, never
+ * deleted by it). A run against a server that still holds this id throws
+ * `ForgottenServerError`: after a forget the database no longer knows what the
+ * server has, so rejoining would restamp every row as new and overwrite edits
+ * and deletes other hosts made since. Deliberately not in
+ * `REMOTE_BOUND_META_KEYS`: it must outlive the forget that wrote it.
+ */
+export const FORGOTTEN_SERVER_ID = "forgotten_server_id";
 
 /**
  * Every local `sync_meta` key that ties this database to one particular remote
  * (`tempad sync --forget` deletes them). `rebuild_pending` is not here: it says
  * the local projections lack pulled events, which stays true whatever happens to
- * the remote. `mirror_sync_enabled` belongs to `src/sync/triggers.ts`.
+ * the remote. `mirror_sync_enabled` belongs to `src/sync/triggers.ts`;
+ * `FORGOTTEN_SERVER_ID` is the one key a forget writes instead of deleting.
  */
 export const REMOTE_BOUND_META_KEYS: readonly string[] = [
   SERVER_ID,
@@ -373,8 +385,11 @@ export async function runSyncEngine(
   const warn = options.warn ?? ((message: string) => console.error(message));
   // First, before any network call: sync is in use from here on, so the
   // mirror triggers go in (once) and rows written without them are stamped
-  // and dirtied, ready for the push below.
-  enableMirrorSync(database);
+  // and dirtied, ready for the push below. Except after a `--forget`: the
+  // server may turn out to be the one that was left (refused below), and
+  // restamping every row dirty would then make the next `--forget` refuse.
+  const forgotten = localMeta(database, FORGOTTEN_SERVER_ID) !== null;
+  if (!forgotten) enableMirrorSync(database);
   // Before any network call: a previous run's pulled events must be
   // projected even when this run is push-only or cannot reach the server.
   // A failure here must not block push and pull (new local work would never
@@ -416,6 +431,15 @@ export async function runSyncEngine(
       `remote holds data from tempad schema ${remoteVersion}; upgrade tempad on this host (schema ${localVersion})`,
     );
   }
+  if (forgotten && localMeta(database, FORGOTTEN_SERVER_ID) === meta.get("server_id")) {
+    throw new ForgottenServerError(
+      "this database ran `tempad sync --forget` against this server and no longer knows what it holds; " +
+        "point [sync] at a fresh server, or start from an empty tempad.db and pull. " +
+        "To rejoin anyway (it overwrites newer edits and brings back deletes made by other hosts), " +
+        `run: sqlite3 <TEMPAD_HOME>/tempad.db "DELETE FROM sync_meta WHERE key = '${FORGOTTEN_SERVER_ID}'"`,
+    );
+  }
+  enableMirrorSync(database);
   if (remoteVersion < localVersion) {
     // Raise it now, not only with the first push batch: a pull-only run or
     // one with nothing dirty must still stop older hosts at the gate.

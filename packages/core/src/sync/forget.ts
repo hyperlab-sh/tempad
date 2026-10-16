@@ -15,10 +15,12 @@
 import type { Database } from "bun:sqlite";
 import {
   defaultRebuild,
+  FORGOTTEN_SERVER_ID,
   REMOTE_BOUND_META_KEYS,
   rebuildIfPending,
   type SyncRunOptions,
 } from "./engine";
+import { SYNCED_APPEND_TABLES, SYNCED_UPSERT_TABLES } from "./tables";
 import {
   isMirrorSyncEnabled,
   MIRROR_SYNC_ENABLED,
@@ -34,6 +36,19 @@ export interface ForgetSummary {
   metaKeysDeleted: string[];
 }
 
+/** Rows and tombstones that never reached the server, so a forget would drop them for good. */
+export class UnpushedChangesError extends Error {
+  constructor(
+    readonly deletes: number,
+    readonly changes: number,
+  ) {
+    super(
+      `${deletes} deletes / ${changes} changes never reached the server; ` +
+        "re-enable [sync] and run `tempad sync --push` first, or pass --force to leave them behind",
+    );
+  }
+}
+
 function count(database: Database, sql: string, args: string[] = []): number {
   return (database.query(sql).get(...args) as { n: number }).n;
 }
@@ -43,10 +58,17 @@ function count(database: Database, sql: string, args: string[] = []): number {
  * database (nothing to forget). Pulled events not yet projected are projected
  * first (`rebuild_pending`), since nothing will do it once sync is off; a
  * failing rebuild throws and leaves everything untouched.
+ *
+ * Throws `UnpushedChangesError`, changing nothing, when a tombstone, event or
+ * mirror row is still `sync_dirty` and `force` is not set: the forget would
+ * delete the tombstones and no later run could push the rest. The id of the
+ * server this database was tied to is kept as `FORGOTTEN_SERVER_ID`, so a later
+ * run refuses to rejoin it (see `ForgottenServerError`).
  */
 export function forgetSync(
   database: Database,
   rebuild: NonNullable<SyncRunOptions["rebuildProjections"]> = defaultRebuild,
+  force = false,
 ): ForgetSummary | null {
   rebuildIfPending(database, rebuild);
   return database
@@ -74,7 +96,37 @@ export function forgetSync(
       ) {
         return null;
       }
+      if (!force) {
+        const deletes = count(
+          database,
+          "SELECT COUNT(*) AS n FROM sync_tombstones WHERE sync_dirty = 1",
+        );
+        let changes = 0;
+        for (const table of [...SYNCED_APPEND_TABLES, ...SYNCED_UPSERT_TABLES]) {
+          changes += count(
+            database,
+            `SELECT COUNT(*) AS n FROM ${table.name} WHERE sync_dirty = 1`,
+          );
+        }
+        if (deletes + changes > 0) throw new UnpushedChangesError(deletes, changes);
+      }
+      // The server this database was tied to: the stored id, else the one a
+      // re-seed in flight was started against. Never overwritten with nothing.
+      const serverId = (
+        database
+          .query(
+            "SELECT value FROM sync_meta WHERE key IN ('reseed_pending', 'server_id') ORDER BY key = 'reseed_pending' DESC LIMIT 1",
+          )
+          .get() as { value: string } | null
+      )?.value;
       database.query(`DELETE FROM sync_meta WHERE key IN (${placeholders})`).run(...metaKeys);
+      if (serverId !== undefined) {
+        database
+          .query(
+            "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+          )
+          .run(FORGOTTEN_SERVER_ID, serverId);
+      }
       database.exec("DELETE FROM sync_cursors");
       // With the marker gone this drops the triggers and prunes the tombstones.
       reconcileMirrorTriggers(database);

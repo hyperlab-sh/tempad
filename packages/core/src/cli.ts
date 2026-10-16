@@ -59,7 +59,7 @@ const USAGE_LINES: string[] = [
   "Usage:",
   "  tempad --help | -h | help | --version",
   "  tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
-  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget   (--forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only)",
+  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget [--force]   (--forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only; refuses while changes never reached the server unless --force)",
   "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
   '  tempad hero init "<name>"',
   '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
@@ -162,7 +162,7 @@ export async function runSync(
 }
 
 /** `tempad sync --forget`: local only, so it needs no configuration beyond a set-up home. */
-function runForgetCommand(syncEnabled: boolean): number {
+function runForgetCommand(syncEnabled: boolean, force: boolean): number {
   if (syncEnabled) {
     console.error(
       "sync: --forget refused: [sync] is still enabled in tempad.toml; remove the [sync] section first",
@@ -171,7 +171,7 @@ function runForgetCommand(syncEnabled: boolean): number {
   }
   const { database } = prepareCommand("tempad sync --forget", []);
   try {
-    console.log(formatForgetSummary(forgetSync(database)));
+    console.log(formatForgetSummary(forgetSync(database, undefined, force)));
   } catch (error) {
     console.error(`sync: forget failed: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
@@ -189,6 +189,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
       push: { type: "boolean", default: false },
       pull: { type: "boolean", default: false },
       forget: { type: "boolean", default: false },
+      force: { type: "boolean", default: false },
     },
     strict: true,
     allowPositionals: true,
@@ -211,6 +212,11 @@ async function runSyncCommand(args: string[]): Promise<number> {
     printUsage();
     return 2;
   }
+  // --force only qualifies --forget.
+  if (values.force && !values.forget) {
+    printUsage();
+    return 2;
+  }
 
   const selected: Collector[] = directional
     ? []
@@ -230,7 +236,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
     console.error(`sync: ${error.message}`);
     return 1;
   }
-  if (values.forget) return runForgetCommand(syncEnabled);
+  if (values.forget) return runForgetCommand(syncEnabled, values.force);
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   // Push sync needs the host tag and the server token, and only when [sync] is enabled:
   // without it the token is never read.

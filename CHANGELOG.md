@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `tempad sync --forget` is the off switch for a host that leaves sync for good. After you remove `[sync]` from `tempad.toml`, it drops the 18 sync triggers, every tombstone, the pull cursors and the server identity in one transaction, and the database stops tracking changes for a server you no longer use. It refuses with exit 1 while `[sync]` is still enabled, prints `sync: forgot triggers=<n> tombstones=<n> cursors=<n> meta=<n>` (or `sync: nothing to forget`), needs no token and never touches the network, and leaves your data and the `sync_*` columns alone. Turning sync on again re-sends everything.
+- `tempad sync --forget` is the off switch for a host that leaves sync for good. After you remove `[sync]` from `tempad.toml`, it drops the 18 sync triggers, every tombstone, the pull cursors and the server identity in one transaction, and the database stops tracking changes for a server you no longer use. It refuses with exit 1 while `[sync]` is still enabled, and while deletes or changes have not reached the server (`N deletes / M changes never reached the server`) unless you pass `--force`. It prints `sync: forgot triggers=<n> tombstones=<n> cursors=<n> meta=<n>` (or `sync: nothing to forget`), needs no token, never touches the network, and leaves your data and the `sync_*` columns alone. The database remembers the id of the server it left and refuses to sync with that server again (`ForgottenServerError`): rejoining would restamp every row as new and overwrite edits other hosts made since, and bring back rows they deleted. Point `[sync]` at a fresh server instead, or start from an empty `tempad.db` and pull.
 
 ### Fixed
 

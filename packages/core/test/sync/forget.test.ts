@@ -5,8 +5,8 @@ import { dirname, join } from "node:path";
 import { openDatabase } from "../../src/db/database";
 import { rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
-import { runSyncEngine } from "../../src/sync/engine";
-import { forgetSync } from "../../src/sync/forget";
+import { ForgottenServerError, runSyncEngine } from "../../src/sync/engine";
+import { forgetSync, UnpushedChangesError } from "../../src/sync/forget";
 import {
   enableMirrorSync,
   isMirrorSyncEnabled,
@@ -51,6 +51,11 @@ function triggerCount(database: Database): number {
       )
       .get(...MIRROR_TRIGGER_NAMES) as { n: number }
   ).n;
+}
+
+function metaValue(database: Database, key: string): string {
+  return (database.query("SELECT value FROM sync_meta WHERE key = ?").get(key) as { value: string })
+    .value;
 }
 
 function count(database: Database, table: string): number {
@@ -109,6 +114,8 @@ async function syncedHost(remote: FakeRemote): Promise<Database> {
   await sync(database, remote);
   database.query("DELETE FROM gh_commits WHERE sha = 'c-gone'").run();
   expect(count(database, "sync_tombstones")).toBe(1);
+  // Push the tombstone too: a forget refuses while anything is unpushed.
+  await sync(database, remote);
   return database;
 }
 
@@ -123,6 +130,10 @@ describe("forgetSync", () => {
     const cursors = count(database, "sync_cursors");
     const stamps = stampSnapshot(database);
     const rows = sourceSnapshot(database);
+    const serverId = metaValue(database, "server_id");
+    // Markers the engine leaves behind mid-re-seed: both must go too.
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('reseed_pending', ?)").run(serverId);
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('pull_own_pending', 'ulid')").run();
 
     const summary = forgetSync(database);
 
@@ -133,6 +144,8 @@ describe("forgetSync", () => {
       metaKeysDeleted: expect.arrayContaining([
         "mirror_sync_enabled",
         "server_id",
+        "reseed_pending",
+        "pull_own_pending",
         "push_probe_event",
         "push_probe_row",
       ]),
@@ -141,8 +154,10 @@ describe("forgetSync", () => {
     expect(isMirrorSyncEnabled(database)).toBe(false);
     expect(count(database, "sync_tombstones")).toBe(0);
     expect(count(database, "sync_cursors")).toBe(0);
-    // Every key the engine writes is covered: nothing is left in sync_meta.
-    expect(metaKeys(database)).toEqual([]);
+    // Every remote-bound key is gone; only the id of the server left stays,
+    // so a later run can refuse to rejoin it.
+    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
+    expect(metaValue(database, "forgotten_server_id")).toBe(serverId);
     expect(stampSnapshot(database)).toEqual(stamps);
     expect(sourceSnapshot(database)).toEqual(rows);
     database.close();
@@ -170,6 +185,66 @@ describe("forgetSync", () => {
     database.query("INSERT INTO sync_cursors (stream, seq) VALUES ('rows', 3)").run();
     expect(forgetSync(database)?.cursorsCleared).toBe(1);
     expect(count(database, "sync_cursors")).toBe(0);
+    database.close();
+  });
+
+  test("a server id with no marker still counts, and is remembered as forgotten", () => {
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    database.query("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'srv-1')").run();
+    const summary = forgetSync(database);
+    expect(summary).not.toBeNull();
+    expect(summary?.metaKeysDeleted).toEqual(["server_id"]);
+    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
+    expect(metaValue(database, "forgotten_server_id")).toBe("srv-1");
+    database.close();
+  });
+
+  test("a second forget keeps the remembered server id", async () => {
+    const database = await syncedHost(new FakeRemote());
+    const serverId = metaValue(database, "server_id");
+    forgetSync(database);
+    expect(forgetSync(database)).toBeNull();
+    expect(metaValue(database, "forgotten_server_id")).toBe(serverId);
+    database.close();
+  });
+
+  test("an unpushed delete refuses, changing nothing; --force drops it", async () => {
+    const database = await syncedHost(new FakeRemote());
+    database.query("DELETE FROM gh_commits WHERE sha = 'c1'").run();
+    const keys = metaKeys(database);
+
+    const error = (() => {
+      try {
+        forgetSync(database);
+      } catch (thrown) {
+        return thrown;
+      }
+    })();
+    expect(error).toBeInstanceOf(UnpushedChangesError);
+    expect((error as Error).message).toStartWith("1 deletes / 0 changes never reached the server");
+    expect(triggerCount(database)).toBe(18);
+    expect(count(database, "sync_tombstones")).toBe(2);
+    expect(metaKeys(database)).toEqual(keys);
+
+    expect(forgetSync(database, undefined, true)).not.toBeNull();
+    expect(triggerCount(database)).toBe(0);
+    database.close();
+  });
+
+  test("an unpushed row change refuses, counting rows and events", async () => {
+    const database = await syncedHost(new FakeRemote());
+    addCommit(database, "c-new", "acme/web", "never pushed");
+    await intent(database, ["party", "add", "other", "Other"]);
+    const dirtyEvents = (
+      database.query("SELECT COUNT(*) AS n FROM events WHERE sync_dirty = 1").get() as { n: number }
+    ).n;
+    expect(dirtyEvents).toBeGreaterThan(0);
+
+    expect(() => forgetSync(database)).toThrow(
+      `0 deletes / ${dirtyEvents + 1} changes never reached the server`,
+    );
+    expect(triggerCount(database)).toBe(18);
+    expect(forgetSync(database, undefined, true)).not.toBeNull();
     database.close();
   });
 
@@ -242,24 +317,72 @@ describe("forgetSync", () => {
     reopened.close();
   });
 
-  test("re-enabling against the server it left changes nothing there: no duplicates", async () => {
+  test("re-enabling against the server it left is refused, and touches nothing there", async () => {
     const remote = new FakeRemote();
     const database = await syncedHost(remote);
-    await sync(database, remote); // push the tombstone too
-    const remoteRows = remote.database.query("SELECT COUNT(*) AS n FROM sync_rows").get();
-    const remoteEvents = remote.database.query("SELECT COUNT(*) AS n FROM sync_events").get();
-    const localRows = sourceSnapshot(database);
+    forgetSync(database);
+    database.close();
+    const remoteBefore = {
+      rows: remote.database
+        .query(
+          "SELECT tbl, pk, data, sync_host, sync_updated_at, seq FROM sync_rows ORDER BY tbl, pk",
+        )
+        .all(),
+      events: remote.database.query("SELECT uid, seq FROM sync_events ORDER BY uid").all(),
+      meta: remote.database.query("SELECT key, value FROM sync_meta ORDER BY key").all(),
+    };
+
+    const reopened = openDatabase(databasePath, { hostSlug: "host-a" });
+    const error = await sync(reopened, remote).catch((thrown) => thrown);
+    expect(error).toBeInstanceOf(ForgottenServerError);
+    expect(error.message).toContain("tempad sync --forget");
+    expect(error.message).toContain("fresh server");
+    expect({
+      rows: remote.database
+        .query(
+          "SELECT tbl, pk, data, sync_host, sync_updated_at, seq FROM sync_rows ORDER BY tbl, pk",
+        )
+        .all(),
+      events: remote.database.query("SELECT uid, seq FROM sync_events ORDER BY uid").all(),
+      meta: remote.database.query("SELECT key, value FROM sync_meta ORDER BY key").all(),
+    }).toEqual(remoteBefore);
+    // The refusal left this database as forget left it: nothing re-enabled,
+    // so a later forget is still a clean no-op.
+    expect(triggerCount(reopened)).toBe(0);
+    expect(isMirrorSyncEnabled(reopened)).toBe(false);
+    expect(forgetSync(reopened)).toBeNull();
+    reopened.close();
+  });
+
+  test("deleting the remembered id is the explicit way back to the old server", async () => {
+    const remote = new FakeRemote();
+    const database = await syncedHost(remote);
+    forgetSync(database);
+    database.query("DELETE FROM sync_meta WHERE key = 'forgotten_server_id'").run();
+    await expect(sync(database, remote)).resolves.toBeDefined();
+    database.close();
+  });
+
+  test("a fresh server ends up with the same content, which a new host then pulls back", async () => {
+    const database = await syncedHost(new FakeRemote());
     forgetSync(database);
     database.close();
 
     const reopened = openDatabase(databasePath, { hostSlug: "host-a" });
-    await sync(reopened, remote);
-    expect(remote.database.query("SELECT COUNT(*) AS n FROM sync_rows").get()).toEqual(remoteRows);
-    expect(remote.database.query("SELECT COUNT(*) AS n FROM sync_events").get()).toEqual(
-      remoteEvents,
-    );
-    expect(withoutStamps(sourceSnapshot(reopened))).toEqual(withoutStamps(localRows));
+    addCommit(reopened, "c-off", "acme/web", "written while sync was off");
+    const fresh = new FakeRemote();
+    await sync(reopened, fresh);
+    const rows = sourceSnapshot(reopened);
     reopened.close();
+
+    const other = openDatabase(join(directory, "other.db"), { hostSlug: "host-b" });
+    await runSyncEngine(other, fresh, { hostSlug: "host-b", batchSize: 500, ...both });
+    expect(withoutStamps(sourceSnapshot(other))).toEqual(withoutStamps(rows));
+    expect(
+      other.query("SELECT subject FROM gh_commits WHERE sha IN ('c-off', 'c1') ORDER BY sha").all(),
+    ).toEqual([{ subject: "written while sync was off" }, { subject: "first" }]);
+    expect(other.query("SELECT 1 FROM gh_commits WHERE sha = 'c-gone'").get()).toBeNull();
+    other.close();
   });
 
   test("pulled events not yet projected are projected before the markers go", async () => {
@@ -291,7 +414,7 @@ describe("forgetSync", () => {
 
     expect(rebuilds).toBe(1);
     expect(count(database, "parties")).toBe(1);
-    expect(metaKeys(database)).toEqual([]);
+    expect(metaKeys(database)).toEqual(["forgotten_server_id"]);
     database.close();
     other.close();
   });
@@ -437,6 +560,55 @@ describe("tempad sync --forget", () => {
       database.close();
     });
   }
+
+  test("unpushed changes: exit 1 naming the counts, nothing changed; --force forgets anyway", async () => {
+    await syncedHome();
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    database.query("DELETE FROM gh_commits WHERE sha = 'c1'").run();
+    addCommit(database, "c-new", "acme/web", "never pushed");
+    database.close();
+
+    const refused = await cli(["sync", "--forget"]);
+    expect(refused.code).toBe(1);
+    expect(refused.stdout).toBe("");
+    expect(refused.stderr).toContain(
+      "sync: forget failed: 1 deletes / 1 changes never reached the server",
+    );
+    expect(refused.stderr).toContain("--force");
+    const kept = openDatabase(databasePath, { hostSlug: "host-a" });
+    expect(triggerCount(kept)).toBe(18);
+    kept.close();
+
+    const forced = await cli(["sync", "--forget", "--force"]);
+    expect(forced.stderr).toBe("");
+    expect(forced.code).toBe(0);
+    expect(forced.stdout).toContain("sync: forgot triggers=18");
+  });
+
+  test("--force without --forget is a usage error", async () => {
+    const result = await cli(["sync", "--force"]);
+    expect(result.code).toBe(2);
+  });
+
+  test("a failure while forgetting exits 1 with 'sync: forget failed:'", async () => {
+    await syncedHome();
+    // Another connection holds the write lock; forget's IMMEDIATE transaction
+    // gives up after the busy timeout.
+    const blocker = openDatabase(databasePath, { hostSlug: "host-a" });
+    blocker.exec("BEGIN IMMEDIATE");
+    try {
+      const result = await cli(["sync", "--forget"]);
+      expect(result.code).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toMatch(/^sync: forget failed: .*locked/m);
+    } finally {
+      blocker.exec("ROLLBACK");
+      blocker.close();
+    }
+    const database = openDatabase(databasePath, { hostSlug: "host-a" });
+    expect(triggerCount(database)).toBe(18);
+    database.close();
+  }, 30_000);
 
   test("--help lists --forget", async () => {
     const result = await cli(["--help"]);
