@@ -725,6 +725,31 @@ describe("tempad review", () => {
       expect(review()).not.toContain("Q-s1");
     });
 
+    test("is hidden for a subagent whose own declaration was retracted while its parent declared", () => {
+      const { database, store, heroId, declareInSession, review } = seedExpired();
+      declareQuest(store, database, {
+        sessionId: "parent",
+        newQuest: { title: "Parent quest", outcome: "o", commitment: "personal" },
+        plan: [],
+        scope: "session",
+        declaredBy: "hero",
+        at: "2026-09-07T08:00:00.000Z",
+        heroId,
+      });
+      const { questId } = declareInSession({ scope: "subagent", parentSessionId: "parent" });
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hero",
+          kind: "retracted",
+          subject: questId,
+          payload: { retracts: "x", reason: "mistake" },
+        }),
+      );
+
+      expect(review()).not.toContain("Q-s1");
+    });
+
     test("is still listed when the only declaration was for a retracted quest", () => {
       const { database, store, declareInSession, review } = seedExpired();
       const { questId } = declareInSession();

@@ -881,6 +881,77 @@ describe("advanceQuestions and a session that has declared since the question wa
     expect(stateOf()).toBe("resolved_by_context");
   });
 
+  describe("a subagent whose own quest ended while its parent still has one", () => {
+    // The window falls back to the parent's active quests when the subagent has
+    // none of its own, so it asks no `declare` question; the stored one must go.
+    function seedSubagentWithParentQuest() {
+      const context = seed();
+      const { database, store, heroId } = context;
+      declareQuest(store, database, {
+        sessionId: "parent",
+        newQuest: { title: "Parent quest", outcome: "o", commitment: "personal" },
+        plan: [],
+        scope: "session",
+        declaredBy: "hero",
+        at: "2026-09-04T15:20:00.000Z",
+        heroId,
+      });
+      const own = declareQuest(store, database, {
+        sessionId: "s1",
+        parentSessionId: "parent",
+        newQuest: { title: "Sub errand", outcome: "o", commitment: "personal" },
+        plan: [],
+        scope: "subagent",
+        declaredBy: "agent",
+        at: "2026-09-04T15:25:00.000Z",
+        heroId,
+      });
+      return { ...context, ownQuestId: own.questId };
+    }
+
+    test("own quest ended with --done: the parent's active quest still resolves it", () => {
+      const { database, store, heroId, ownQuestId, questionId, stateOf } =
+        seedSubagentWithParentQuest();
+      declareQuest(store, database, {
+        sessionId: "s1",
+        parentSessionId: "parent",
+        questId: ownQuestId,
+        plan: [],
+        scope: "subagent",
+        declaredBy: "agent",
+        at: "2026-09-04T15:30:00.000Z",
+        heroId,
+        done: true,
+      });
+
+      const result = advance(database, store, "2026-09-04T15:40:00.000Z", 3);
+
+      expect(result.asked).toHaveLength(0);
+      expect(result.resolved.map((question) => question.id)).toEqual([questionId]);
+      expect(stateOf()).toBe("resolved_by_context");
+    });
+
+    test("own quest retracted: the parent's active quest still resolves it", () => {
+      const { database, store, ownQuestId, questionId, stateOf } = seedSubagentWithParentQuest();
+      applyIncremental(
+        database,
+        store.append({
+          actor: "hero",
+          kind: "retracted",
+          subject: ownQuestId,
+          at: "2026-09-04T15:30:00.000Z",
+          payload: { retracts: "x", reason: "mistake" },
+        }),
+      );
+
+      const result = advance(database, store, "2026-09-04T15:40:00.000Z", 3);
+
+      expect(result.asked).toHaveLength(0);
+      expect(result.resolved.map((question) => question.id)).toEqual([questionId]);
+      expect(stateOf()).toBe("resolved_by_context");
+    });
+  });
+
   test("a declaration in another session does not resolve the question", () => {
     const { database, store, heroId, questionId, stateOf } = seed();
     declareQuest(store, database, {
