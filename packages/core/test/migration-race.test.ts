@@ -46,6 +46,72 @@ function preNineteenDatabase(path: string): void {
   database.close();
 }
 
+async function openConcurrently(script: string, path: string, processes: number): Promise<void> {
+  const goAt = Date.now() + 1500;
+  const children = Array.from({ length: processes }, (_, index) =>
+    Bun.spawn([process.execPath, script, DATABASE_MODULE, path, String(goAt), `host-${index}`], {
+      stdout: "pipe",
+      stderr: "pipe",
+    }),
+  );
+  for (const child of children) {
+    const [out, err] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    await child.exited;
+    expect(err.trim()).toBe("");
+    expect(JSON.parse(out.trim())).toMatchObject({ ok: true });
+  }
+}
+
+/** `VACUUM INTO`, not a file copy: the source is in WAL mode and may hold rows in its sidecar. */
+function copyDatabase(from: string, to: string): void {
+  const source = new Database(from, { readonly: true });
+  source.run("VACUUM INTO ?", [to]);
+  source.close();
+}
+
+function uidsById(path: string): Map<number, string | null> {
+  const database = new Database(path, { readonly: true });
+  const rows = database.query("SELECT id, uid FROM events ORDER BY id").all() as {
+    id: number;
+    uid: string | null;
+  }[];
+  database.close();
+  return new Map(rows.map((row) => [row.id, row.uid]));
+}
+
+describe("concurrent uid backfill", () => {
+  test("racing processes end with the uids a single process assigns to an identical copy", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-uid-race-"));
+    const script = join(directory, "child.ts");
+    writeFileSync(script, CHILD);
+    try {
+      for (let round = 0; round < ROUNDS; round += 1) {
+        const racing = join(directory, `racing-${round}.db`);
+        const reference = join(directory, `reference-${round}.db`);
+        preNineteenDatabase(racing);
+        copyDatabase(racing, reference);
+
+        openDatabase(reference, { hostSlug: "reference" }).close();
+        await openConcurrently(script, racing, PROCESSES);
+
+        const expected = uidsById(reference);
+        const actual = uidsById(racing);
+        expect(expected.size).toBe(LEGACY_EVENTS);
+        expect(actual.size).toBe(LEGACY_EVENTS);
+        expect(new Set(expected.values()).size).toBe(LEGACY_EVENTS);
+        expect(expected.has(1) && expected.get(1) !== null).toBe(true);
+        // Same uid per event id: no stale, reassigned or missing uid.
+        expect([...actual]).toEqual([...expected]);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
 describe("two processes opening a database that needs upgrading", () => {
   test("every process succeeds and the schema is migrated exactly once", async () => {
     const directory = mkdtempSync(join(tmpdir(), "tempad-migration-race-"));
