@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-prompt.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

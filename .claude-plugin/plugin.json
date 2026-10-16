@@ -1,0 +1,14 @@
+{
+  "name": "tempad",
+  "version": "0.1.0",
+  "description": "Reconstructs work history hour by hour from git, Monday.com and Claude Code sessions. Adds the tempad-quest skill and hooks that keep each session's quest declared.",
+  "author": {
+    "name": "Saulo Vallory",
+    "email": "me@saulo.engineer"
+  },
+  "homepage": "https://github.com/hyperlab-sh/tempad",
+  "repository": "https://github.com/hyperlab-sh/tempad",
+  "license": "MIT",
+  "keywords": ["timesheet", "time-tracking", "git", "monday", "claude-code", "sessions"],
+  "skills": "./packages/core/skills/"
+}
