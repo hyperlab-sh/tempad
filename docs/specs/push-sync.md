@@ -6,7 +6,7 @@ Status: design, 2026-10-16. Beads epic `tempad-25a`.
 
 ## Goals and non-goals
 
-- Opt-in. No `[sync]` section in `tempad.toml` (or `enabled = false`) means zero network and `@libsql/client` is never loaded.
+- Opt-in. With sync off, behaviour is byte-identical to today for a single-host user: same projections, same reports, no network module loaded. No `[sync]` section in `tempad.toml` (or `enabled = false`) means zero network and `@libsql/client` is never loaded.
 - Payload is every source table: the event log and every collector mirror. Projections are never shipped; each host rebuilds them from events.
 - Idempotent: a second `tempad sync` with nothing new changes nothing locally or remotely. Two hosts that have both synced since the last change hold identical source tables (local integer `events.id` aside).
 - Not in scope: real-time sync or daemons, Turso cloud, replacing `bun:sqlite`, remote reads from reports.
@@ -46,24 +46,26 @@ Safe on existing databases: only `ADD COLUMN`, new tables, new triggers, and a t
 
 **Events.**
 
-- `ALTER TABLE events ADD COLUMN uid TEXT` and `ADD COLUMN sync_host TEXT`; `CREATE UNIQUE INDEX events_uid ON events(uid)` (SQLite allows many NULLs under a unique index).
-- Replace `events_no_update` so the only permitted update fills a NULL `uid` and/or a NULL `sync_host` while every other column is unchanged. Content stays append-only; deletes stay forbidden.
-- `EventStore.append` sets `uid = newUlid()`. Legacy rows get a uid once, right after migrations in `openDatabase`: in `id` order, a ULID seeded with the row's `recorded_at` from a monotonic factory, so legacy uids sort like their ids.
-- `sync_host` NULL means "appended here, not yet pushed". Pulled events carry their origin host.
+- `ALTER TABLE events ADD COLUMN uid TEXT`, `ADD COLUMN sync_host TEXT`, `ADD COLUMN sync_dirty INTEGER NOT NULL DEFAULT 1`; `CREATE UNIQUE INDEX events_uid ON events(uid)` (SQLite allows many NULLs under a unique index).
+- Replace `events_no_update` so the only permitted update fills a NULL `uid`, fills a NULL `sync_host`, and/or clears `sync_dirty` from 1 to 0, with every other column unchanged. Content stays append-only; deletes stay forbidden.
+- `sync_host` is the origin host, set at append time from the local host (see "Local host" below); pulled events carry their origin host. `sync_dirty` is the push state, kept separate from the host tag: 1 = not yet pushed, 0 = pushed or pulled.
+- `EventStore.append` sets `uid` from a monotonic ULID factory, and guarantees the new uid is greater than every uid already in `events` (if the factory's value is not, it uses the successor of the current maximum), inside the same transaction as the insert. So on one host uid order is exactly insertion (`id`) order, across processes too.
+- Legacy rows get a uid once, right after migrations in `openDatabase`: rows in `id` order, a monotonic factory seeded with each row's `recorded_at` epoch ms. The monotonic factory never goes backwards (an earlier seed reuses the last time and increments), so legacy uid order is exactly `id` order even where `recorded_at` is not monotonic in `id`.
 
 **Mirrors** (`gh_repos`, `gh_commits`, `gh_pull_requests`, `monday_items`, `claude_sessions`, `claude_messages`):
 
-- `ADD COLUMN sync_host TEXT` and `ADD COLUMN sync_updated_at TEXT`. Existing rows get `sync_updated_at` = migration time and `sync_host` NULL, so the first push uploads them.
-- `sync_host` is the host tag of the row's last writer; NULL means "changed here, not yet pushed" (a dirty flag). `claude_sessions.host_slug` keeps its meaning (where the session ran) and is untouched.
+- `ADD COLUMN sync_host TEXT`, `ADD COLUMN sync_updated_at TEXT`, `ADD COLUMN sync_dirty INTEGER NOT NULL DEFAULT 1`. Existing rows get `sync_updated_at` = migration time, `sync_host` NULL (filled with the local host at their first push), `sync_dirty` 1, so the first push uploads them.
+- `sync_host` is the host tag of the row's last writer. `sync_dirty` is the push state, separate from the tag. `claude_sessions.host_slug` keeps its meaning (where the session ran) and is untouched.
 - Triggers per table, generated from its column list:
-  - `AFTER INSERT ... WHEN NEW.sync_updated_at IS NULL`: stamp `sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')` (millisecond UTC).
-  - `AFTER UPDATE ... WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (<any content column> IS NOT OLD.<col>)`: restamp and set `sync_host = NULL`. A pull writes an explicit `sync_updated_at`, so it never triggers a restamp; marking a row pushed changes only `sync_host`, which is not content, so it does not either. The collectors' `IS NOT` guards mean an unchanged re-collection never fires the trigger at all.
-  - `AFTER DELETE`: insert `(table, key JSON, deleted_at = now)` into `sync_tombstones`, `sync_host` NULL.
+  - `AFTER INSERT ... WHEN NEW.sync_updated_at IS NULL`: stamp `sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')` (millisecond UTC), `sync_host` = local host, `sync_dirty = 1`.
+  - `AFTER UPDATE ... WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (<any content column> IS NOT OLD.<col>)`: restamp, `sync_host` = local host, `sync_dirty = 1`. A pull writes an explicit `sync_updated_at`, so it never fires this; marking a row pushed changes only `sync_dirty` (and fills a NULL `sync_host`), which are not content, so that does not either. The collectors' `IS NOT` guards mean an unchanged re-collection never fires it at all.
+  - `AFTER DELETE`: upsert `(table, key JSON, deleted_at = now, sync_host = local host, sync_dirty = 1)` into `sync_tombstones`.
 
 **Sync bookkeeping:**
 
 - `sync_cursors(stream TEXT PRIMARY KEY, seq INTEGER NOT NULL)`: last remote sequence pulled, streams `rows` and `events`.
-- `sync_tombstones(tbl TEXT, pk TEXT, deleted_at TEXT, sync_host TEXT, PRIMARY KEY (tbl, pk))`.
+- `sync_tombstones(tbl TEXT, pk TEXT, deleted_at TEXT, sync_host TEXT, sync_dirty INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (tbl, pk))`.
+- `sync_local(id INTEGER PRIMARY KEY CHECK (id = 1), host_slug TEXT NOT NULL)`: the local host. **Local host**: `openDatabase(path, { hostSlug })` upserts it when given (every CLI entry point passes `config.hostSlug`); triggers and `EventStore.append` read it with a subquery. A database opened without a host slug (tests, `:memory:`) writes `sync_host` NULL, which push fills with its own slug before sending.
 
 ## Remote schema
 
@@ -89,23 +91,23 @@ Last writer wins on `(sync_updated_at, sync_host)`, compared as a row value: the
 Applied in two places with the same comparison:
 
 - Server, on push: `INSERT INTO sync_rows ... ON CONFLICT (tbl, pk) DO UPDATE SET ... WHERE (excluded.sync_updated_at, excluded.sync_host) > (sync_rows.sync_updated_at, sync_rows.sync_host)`. A losing or equal push changes nothing, including `seq`.
-- Local, on pull: the same `ON CONFLICT ... WHERE`, with a local dirty row (`sync_host` NULL) compared as `(sync_updated_at, <own HOST_SLUG>)`.
+- Local, on pull: the same `ON CONFLICT ... WHERE`, with a NULL local `sync_host` compared as the own `HOST_SLUG`. A pulled row is written with its remote stamp and host and `sync_dirty = 0`.
 
 Locally a tombstone competes too: a pulled row loses to a local tombstone with a newer `(deleted_at, host)`, and a pulled tombstone deletes the local row only when it wins. The delete trigger then writes a local tombstone; the pull rewrites it in the same transaction with the remote `deleted_at` and host, so it is not pushed back.
 
 Events never conflict: they are immutable and keyed by `uid`.
 
-Known trade-off: the stamp is the writer's wall clock. Machines are expected to run NTP; a host with a skewed clock wins or loses ties it should not. Acceptable for mirrors of upstream data that every host re-collects anyway.
+Known limit: both this rule and cross-host event order depend on wall clocks (the `sync_updated_at` stamp and the time half of each ULID). Machines are expected to run NTP; a host with a skewed clock wins or loses conflicts it should not, and its events sort early or late against other hosts' events. That is the accepted limit of eventual consistency here: convergence still holds (every host computes the same answer), only "which write is newest" can be wrong by the skew.
 
 ## Cursors
 
-- **Push needs no cursor.** The dirty flag is the cursor: push sends events and rows whose `sync_host IS NULL`, plus tombstones whose `sync_host IS NULL`. After a batch commits remotely, it is marked locally with `UPDATE ... SET sync_host = <own> WHERE <key> = ? AND sync_host IS NULL AND sync_updated_at = <pushed stamp>`, so a row a collector changed between read and mark stays dirty for the next run.
+- **Push needs no cursor.** `sync_dirty` is the outbox: push sends events, rows and tombstones with `sync_dirty = 1`, filling a NULL `sync_host` with the own slug first. After a batch commits remotely, it is marked locally with `UPDATE ... SET sync_dirty = 0 WHERE <key> = ? AND sync_dirty = 1 AND sync_updated_at = <pushed stamp>`, so a row a collector changed between read and mark stays dirty for the next run.
 - **Pull uses a server sequence.** Every push batch runs in one remote write transaction that first does `UPDATE sync_clock SET seq = seq + 1 RETURNING seq` and writes that value into every row it changes. sqld serializes write transactions, so a committed `seq` is never overtaken by a lower one. Pull reads `WHERE seq > :cursor AND sync_host != :own ORDER BY seq` in pages and advances `sync_cursors` only after the page is applied locally.
-- **Server identity.** The remote `sync_meta.server_id` is created once, on first contact with an empty server. The host stores the id it last synced with locally (`sync_cursors` gains no row for it; a local `sync_meta(key, value)` table holds `server_id`, added by the sync module's own migration). When the remote id differs from the stored one (server rebuilt from scratch, restored from an older backup, or URL pointed elsewhere), the run treats the server as unknown: it pushes every row, event and tombstone whose `sync_host` is NULL or its own slug, and resets both pull cursors to 0. That re-seeds a lost server from each host's copy without any manual step; pulling from 0 is safe because the local apply uses the same conflict rule.
+- **Server identity.** The remote `sync_meta.server_id` is created once, on first contact with an empty server. The host stores the id it last synced with locally (`sync_cursors` gains no row for it; a local `sync_meta(key, value)` table holds `server_id`, added by the sync module's own migration). When the remote id differs from the stored one (server rebuilt from scratch, restored from an older backup, or URL pointed elsewhere), the run treats the server as unknown: it pushes every row, event and tombstone whose `sync_host` is its own slug (or NULL), dirty or not, and resets both pull cursors to 0. That re-seeds a lost server from each host's copy without any manual step; pulling from 0 is safe because the local apply uses the same conflict rule.
 
 ## Event order across hosts
 
-Replay order changes from `ORDER BY id` to `ORDER BY recorded_at, uid` in `EventStore.read`, `stateAsOf` (which also copies `uid`), `w5 dedupe` (keep the earliest by that order, not the lowest id), and the declaration tiebreaks (`at DESC, recorded_at DESC, uid DESC`). On a single host this is the same order as today except for same-millisecond ties across processes. Across hosts it is a total order that every host computes identically, which is what makes rebuilt projections converge. `projection_state.last_event_id` and `impacts.event_id` keep storing the local id; nothing reads them.
+Replay order changes from `ORDER BY id` to `ORDER BY uid` in `EventStore.read`, `stateAsOf` (which also copies `uid`, `sync_host`, `sync_dirty`), `w5 dedupe` (keep the earliest uid, not the lowest id), and the declaration tiebreaks (`at DESC, uid DESC` where they say `at DESC, id DESC`, same for ASC). On a single host uid order is exactly `id` order, for legacy rows and new ones (see "Events" above), so with sync off every projection is byte-identical to today; a test rebuilds a fixture database with same-millisecond and out-of-order `recorded_at` events before and after the migration and compares every projection table. Across hosts uid order is a total order every host computes identically, which is what makes rebuilt projections converge. `projection_state.last_event_id` and `impacts.event_id` keep storing the local id; nothing reads them.
 
 ## Flow
 
