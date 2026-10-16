@@ -4,6 +4,7 @@ import type { HomeConfig } from "../config/env";
 import { openDatabase } from "../db/database";
 import { defaultIntentConfig } from "../intent/config";
 import { declareQuest } from "../intent/declarations";
+import { currentHeroId } from "../intent/identity";
 import { newUlid } from "../intent/ids";
 import { applyIncremental } from "../intent/projections";
 import { registerAllProjections } from "../intent/projections/register";
@@ -140,7 +141,8 @@ async function applyDeclareFile(
 
   const store = new EventStore(database);
 
-  let hero = database.query("SELECT id FROM heroes LIMIT 1").get() as { id: string } | null;
+  const existingHero = currentHeroId(database);
+  let hero = existingHero ? { id: existingHero } : null;
   if (!hero) {
     const heroId = newUlid();
     applyIncremental(

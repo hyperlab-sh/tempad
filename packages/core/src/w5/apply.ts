@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { askQuestion, assignStint, recordTrace } from "../intent/api";
 import type { Actor } from "../intent/events";
+import { currentHeroId } from "../intent/identity";
 import { newUlid } from "../intent/ids";
 import { applyIncremental } from "../intent/projections";
 import type { EventStore } from "../intent/store";
@@ -48,9 +49,9 @@ export interface ApplyOptions {
 }
 
 function requireHeroId(database: Database): string {
-  const row = database.query("SELECT id FROM heroes LIMIT 1").get() as { id: string } | null;
-  if (!row) throw new Error("run `tempad hero init` first");
-  return row.id;
+  const id = currentHeroId(database);
+  if (!id) throw new Error("run `tempad hero init` first");
+  return id;
 }
 
 function classifyTrigger(trigger: string | null): string {

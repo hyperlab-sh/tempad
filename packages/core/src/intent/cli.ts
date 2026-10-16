@@ -12,6 +12,7 @@ import {
 } from "./declarations";
 import { assertEditIntent } from "./edit-intent";
 import { EVIDENCE_REF_SHAPES, formatEvidenceRef, parseEvidenceRef } from "./evidence-ref";
+import { currentHeroId } from "./identity";
 import { newUlid } from "./ids";
 import { applyIncremental, ensureTables, rebuildAll } from "./projections";
 import { resolveQuest } from "./projections/quest";
@@ -29,9 +30,9 @@ export interface IntentContext {
 }
 
 function requireHero(database: Database): string {
-  const row = database.query("SELECT id FROM heroes LIMIT 1").get() as { id: string } | null;
-  if (!row) throw new Error("run `tempad hero init` first");
-  return row.id;
+  const id = currentHeroId(database);
+  if (!id) throw new Error("run `tempad hero init` first");
+  return id;
 }
 
 function findPartyBySlug(database: Database, slug: string): { id: string } | null {
@@ -59,7 +60,7 @@ function runHeroCommand(args: string[], context: IntentContext): number {
       console.error('usage: tempad hero init "<name>"');
       return 2;
     }
-    const existing = context.database.query("SELECT id FROM heroes LIMIT 1").get();
+    const existing = currentHeroId(context.database);
     if (existing) {
       console.error("hero already exists");
       return 1;
@@ -821,9 +822,8 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         console.error(`unknown quest ${values.done}`);
         return 1;
       }
-      const heroForDone = context.database.query("SELECT id FROM heroes LIMIT 1").get() as {
-        id: string;
-      } | null;
+      const heroForDoneId = currentHeroId(context.database);
+      const heroForDone = heroForDoneId ? { id: heroForDoneId } : null;
       if (!heroForDone) {
         console.error("run `tempad hero init` first");
         return 1;
@@ -895,9 +895,8 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error(usage);
       return 2;
     }
-    const heroRow = context.database.query("SELECT id FROM heroes LIMIT 1").get() as {
-      id: string;
-    } | null;
+    const heroRowId = currentHeroId(context.database);
+    const heroRow = heroRowId ? { id: heroRowId } : null;
     if (!heroRow) {
       console.error("run `tempad hero init` first");
       return 1;
