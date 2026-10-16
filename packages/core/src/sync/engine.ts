@@ -63,6 +63,8 @@ export interface SyncRunSummary {
 }
 
 export class SchemaGateError extends Error {}
+/** The remote is the server this database forgot (`tempad sync --forget`). */
+export class ForgottenServerError extends Error {}
 
 /** The remote schema: generic, never a copy of local DDL. */
 export const REMOTE_SCHEMA: readonly string[] = [
@@ -115,6 +117,38 @@ const PULL_OWN_PENDING = "pull_own_pending";
 /** The last event / mirror row or tombstone this host saw land on the server. */
 const PUSH_PROBE_EVENT = "push_probe_event";
 const PUSH_PROBE_ROW = "push_probe_row";
+/** The server identity this database last synced with (stored after a completed re-seed). */
+const SERVER_ID = "server_id";
+/**
+ * Prefix of the keys that remember every server `tempad sync --forget` left:
+ * one `forgotten_server_id:<id>` row per id, written by a forget and deleted
+ * only by `tempad sync --rejoin <id>`. A run against a server whose id is in
+ * that set throws `ForgottenServerError`: after a forget the database no longer
+ * knows what the server has, so rejoining would restamp every row as new and
+ * overwrite edits and deletes other hosts made since. Deliberately not in
+ * `REMOTE_BOUND_META_KEYS`: the set must outlive the forget that wrote it, and
+ * it only grows (forget A, use B, forget B: A is still refused).
+ */
+export const FORGOTTEN_SERVER_PREFIX = "forgotten_server_id:";
+
+export function forgottenServerKey(serverId: string): string {
+  return FORGOTTEN_SERVER_PREFIX + serverId;
+}
+
+/**
+ * Every local `sync_meta` key that ties this database to one particular remote
+ * (`tempad sync --forget` deletes them). `rebuild_pending` is not here: it says
+ * the local projections lack pulled events, which stays true whatever happens to
+ * the remote. `mirror_sync_enabled` belongs to `src/sync/triggers.ts`;
+ * the `FORGOTTEN_SERVER_PREFIX` keys are what a forget writes instead of deleting.
+ */
+export const REMOTE_BOUND_META_KEYS: readonly string[] = [
+  SERVER_ID,
+  RESEED_PENDING,
+  PULL_OWN_PENDING,
+  PUSH_PROBE_EVENT,
+  PUSH_PROBE_ROW,
+];
 
 const META_UPSERT =
   "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
@@ -129,7 +163,7 @@ function localMeta(database: Database, key: string): string | null {
   );
 }
 
-function defaultRebuild(database: Database, options: RebuildOptions): void {
+export function defaultRebuild(database: Database, options: RebuildOptions): void {
   registerAllProjections();
   rebuildAll(database, options);
 }
@@ -152,7 +186,7 @@ export function clearRebuildMarker(database: Database, token: string): void {
  * is cleared in `beforeCommit`, inside the rebuild's own transaction: a
  * rebuild that rolls back leaves it set, one that commits takes it along.
  */
-function rebuildIfPending(
+export function rebuildIfPending(
   database: Database,
   rebuild: NonNullable<SyncRunOptions["rebuildProjections"]>,
 ): boolean {
@@ -357,8 +391,14 @@ export async function runSyncEngine(
   const warn = options.warn ?? ((message: string) => console.error(message));
   // First, before any network call: sync is in use from here on, so the
   // mirror triggers go in (once) and rows written without them are stamped
-  // and dirtied, ready for the push below.
-  enableMirrorSync(database);
+  // and dirtied, ready for the push below. Except after a `--forget`: the
+  // server may turn out to be the one that was left (refused below), and
+  // restamping every row dirty would then make the next `--forget` refuse.
+  const forgotten =
+    database
+      .query("SELECT 1 FROM sync_meta WHERE substr(key, 1, ?) = ? LIMIT 1")
+      .get(FORGOTTEN_SERVER_PREFIX.length, FORGOTTEN_SERVER_PREFIX) !== null;
+  if (!forgotten) enableMirrorSync(database);
   // Before any network call: a previous run's pulled events must be
   // projected even when this run is push-only or cannot reach the server.
   // A failure here must not block push and pull (new local work would never
@@ -400,6 +440,16 @@ export async function runSyncEngine(
       `remote holds data from tempad schema ${remoteVersion}; upgrade tempad on this host (schema ${localVersion})`,
     );
   }
+  const remoteId = meta.get("server_id") ?? "";
+  if (forgotten && localMeta(database, forgottenServerKey(remoteId)) !== null) {
+    throw new ForgottenServerError(
+      "this database ran `tempad sync --forget` against this server and no longer knows what it holds; " +
+        "point [sync] at a fresh server, or start from an empty tempad.db and pull. " +
+        "To rejoin anyway (it overwrites newer edits and brings back deletes made by other hosts), " +
+        `run: tempad sync --rejoin ${remoteId}`,
+    );
+  }
+  enableMirrorSync(database);
   if (remoteVersion < localVersion) {
     // Raise it now, not only with the first push batch: a pull-only run or
     // one with nothing dirty must still stop older hosts at the gate.
@@ -410,7 +460,7 @@ export async function runSyncEngine(
     (await remote.query("SELECT seq FROM sync_clock WHERE id = 1"))[0]?.seq ?? 0,
   );
 
-  const storedId = localMeta(database, "server_id");
+  const storedId = localMeta(database, SERVER_ID);
   const maxCursor = (
     database.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_cursors").get() as { seq: number }
   ).seq;
@@ -486,7 +536,7 @@ export async function runSyncEngine(
       // cursors were reset when the marker was set, so the pull below
       // still starts from 0.
       database.transaction(() => {
-        database.query(META_UPSERT).run("server_id", serverId);
+        database.query(META_UPSERT).run(SERVER_ID, serverId);
         database
           .query("DELETE FROM sync_meta WHERE key = ? AND value = ?")
           .run(RESEED_PENDING, serverId);

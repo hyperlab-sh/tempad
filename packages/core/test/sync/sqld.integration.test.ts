@@ -557,7 +557,9 @@ describe.skipIf(skipReason !== null)("push sync against sqld", () => {
     const bad = await run(["sync", "--push"], badToken);
     expect(bad.code).toBe(1);
     expect(bad.stdout).not.toContain("sync: pushed");
-    expect(bad.stderr.trim()).toBe("SERVER_ERROR: Server returned HTTP status 401");
+    expect(bad.stderr.trim()).toBe(
+      "sync: push failed: SERVER_ERROR: Server returned HTTP status 401",
+    );
     expect(bad.stderr).not.toContain(badToken);
     expect(bad.stderr).not.toContain(badToken.split(".")[2] as string);
     expect(bad.stderr.toLowerCase()).not.toContain("authorization");

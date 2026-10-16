@@ -6,9 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `tempad sync --forget` is the off switch for a host that leaves sync for good. After you remove `[sync]` from `tempad.toml`, it drops the 18 sync triggers, every tombstone, the pull cursors and the server identity in one transaction, and the database stops tracking changes for a server you no longer use. It refuses with exit 1 while `[sync]` is still enabled, and while deletes or changes have not reached the server (`N deletes / M changes never reached the server`) unless you pass `--force`. It prints `sync: forgot triggers=<n> tombstones=<n> cursors=<n> meta=<n>` (or `sync: nothing to forget`), needs no token, never touches the network, and leaves your data and the `sync_*` columns alone. The database remembers the id of every server it left (a growing set) and refuses to sync with any of them again (`ForgottenServerError`): rejoining would restamp every row as new and overwrite edits other hosts made since, and bring back rows they deleted. Point `[sync]` at a fresh server instead, start from an empty `tempad.db` and pull, or run `tempad sync --rejoin <server-id>` to accept the overwrites for one server. A second `--forget` is not blocked by rows written after the first.
+
 ### Fixed
 
 - Commit dates with a UTC offset of +-15:00 or more (never emitted by git, only by imported history) were left in offset form by migration 0021, because SQLite's `strftime` returns NULL for them, while a host that pulled the same row stored UTC. Migration 0023 now rewrites them to the same UTC text, once, atomically with the version bump, without restamping or re-dirtying the row, so every host holds one text per instant and later opens pay nothing.
+- `tempad sync` reports a failed push or pull the same way every time: the exit code is 1 and stderr gets one `sync: push failed: <reason>` line (`sync: pull failed: <reason>` for `--pull` alone). It covers a missing `@libsql/client` package, an unreachable server, a rejected token and any server error. The collectors' results are kept, and the token is scrubbed from the reason.
 
 ## [0.2.0] - 2026-10-16
 
