@@ -1,9 +1,10 @@
 #!/usr/bin/env -S bun --no-env-file
 import type { Database } from "bun:sqlite";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
+import packageJson from "../package.json" with { type: "json" };
 import { reresolveSessions as reresolveClaudeSessions } from "./collect/claude.ts";
 import { collectors } from "./collect/index.ts";
 import type { Collector, SyncSummary } from "./collect/types.ts";
@@ -21,12 +22,12 @@ import { deriveOrgProject, registerProject } from "./config/project-register.ts"
 import { loadRules, normalizePathForMatch } from "./config/rules.ts";
 import { openDatabase } from "./db/database.ts";
 import { setSyncState } from "./db/sync-state.ts";
-import { runInit } from "./init/index.ts";
 import { runIntentCommand } from "./intent/cli.ts";
 import { loadIntentConfig } from "./intent/config.ts";
 import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
+import { runSetup } from "./setup/index.ts";
 import {
   planW5Command,
   runQuietCommand,
@@ -52,8 +53,8 @@ const INTENT_COMMANDS = new Set([
 
 const USAGE_LINES: string[] = [
   "Usage:",
-  "  tempad --help | -h | help",
-  "  tempad init [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
+  "  tempad --help | -h | help | --version",
+  "  tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
   "  tempad sync [monday|github|claude] [--full]",
   "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
   '  tempad hero init "<name>"',
@@ -255,13 +256,19 @@ async function runReportCommand(args: string[]): Promise<number> {
   return 0;
 }
 
-const SKILL_SOURCE_PATH = join(import.meta.dir, "..", "skills", "tempad-quest", "SKILL.md");
+const SKILL_SOURCE_PATH = join(import.meta.dir, "..", "skills", "quest", "SKILL.md");
+
+/**
+ * Outside the plugin there is no `tempad:` namespace, so the legacy copy keeps the
+ * descriptive directory and name `tempad-quest`; a bare `quest` is too generic there.
+ */
+const LEGACY_SKILL_NAME = "tempad-quest";
 
 function skillDestinationFor(scope: string): string {
   if (scope === "project")
-    return join(process.cwd(), ".claude", "skills", "tempad-quest", "SKILL.md");
+    return join(process.cwd(), ".claude", "skills", LEGACY_SKILL_NAME, "SKILL.md");
   try {
-    return join(userClaudeDirectory(), "skills", "tempad-quest", "SKILL.md");
+    return join(userClaudeDirectory(), "skills", LEGACY_SKILL_NAME, "SKILL.md");
   } catch {
     throw new Error(
       "HOME is not set; required for `tempad skill install --scope user` (or set CLAUDE_CONFIG_DIR)",
@@ -283,8 +290,9 @@ export function runSkillCommand(args: string[]): number {
   const scope = values.scope === "project" ? "project" : "user";
   const destination = skillDestinationFor(scope);
   mkdirSync(dirname(destination), { recursive: true });
-  copyFileSync(SKILL_SOURCE_PATH, destination);
-  console.log(`installed tempad-quest skill to ${destination}`);
+  const source = readFileSync(SKILL_SOURCE_PATH, "utf8");
+  writeFileSync(destination, source.replace(/^name: quest$/m, `name: ${LEGACY_SKILL_NAME}`));
+  console.log(`installed ${LEGACY_SKILL_NAME} skill to ${destination}`);
   return 0;
 }
 
@@ -415,7 +423,7 @@ async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[])
 
   const { config, database } = prepareCommand(plan.label, plan.needs);
   // Projection tables are created lazily; the w5 commands read them, and a home that
-  // `tempad init` just set up has none yet. Intent commands do the same in runIntentCommand.
+  // `tempad setup` just set up has none yet. Intent commands do the same in runIntentCommand.
   ensureTables(database);
   const intentConfig = loadIntentConfig(join(config.home, "tempad.toml"));
   const context: W5Context = {
@@ -432,6 +440,7 @@ async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[])
 }
 
 const OTHER_COMMANDS = new Set([
+  "setup",
   "init",
   "sync",
   "report",
@@ -448,6 +457,10 @@ function isKnownCommand(command: string | undefined): boolean {
 }
 
 async function dispatch(command: string | undefined, rest: string[]): Promise<number> {
+  if (command === "--version" || command === "-v") {
+    console.log(packageJson.version);
+    return 0;
+  }
   if (command === "--help" || command === "-h" || command === "help") {
     printHelp();
     return 0;
@@ -457,9 +470,10 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     return 0;
   }
 
-  // `init` needs no configuration and opens no database: it creates them.
-  if (command === "init") {
-    return runInit(rest);
+  // `setup` needs no configuration and opens no database: it creates them.
+  // `init` is its old name, still accepted but left out of --help.
+  if (command === "setup" || command === "init") {
+    return runSetup(rest);
   }
 
   if (command === "sync") {

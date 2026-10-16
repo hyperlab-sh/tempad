@@ -199,7 +199,7 @@ describe("loadConfig", () => {
     writeEnvFile("");
     const error = configErrorFor("tempad sync monday", ["mondayApiToken", "mondayUser"]);
     expect(error.message).toBe(
-      `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(tempHome, ".env")} or run: bunx @hyperlab.sh/tempad init`,
+      `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(tempHome, ".env")} or run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal`,
     );
     expect(error.command).toBe("tempad sync monday");
     expect(error.variables).toEqual(["MONDAY_API_TOKEN", "MONDAY_USER"]);
@@ -210,7 +210,7 @@ describe("loadConfig", () => {
     writeEnvFile("");
     const error = configErrorFor("tempad report daily", ["tz"]);
     expect(error.message).toBe(
-      `tempad report daily needs TZ; set it in ${join(tempHome, ".env")} or run: bunx @hyperlab.sh/tempad init`,
+      `tempad report daily needs TZ; set it in ${join(tempHome, ".env")} or run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal`,
     );
   });
 

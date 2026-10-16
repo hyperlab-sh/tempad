@@ -7,7 +7,7 @@ import { defaultIntentConfig } from "../intent/config.ts";
  */
 export function renderTomlFile(): string {
   const w5 = defaultIntentConfig().w5;
-  return `# tempad.toml, written by \`tempad init\`. Everything here is optional and commented out.
+  return `# tempad.toml, written by \`tempad setup\`. Everything here is optional and commented out.
 # Documentation: docs/specs/ in the tempad repository.
 
 # Classifier settings for the w5 hook. Values shown are the defaults.

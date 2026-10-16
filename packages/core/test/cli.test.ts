@@ -207,7 +207,8 @@ describe("tempad sync --full", () => {
 });
 
 const CLI_PATH = join(import.meta.dir, "..", "src", "cli.ts");
-const NOT_SET_UP = "tempad is not set up yet; run: bunx @hyperlab.sh/tempad init\n";
+const NOT_SET_UP =
+  "tempad is not set up yet; run /tempad:setup in Claude Code, or `tempad setup` in a terminal\n";
 
 interface CliResult {
   exitCode: number;
@@ -328,7 +329,7 @@ describe("cli process", () => {
 
 describe("cli --help", () => {
   const COMMAND_FRAGMENTS = [
-    "tempad init",
+    "tempad setup",
     "tempad sync",
     "tempad report",
     "tempad hero init",
@@ -355,6 +356,35 @@ describe("cli --help", () => {
     "tempad project register",
     "tempad --help",
   ];
+
+  test("lists setup and leaves the hidden init alias out", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const result = await runCli(sandbox, ["--help"]);
+      expect(result.stdout).toContain("tempad setup");
+      expect(result.stdout).not.toMatch(/tempad init\b/);
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
+  test("--version prints the package version without a home", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const result = await runCli(sandbox, ["--version"]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        (
+          JSON.parse(readFileSync(join(import.meta.dir, "..", "package.json"), "utf8")) as {
+            version: string;
+          }
+        ).version,
+      );
+      expect(existsSync(sandbox.tempadHome)).toBe(false);
+    } finally {
+      cleanup(sandbox);
+    }
+  });
 
   for (const flag of ["--help", "-h", "help"]) {
     test(`\`tempad ${flag}\` prints every command to stdout, exits 0, with an empty env and no home`, async () => {
@@ -412,7 +442,7 @@ describe("cli per-command configuration", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe(
-        `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(sandbox.tempadHome, ".env")} or run: bunx @hyperlab.sh/tempad init\n`,
+        `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ${join(sandbox.tempadHome, ".env")} or run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal\n`,
       );
     } finally {
       cleanup(sandbox);
@@ -516,7 +546,7 @@ describe("cli per-command configuration", () => {
       ]);
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toBe(
-        `tempad report daily needs TZ; set it in ${join(sandbox.tempadHome, ".env")} or run: bunx @hyperlab.sh/tempad init\n`,
+        `tempad report daily needs TZ; set it in ${join(sandbox.tempadHome, ".env")} or run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal\n`,
       );
     } finally {
       cleanup(sandbox);
@@ -893,6 +923,7 @@ describe("tempad skill install", () => {
       expect(existsSync(destination)).toBe(true);
       const content = readFileSync(destination, "utf8");
       expect(content).toContain("name: tempad-quest");
+      expect(content).not.toMatch(/^name: quest$/m);
       expect(content).toContain("tempad quest declare");
     } finally {
       process.env.HOME = previousHome;
