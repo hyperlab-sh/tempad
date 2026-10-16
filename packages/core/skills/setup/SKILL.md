@@ -17,8 +17,9 @@ Run `command -v bun`. If it is missing, tell the user to install it from https:/
 ## 2. The CLI
 
 Run `tempad --version`. If it prints a version, skip to step 3. Otherwise run
-`bun add -g @hyperlab.sh/tempad`, then `tempad --version` again. If `tempad` is still not found, bun's
-global bin directory (`~/.bun/bin`) is not on their `PATH`; tell them to add it and stop.
+`bun add -g @hyperlab.sh/tempad`, then `tempad --version` again. If `tempad` is still not found, run
+`bun pm bin -g` to get bun's global bin directory and use `$(bun pm bin -g)/tempad` by its full path
+wherever a later step says `tempad`. At the end, tell the user to add that directory to their `PATH`.
 
 ## 3. Configure
 
