@@ -73,6 +73,8 @@ export interface EvalOptions {
   declareFile?: string;
   /** IANA zone bare `from`/`to` dates resolve in. Defaults to UTC. */
   timeZone?: string;
+  /** Push sync on: rerun only this host's sessions (passed to `backfill`). */
+  hostSlug?: string;
 }
 
 interface DeclareFileEntry {
@@ -455,6 +457,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
       force: true,
       from: range.from,
       to: range.to,
+      ...(options.hostSlug !== undefined ? { hostSlug: options.hostSlug } : {}),
     },
   );
 

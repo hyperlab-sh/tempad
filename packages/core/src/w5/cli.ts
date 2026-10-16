@@ -11,6 +11,7 @@ import {
 } from "../config/env";
 import type { IntentConfig } from "../intent/config";
 import { activeDeclaredQuests } from "../intent/declarations";
+import { isSyncEnabled } from "../sync/config";
 import { backfill } from "./backfill";
 import { AnthropicClassifier, type Classifier } from "./classifier";
 import { ClaudeCliClassifier } from "./classifier-cli";
@@ -416,6 +417,8 @@ export interface CommandPlan {
 
 export const W5_RUN_NEEDS = ["claudeDirs", "hostSlug"] as const;
 export const W5_EVAL_NEEDS = ["tz"] as const;
+/** Own-host classification with push sync on: `backfill`/`eval` filter sessions by it. */
+export const W5_SYNC_NEEDS = ["hostSlug"] as const;
 
 const W5_DATABASE_SUBCOMMANDS = new Set([
   "enqueue",
@@ -430,6 +433,7 @@ const W5_DATABASE_SUBCOMMANDS = new Set([
 export function planW5Command(
   command: "w5" | "quiet" | "review",
   args: string[],
+  options: { syncEnabled?: boolean } = {},
 ): CommandPlan | null {
   if (command === "quiet" || command === "review") {
     return {
@@ -445,9 +449,18 @@ export function planW5Command(
     return { label, needs: [], opensDatabase: false, silentWhenUnconfigured: false };
   }
   if (!W5_DATABASE_SUBCOMMANDS.has(subcommand)) return null;
+  const sync: readonly ConfigKey[] = options.syncEnabled ? W5_SYNC_NEEDS : [];
+  const needs: readonly ConfigKey[] =
+    subcommand === "run"
+      ? W5_RUN_NEEDS
+      : subcommand === "eval"
+        ? [...W5_EVAL_NEEDS, ...sync]
+        : subcommand === "backfill"
+          ? sync
+          : [];
   return {
     label,
-    needs: subcommand === "run" ? W5_RUN_NEEDS : subcommand === "eval" ? W5_EVAL_NEEDS : [],
+    needs,
     opensDatabase: true,
     silentWhenUnconfigured: subcommand === "enqueue" || subcommand === "context",
   };
@@ -544,6 +557,9 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
         context.stdout(line);
       },
       force: values.force === true,
+      // With push sync on, classify only this host's sessions; the others'
+      // traces arrive as events from the host that has the transcript.
+      ...(isSyncEnabled(context.config.home) ? { hostSlug: context.config.hostSlug } : {}),
     },
   );
 
@@ -611,6 +627,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
       },
       declareFile: values.declare,
       timeZone: evalConfig.tz,
+      ...(isSyncEnabled(context.config.home) ? { hostSlug: context.config.hostSlug } : {}),
     });
   } catch (error) {
     if (error instanceof InvalidDeclareFileError) {
