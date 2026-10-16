@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { resolveOwnerIdentity } from "../identity";
 import type { Projection } from "./index";
 
 export const questProjection: Projection = {
@@ -37,7 +38,7 @@ export const questProjection: Projection = {
     const payload = event.payload;
     switch (event.kind) {
       case "quest.created": {
-        const owner = payload.owner as { kind: string; id: string };
+        const owner = resolveOwnerIdentity(database, payload.owner as { kind: string; id: string });
         database
           .query(
             `INSERT OR REPLACE INTO quests

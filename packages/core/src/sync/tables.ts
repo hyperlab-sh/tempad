@@ -67,6 +67,8 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "impacts",
   "w5_windows",
   "projection_state",
+  // Cross-host identity aliases (src/intent/identity.ts), rebuilt with the rest.
+  "identity_aliases",
   // Collector cursors are per host.
   "sync_state",
   // w5 job queue, per-session classifier memory, quiet window.

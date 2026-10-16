@@ -1,3 +1,4 @@
+import { resolveOwnerIdentity } from "../identity";
 import type { Projection } from "./index";
 
 export const sagaProjection: Projection = {
@@ -20,7 +21,7 @@ export const sagaProjection: Projection = {
     const payload = event.payload;
     switch (event.kind) {
       case "saga.created": {
-        const owner = payload.owner as { kind: string; id: string };
+        const owner = resolveOwnerIdentity(database, payload.owner as { kind: string; id: string });
         database
           .query(
             "INSERT OR REPLACE INTO sagas (id, owner_kind, owner_id, title, statement, revision, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
