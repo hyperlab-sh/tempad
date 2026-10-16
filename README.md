@@ -218,6 +218,27 @@ The w5 hook classifies through the local `claude` CLI (`[w5].backend = "claude-c
 
 In `declared` mode the session states its quest (the `quest` skill does this) and the classifier only verifies that each stretch of work serves it, asking you when it doubts. The design is in [`docs/specs`](docs/specs).
 
+## Sync across machines (optional)
+
+Each machine keeps its own `tempad.db`. To see the same history on several machines, point them all at one self-hosted [sqld](https://github.com/tursodatabase/libsql) server:
+
+```toml
+# TEMPAD_HOME/tempad.toml
+[sync]
+url = "libsql://tempad-sync.example.com"
+```
+
+```sh
+# TEMPAD_HOME/.env
+TEMPAD_SYNC_TOKEN=<a JWT signed with the server's key>
+```
+
+With `[sync]` present, `tempad sync` pushes this machine's changes and pulls the others' after collecting. `tempad sync --push` or `tempad sync --pull` runs one direction only, without collecting. Without `[sync]`, tempad never opens a network connection for sync.
+
+Every host must run identical `[[projects]]` rules in `tempad.toml`. Collectors compute org, project and display name from the local rules and sync them as data, so hosts with different rules overwrite each other's values on every sync.
+
+Server setup (Coolify, JWT keys, backups): `docs/deploy/sqld-coolify.md`. Protocol and conflict rule: `docs/specs/push-sync.md`.
+
 ## Repository layout
 
 | Path             | Why                                                                                                                            |
