@@ -64,6 +64,7 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "sync_local",
   "sync_cursors",
   "sync_tombstones",
+  "sync_meta",
 ];
 
 /** Columns sync owns on every synced-upsert table; never content. */
