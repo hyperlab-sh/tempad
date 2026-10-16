@@ -381,11 +381,20 @@ describe("ignoreWorkingDirectoryEnvFiles", () => {
   });
 
   test("covers .env.local and the NODE_ENV-specific files", () => {
-    writeFileSync(join(cwd, ".env.local"), "TZ=UTC");
-    writeFileSync(join(cwd, ".env.development"), "HOST_SLUG=ci");
-    const environment: NodeJS.ProcessEnv = { TZ: "UTC", HOST_SLUG: "ci" };
-    ignoreWorkingDirectoryEnvFiles(cwd, environment, []);
-    expect(environment).toEqual({});
+    // Bun picks `.env.$NODE_ENV` from process.env.NODE_ENV, which `bun test` sets to "test"
+    // and a developer shell may set to anything, so pin it for this test.
+    const previousMode = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    try {
+      writeFileSync(join(cwd, ".env.local"), "TZ=UTC");
+      writeFileSync(join(cwd, ".env.development"), "HOST_SLUG=ci");
+      const environment: NodeJS.ProcessEnv = { TZ: "UTC", HOST_SLUG: "ci" };
+      ignoreWorkingDirectoryEnvFiles(cwd, environment, []);
+      expect(environment).toEqual({});
+    } finally {
+      if (previousMode === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousMode;
+    }
   });
 
   test("keeps a value the caller set differently from the cwd file", () => {
