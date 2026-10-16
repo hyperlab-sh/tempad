@@ -1,22 +1,27 @@
 import { heroProjection } from "./hero";
 import { impactProjection } from "./impact";
-import { registerProjection } from "./index";
+import { type Projection, registerProjection } from "./index";
 import { partyProjection } from "./party";
 import { questProjection } from "./quest";
 import { sagaProjection } from "./saga";
 import { stintProjection } from "./stint";
 import { windowProjection } from "./window";
 
+/** Every production projection, in registration order. */
+export const ALL_PROJECTIONS: readonly Projection[] = [
+  heroProjection,
+  impactProjection,
+  partyProjection,
+  sagaProjection,
+  questProjection,
+  stintProjection,
+  windowProjection,
+];
+
 let registered = false;
 
 export function registerAllProjections(): void {
   if (registered) return;
-  registerProjection(heroProjection);
-  registerProjection(impactProjection);
-  registerProjection(partyProjection);
-  registerProjection(sagaProjection);
-  registerProjection(questProjection);
-  registerProjection(stintProjection);
-  registerProjection(windowProjection);
+  for (const projection of ALL_PROJECTIONS) registerProjection(projection);
   registered = true;
 }

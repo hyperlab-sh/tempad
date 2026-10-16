@@ -510,7 +510,7 @@ function latestDeclaredParentSessionId(
     .query(
       `SELECT payload FROM events
         WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
-        ORDER BY at DESC, id DESC LIMIT 1`,
+        ORDER BY at DESC, uid DESC, id DESC LIMIT 1`,
     )
     .get(sessionId, at) as { payload: string } | null;
   if (row === null) return null;

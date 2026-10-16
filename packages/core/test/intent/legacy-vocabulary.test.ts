@@ -130,9 +130,10 @@ describe("migration 0011", () => {
   test("renames tables and columns on a database holding old-name data", () => {
     const path = temporaryPath("old.db");
 
-    // Build a database at version 10, with the pre-rename projection tables.
+    // Build a database at version 10: the real migration-created tables from
+    // 0001-0010, plus the pre-rename projection tables.
+    openDatabase(path, { upToVersion: 10 }).close();
     const old = new Database(path);
-    old.exec("PRAGMA journal_mode = WAL;");
     old.exec(`
       CREATE TABLE goals (id TEXT PRIMARY KEY, title TEXT NOT NULL);
       CREATE TABLE activities (
@@ -151,7 +152,6 @@ describe("migration 0011", () => {
     old.query("INSERT INTO traces VALUES ('T1', 'S1')").run();
     old.query("INSERT INTO trace_links VALUES ('T1', 'S1')").run();
     old.query("INSERT INTO quests VALUES ('Q1', 'G1', 'an outcome', 'S0')").run();
-    old.exec("PRAGMA user_version = 10;");
     old.close();
 
     const database = openDatabase(path);

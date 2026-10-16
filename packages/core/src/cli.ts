@@ -10,6 +10,7 @@ import { collectors } from "./collect/index.ts";
 import type { Collector, SyncSummary } from "./collect/types.ts";
 import {
   ConfigError,
+  type Config,
   type ConfigKey,
   ignoreWorkingDirectoryEnvFiles,
   isConfigured,
@@ -116,7 +117,14 @@ function prepareCommand<K extends ConfigKey>(
 ): { config: LoadedConfig<K>; database: Database } {
   assertConfigured(tempadHome());
   const config = loadConfig(label, needs);
-  return { config, database: openDatabase(join(config.home, "tempad.db")) };
+  // `sync_local` records the host for the sync triggers. Only commands that asked for
+  // HOST_SLUG have it; for the rest the column stays NULL and the first push fills it.
+  const hostSlug = (config as Partial<Pick<Config, "hostSlug">>).hostSlug;
+  const database = openDatabase(
+    join(config.home, "tempad.db"),
+    hostSlug === undefined ? undefined : { hostSlug },
+  );
+  return { config, database };
 }
 
 export async function runSync(

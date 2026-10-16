@@ -20,7 +20,10 @@ CREATE TABLE monday_items (
   raw                  TEXT NOT NULL,     -- full column_values JSON
   org                  TEXT,              -- mapped org, from tempad.toml [[boards]] (or fallback)
   project              TEXT,              -- mapped project
-  meta                 TEXT               -- JSON of extra board-rule keys
+  meta                 TEXT,              -- JSON of extra board-rule keys
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 CREATE INDEX monday_items_updated ON monday_items(updated_at);
 
@@ -31,7 +34,10 @@ CREATE TABLE gh_repos (
   default_branch TEXT,
   mirrored_at    TEXT,
   project        TEXT,                    -- mapped project
-  meta           TEXT                     -- JSON of extra repository-rule keys
+  meta           TEXT,                    -- JSON of extra repository-rule keys
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 
 CREATE TABLE gh_commits (
@@ -46,7 +52,10 @@ CREATE TABLE gh_commits (
   body           TEXT,
   files_changed  INTEGER,
   insertions     INTEGER,
-  deletions      INTEGER
+  deletions      INTEGER,
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 CREATE INDEX gh_commits_authored ON gh_commits(authored_at);
 
@@ -62,6 +71,9 @@ CREATE TABLE gh_pull_requests (
   closed_at   TEXT,
   first_authored_at TEXT,                 -- earliest commit author date among the PR's commits
   updated_at  TEXT,                        -- GitHub's PR updated_at cursor, to detect changed PRs
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1, -- 1 = not yet pushed (0019)
   PRIMARY KEY (repo, number)
 );
 
@@ -86,7 +98,10 @@ CREATE TABLE claude_sessions (
   file_mtime       TEXT NOT NULL,
   title_source     TEXT,                  -- 'custom-title' | 'agent-name' | 'first-message' | 'none'
   entrypoint       TEXT,                  -- top-level `entrypoint` from the first user line
-  user_type        TEXT                   -- top-level `userType` from the first user line
+  user_type        TEXT,                  -- top-level `userType` from the first user line
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 CREATE INDEX claude_sessions_started ON claude_sessions(started_at);
 
@@ -101,7 +116,10 @@ CREATE TABLE claude_messages (
   text_preview  TEXT,                     -- first 500 chars of text content
   tool_name     TEXT,                     -- when the line is a tool_use
   tokens_in     INTEGER,
-  tokens_out    INTEGER
+  tokens_out    INTEGER,
+  sync_host        TEXT,                   -- host tag of the last writer (0019)
+  sync_updated_at  TEXT,                   -- last-write stamp, ms UTC ISO (0019)
+  sync_dirty       INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 CREATE INDEX claude_messages_ts ON claude_messages(ts);
 CREATE INDEX claude_messages_session ON claude_messages(session_id);
@@ -114,14 +132,29 @@ CREATE TABLE events (
   session_id  TEXT,
   kind        TEXT NOT NULL,
   subject     TEXT NOT NULL,
-  payload     TEXT NOT NULL
+  payload     TEXT NOT NULL,
+  uid         TEXT,                      -- global ULID, replay order (0019)
+  sync_host   TEXT,                      -- origin host (0019)
+  sync_dirty  INTEGER NOT NULL DEFAULT 1 -- 1 = not yet pushed (0019)
 );
 CREATE INDEX events_subject ON events(subject, at);
 CREATE INDEX events_kind ON events(kind, at);
 CREATE INDEX events_quest_declared_session
   ON events(json_extract(payload, '$.session_id'))
   WHERE kind = 'quest.declared';
-CREATE TRIGGER events_no_update BEFORE UPDATE ON events BEGIN
+CREATE UNIQUE INDEX events_uid ON events(uid);
+-- 0019 replaced the unconditional trigger: an update may only fill a NULL uid,
+-- fill a NULL sync_host, and/or clear sync_dirty 1 -> 0 (see 0019_push_sync.sql).
+CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+WHEN NOT (
+  NEW.id IS OLD.id AND NEW.at IS OLD.at AND NEW.recorded_at IS OLD.recorded_at AND
+  NEW.actor IS OLD.actor AND NEW.session_id IS OLD.session_id AND NEW.kind IS OLD.kind AND
+  NEW.subject IS OLD.subject AND NEW.payload IS OLD.payload AND
+  (NEW.uid IS OLD.uid OR OLD.uid IS NULL) AND
+  (NEW.sync_host IS OLD.sync_host OR OLD.sync_host IS NULL) AND
+  (NEW.sync_dirty IS OLD.sync_dirty OR (OLD.sync_dirty = 1 AND NEW.sync_dirty = 0))
+)
+BEGIN
   SELECT RAISE(ABORT, 'events are append-only');
 END;
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events BEGIN
@@ -243,4 +276,33 @@ CREATE TABLE IF NOT EXISTS impacts (
   stated_at TEXT NOT NULL,
   event_id INTEGER NOT NULL,
   retracted_at TEXT
+);
+
+-- Migration 0019_push_sync.sql (docs/specs/push-sync.md, "Schema changes")
+-- added the sync columns mirrored above on `events` and the six collector
+-- mirrors, the tables below, and per-mirror triggers `<table>_sync_insert`,
+-- `<table>_sync_update` and `<table>_sync_delete` (defined only in the
+-- migration): insert without a stamp -> stamp, tag with sync_local's host,
+-- dirty; content update with the stamp untouched -> same; delete -> upsert a
+-- `sync_tombstones` row keyed by the JSON array of the natural key. The table
+-- classification (synced-append / synced-upsert / local-only) lives in
+-- src/sync/tables.ts.
+
+CREATE TABLE sync_local (
+  id        INTEGER PRIMARY KEY CHECK (id = 1),
+  host_slug TEXT NOT NULL
+);
+
+CREATE TABLE sync_cursors (
+  stream TEXT PRIMARY KEY,
+  seq    INTEGER NOT NULL
+);
+
+CREATE TABLE sync_tombstones (
+  tbl        TEXT NOT NULL,
+  pk         TEXT NOT NULL,
+  deleted_at TEXT NOT NULL,
+  sync_host  TEXT,
+  sync_dirty INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (tbl, pk)
 );

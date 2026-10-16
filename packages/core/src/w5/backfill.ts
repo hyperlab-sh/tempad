@@ -28,6 +28,14 @@ export interface BackfillOptions {
    * exclude the whole day instead of including it.
    */
   to?: string;
+  /**
+   * When set, only sessions that ran on this host (`claude_sessions.host_slug`)
+   * are classified. Push sync passes the local `HOST_SLUG` so a session is
+   * classified once, on the machine holding its transcript, and its traces
+   * reach the other hosts as events (docs/specs/push-sync.md, "w5 stays
+   * host-local"). Unset: every session, regardless of host.
+   */
+  hostSlug?: string;
 }
 
 export interface BackfillResult {
@@ -120,17 +128,21 @@ export async function backfill(
     options.from ??
     new Date(Date.parse(options.now) - options.days * 24 * 60 * 60 * 1000).toISOString();
 
-  const sessions = options.to
-    ? (database
-        .query(
-          "SELECT id, ended_at FROM claude_sessions WHERE ended_at >= ? AND ended_at < ? ORDER BY started_at ASC",
-        )
-        .all(cutoff, options.to) as SessionRow[])
-    : (database
-        .query(
-          "SELECT id, ended_at FROM claude_sessions WHERE ended_at >= ? ORDER BY started_at ASC",
-        )
-        .all(cutoff) as SessionRow[]);
+  const sessionClauses = ["ended_at >= ?"];
+  const sessionParameters: string[] = [cutoff];
+  if (options.to) {
+    sessionClauses.push("ended_at < ?");
+    sessionParameters.push(options.to);
+  }
+  if (options.hostSlug !== undefined) {
+    sessionClauses.push("host_slug = ?");
+    sessionParameters.push(options.hostSlug);
+  }
+  const sessions = database
+    .query(
+      `SELECT id, ended_at FROM claude_sessions WHERE ${sessionClauses.join(" AND ")} ORDER BY started_at ASC`,
+    )
+    .all(...sessionParameters) as SessionRow[];
 
   let sessionsClassified = 0;
   let sessionsSkipped = 0;

@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { monotonicFactory } from "ulid";
+import { ulidAfter } from "../intent/ids";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
 
@@ -21,7 +23,25 @@ function loadMigrations(): { version: number; sql: string }[] {
   });
 }
 
-export function openDatabase(path: string): Database {
+export interface OpenDatabaseOptions {
+  /**
+   * This machine's `HOST_SLUG`. When given, it is upserted into `sync_local`,
+   * where the push-sync triggers and `EventStore.append` read it to tag every
+   * row and event they write. Every CLI entry point passes `config.hostSlug`;
+   * a database opened without one (tests, `:memory:`) writes `sync_host` NULL,
+   * which push fills with its own slug before sending.
+   */
+  hostSlug?: string;
+  /**
+   * Stop after this migration version instead of migrating to head. For tests
+   * that need a database exactly as an older release left it: rewinding
+   * `user_version` after a full migration instead would replay non-ALTER
+   * migrations (0019 onward) against tables that already have their columns.
+   */
+  upToVersion?: number;
+}
+
+export function openDatabase(path: string, options: OpenDatabaseOptions = {}): Database {
   const database = new Database(path);
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA foreign_keys = ON;");
@@ -32,10 +52,79 @@ export function openDatabase(path: string): Database {
   const migrations = loadMigrations();
   for (const migration of migrations) {
     if (migration.version <= currentVersion) continue;
+    if (options.upToVersion !== undefined && migration.version > options.upToVersion) break;
     applyMigration(database, migration);
   }
 
+  if (hasColumn(database, "events", "uid")) backfillEventUids(database);
+  if (options.hostSlug !== undefined && hasTable(database, "sync_local")) {
+    database
+      .query(
+        "INSERT INTO sync_local (id, host_slug) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET host_slug = excluded.host_slug WHERE host_slug IS NOT excluded.host_slug",
+      )
+      .run(options.hostSlug);
+  }
+
   return database;
+}
+
+function hasTable(database: Database, table: string): boolean {
+  return (
+    database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !==
+    null
+  );
+}
+
+function hasColumn(database: Database, table: string, column: string): boolean {
+  return (
+    database.query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?").get(table, column) !== null
+  );
+}
+
+/**
+ * Gives every event without a `uid` one, once: rows written before migration
+ * 0019 (or inserted by hand, outside `EventStore`, since). Rows are walked in
+ * `id` order through a single monotonic ULID factory seeded with each row's
+ * `recorded_at`. The factory never goes backwards -- a seed at or before the
+ * last one reuses the last time and increments the random half -- so the
+ * uids sort exactly like the ids, even where `recorded_at` is not monotonic in
+ * `id`, and replaying `ORDER BY uid` reproduces the old `ORDER BY id`.
+ *
+ * Seeding from `recorded_at` keeps legacy uids below every uid appended later
+ * (`EventStore.append` also refuses to go below the current maximum), so the
+ * single-host order stays insertion order across the upgrade.
+ *
+ * `uid IS NULL` is answered from the `events_uid` index, so this is a cheap
+ * no-op on every open after the first.
+ */
+function backfillEventUids(database: Database): void {
+  const rows = database
+    .query("SELECT id, recorded_at FROM events WHERE uid IS NULL ORDER BY id")
+    .all() as { id: number; recorded_at: string }[];
+  if (rows.length === 0) return;
+
+  // Never start below an existing uid: a row inserted by hand after the
+  // migration must still sort after the events already carrying one.
+  const maximum = (
+    database.query("SELECT MAX(uid) AS uid FROM events").get() as {
+      uid: string | null;
+    }
+  ).uid;
+  const nextUid = monotonicFactory();
+  const update = database.query("UPDATE events SET uid = ? WHERE id = ?");
+  const run = database.transaction(() => {
+    let previous = maximum;
+    for (const row of rows) {
+      const seed = Date.parse(row.recorded_at);
+      if (Number.isNaN(seed)) {
+        throw new Error(`events row ${row.id} has an unparseable recorded_at: ${row.recorded_at}`);
+      }
+      const uid = ulidAfter(nextUid(seed), previous);
+      update.run(uid, row.id);
+      previous = uid;
+    }
+  });
+  run();
 }
 
 /**
