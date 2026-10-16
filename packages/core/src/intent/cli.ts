@@ -410,10 +410,145 @@ function questExists(database: Database, id: string): boolean {
   return database.query("SELECT 1 FROM quests WHERE id = ?").get(id) !== null;
 }
 
-/** Resolves a possibly-merged quest id and confirms the underlying quest exists. */
+/** True when a `retracted` event has hidden the quest. A missing quest is not retracted. */
+function questRetracted(database: Database, id: string): boolean {
+  const row = database.query("SELECT retracted_at FROM quests WHERE id = ?").get(id) as {
+    retracted_at: string | null;
+  } | null;
+  return row !== null && row.retracted_at !== null;
+}
+
+/**
+ * Resolves a possibly-merged quest id and confirms the underlying quest exists
+ * and is not retracted. A retracted quest is gone for every command that
+ * targets one (confirm, merge, branch, return, lifecycle, declare); only
+ * `quest retract` itself looks at retracted rows. A null result is explained
+ * by `unavailableQuestMessage`.
+ */
 function resolveExistingQuest(database: Database, id: string): string | null {
   const resolved = resolveQuest(database, id);
-  return questExists(database, resolved) ? resolved : null;
+  if (!questExists(database, resolved)) return null;
+  return questRetracted(database, resolved) ? null : resolved;
+}
+
+/** Why `resolveExistingQuest(database, id)` returned null: retracted, or never existed. */
+function unavailableQuestMessage(database: Database, id: string): string {
+  const resolved = resolveQuest(database, id);
+  return questRetracted(database, resolved)
+    ? `quest ${resolved} is retracted`
+    : `unknown quest ${id}`;
+}
+
+/** Guard for commands that take a quest id without resolving it: a retracted quest cannot be edited. */
+function refuseRetractedQuest(database: Database, id: string): boolean {
+  if (!questRetracted(database, id)) return false;
+  console.error(`quest ${id} is retracted`);
+  return true;
+}
+
+interface QuestDependents {
+  /** Live stints attached to the quest, dismissed ones included (their traces still count as short work). */
+  stints: string[];
+  /** Live traces of those stints. */
+  traces: string[];
+  /** Live quests that serve, advance or deviate from this one, or were merged into it. */
+  childQuests: string[];
+  /** The quest this one was merged into, if any. */
+  mergedInto: string | null;
+}
+
+/**
+ * Everything live that hangs off a quest. Child quests are found three ways:
+ * a side quest branched from one of its stints (`deviates_from_stint_id`, which
+ * the declare path also fills with a quest id), `serves`, and `advances`, which
+ * has no column and lives only on the `quest.created` payload. Quests merged
+ * into it count as children too.
+ */
+function questDependents(database: Database, id: string): QuestDependents {
+  const stints = (
+    database
+      .query("SELECT id FROM stints WHERE quest_id = ? AND retracted_at IS NULL ORDER BY opened_at")
+      .all(id) as { id: string }[]
+  ).map((row) => row.id);
+  const traces = stints.flatMap((stintId) =>
+    (
+      database
+        .query("SELECT id FROM traces WHERE stint_id = ? AND retracted_at IS NULL ORDER BY id")
+        .all(stintId) as { id: string }[]
+    ).map((row) => row.id),
+  );
+  const children = new Set<string>();
+  const collect = (rows: { id: string }[]) => {
+    for (const row of rows) if (row.id !== id) children.add(row.id);
+  };
+  collect(
+    database
+      .query(
+        `SELECT id FROM quests
+          WHERE retracted_at IS NULL
+            AND (serves = ? OR merged_into = ? OR deviates_from_stint_id = ?
+                 OR deviates_from_stint_id IN (SELECT id FROM stints WHERE quest_id = ?))`,
+      )
+      .all(id, id, id, id) as { id: string }[],
+  );
+  collect(
+    database
+      .query(
+        `SELECT quests.id AS id FROM quests
+           JOIN events ON events.kind = 'quest.created' AND events.subject = quests.id
+          WHERE quests.retracted_at IS NULL AND json_extract(events.payload, '$.advances') = ?`,
+      )
+      .all(id) as { id: string }[],
+  );
+  const merged = database.query("SELECT merged_into FROM quests WHERE id = ?").get(id) as {
+    merged_into: string | null;
+  } | null;
+  return {
+    stints,
+    traces,
+    childQuests: [...children].sort(),
+    mergedInto: merged?.merged_into ?? null,
+  };
+}
+
+/** The quest plus every child quest reachable through `questDependents`, parent first. */
+function questClosure(database: Database, id: string): string[] {
+  const order = [id];
+  const seen = new Set(order);
+  for (let index = 0; index < order.length; index += 1) {
+    for (const child of questDependents(database, order[index] as string).childQuests) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      order.push(child);
+    }
+  }
+  return order;
+}
+
+function describeDependents(id: string, dependents: QuestDependents): string {
+  const parts: string[] = [];
+  if (dependents.stints.length > 0) parts.push(`${dependents.stints.length} live stints`);
+  if (dependents.traces.length > 0) parts.push(`${dependents.traces.length} live traces`);
+  if (dependents.childQuests.length > 0) {
+    parts.push(
+      `child quests (serve, advance, deviate or merged into it): ${dependents.childQuests.join(", ")}`,
+    );
+  }
+  if (dependents.mergedInto !== null) parts.push(`it was merged into ${dependents.mergedInto}`);
+  return `quest ${id} cannot be retracted: ${parts.join("; ")}. Pass --force to retract the dependents too, or use abandon if the work was dropped rather than created by mistake.`;
+}
+
+/** Appends a `retracted` event for one row (quest, stint or trace) and updates the projection. */
+function retractRow(store: EventStore, database: Database, subject: string, reason: string): void {
+  applyIncremental(
+    database,
+    store.append({
+      actor: "hero",
+      kind: "retracted",
+      subject,
+      payload: { retracts: subject, reason },
+    }),
+  );
 }
 
 export const QUEST_DECLARE_OPTIONS = {
@@ -498,6 +633,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error('usage: tempad quest reword <id> "<title>" [--outcome]');
       return 2;
     }
+    if (refuseRetractedQuest(context.database, id)) return 1;
     assertEditIntent(context.database, "quest", id, "reword");
     applyIncremental(
       context.database,
@@ -528,6 +664,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error(`unknown quest: ${id}`);
       return 1;
     }
+    if (refuseRetractedQuest(context.database, id)) return 1;
     assertEditIntent(context.database, "quest", id, "replace");
     const newId = newUlid();
     applyIncremental(
@@ -568,6 +705,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error("usage: tempad quest end <id> --reason ...");
       return 2;
     }
+    if (refuseRetractedQuest(context.database, id)) return 1;
     applyIncremental(
       context.database,
       store.append({
@@ -586,6 +724,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error('usage: tempad quest edit <id> "<title>"');
       return 2;
     }
+    if (refuseRetractedQuest(context.database, id)) return 1;
     assertEditIntent(context.database, "quest", id, undefined);
     applyIncremental(
       context.database,
@@ -602,7 +741,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
     const resolved = resolveExistingQuest(context.database, id);
     if (!resolved) {
-      console.error(`unknown quest ${id}`);
+      console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
     applyIncremental(
@@ -631,12 +770,12 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
     const source = resolveExistingQuest(context.database, id);
     if (!source) {
-      console.error(`unknown quest ${id}`);
+      console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
     const target = resolveExistingQuest(context.database, values.into);
     if (!target) {
-      console.error(`unknown quest ${values.into}`);
+      console.error(unavailableQuestMessage(context.database, values.into));
       return 1;
     }
     if (source === target) {
@@ -669,7 +808,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
     const resolved = resolveExistingQuest(context.database, id);
     if (!resolved) {
-      console.error(`unknown quest ${id}`);
+      console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
     const stateBySubcommand: Record<string, string> = {
@@ -710,7 +849,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
     const resolved = resolveExistingQuest(context.database, id);
     if (!resolved) {
-      console.error(`unknown quest ${id}`);
+      console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
     applyIncremental(
@@ -743,12 +882,12 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
     const resolved = resolveExistingQuest(context.database, id);
     if (!resolved) {
-      console.error(`unknown quest ${id}`);
+      console.error(unavailableQuestMessage(context.database, id));
       return 1;
     }
     const target = resolveExistingQuest(context.database, values.to);
     if (!target) {
-      console.error(`unknown quest ${values.to}`);
+      console.error(unavailableQuestMessage(context.database, values.to));
       return 1;
     }
     applyIncremental(
@@ -760,6 +899,80 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         payload: { to_quest: target },
       }),
     );
+    return 0;
+  }
+
+  if (subcommand === "retract" || subcommand === "delete") {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      options: { reason: { type: "string" }, force: { type: "boolean", default: false } },
+      strict: true,
+      allowPositionals: true,
+    });
+    const id = positionals[0];
+    const reason = values.reason?.trim();
+    if (!id || !reason) {
+      console.error(`usage: tempad quest ${subcommand} <id> --reason "..." [--force]`);
+      return 2;
+    }
+    // The id is taken exactly as named, not followed through `merged_into`:
+    // every other command resolves a merged-away id to its target, which here
+    // would retract a different quest than the one the operator typed.
+    const row = context.database
+      .query("SELECT id, retracted_at, merged_into FROM quests WHERE id = ?")
+      .get(id) as { id: string; retracted_at: string | null; merged_into: string | null } | null;
+    if (!row) {
+      console.error(`unknown quest ${id}`);
+      return 1;
+    }
+    if (row.retracted_at !== null) {
+      context.stdout(`quest ${id} is already retracted; nothing to do`);
+      return 0;
+    }
+    const dependents = questDependents(context.database, id);
+    const blocked =
+      dependents.stints.length > 0 ||
+      dependents.traces.length > 0 ||
+      dependents.childQuests.length > 0 ||
+      dependents.mergedInto !== null;
+    if (blocked && !values.force) {
+      console.error(describeDependents(id, dependents));
+      return 1;
+    }
+
+    const retracted = { traces: 0, stints: 0, quests: 0 };
+    if (blocked) {
+      // `--force` retracts dependents, it does not detach them: there is no
+      // event that moves a stint or child quest off a quest, and a stint left
+      // pointing at a retracted quest would report its time as unattributed
+      // work on a quest nobody can see. Traces go first, then stints, then
+      // child quests (each with its own dependents), then the quest itself, so
+      // a crash part-way leaves nothing live under a retracted parent and a
+      // rerun finishes the job. Quests merged into this one go too: their work
+      // was folded into it. The quest this one was merged into is untouched.
+      const closure = questClosure(context.database, id);
+      for (const questId of closure) {
+        const own = questDependents(context.database, questId);
+        for (const trace of own.traces) {
+          retractRow(store, context.database, trace, `${reason} (with quest ${id})`);
+          retracted.traces += 1;
+        }
+        for (const stint of own.stints) {
+          retractRow(store, context.database, stint, `${reason} (with quest ${id})`);
+          retracted.stints += 1;
+        }
+      }
+      for (const questId of [...closure].reverse()) {
+        if (questId === id) continue;
+        retractRow(store, context.database, questId, `${reason} (with quest ${id})`);
+        retracted.quests += 1;
+      }
+    }
+    retractRow(store, context.database, id, reason);
+    const cascade = blocked
+      ? ` (also retracted: ${retracted.traces} traces, ${retracted.stints} stints, ${retracted.quests} child quests)`
+      : "";
+    context.stdout(`retracted quest ${id}${cascade}`);
     return 0;
   }
 
@@ -781,16 +994,26 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     if (!values.all) {
       clauses.push("ended_at IS NULL");
       clauses.push("merged_into IS NULL");
+      clauses.push("retracted_at IS NULL");
     }
     if (values.unconfirmed) clauses.push("confirmed = 0");
     if (values.side) clauses.push("deviates_from_stint_id IS NOT NULL");
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = source
-      .query(`SELECT id, title, state, confirmed FROM quests ${where} ORDER BY created_at`)
-      .all() as { id: string; title: string; state: string; confirmed: number }[];
+      .query(
+        `SELECT id, title, state, confirmed, retracted_at FROM quests ${where} ORDER BY created_at`,
+      )
+      .all() as {
+      id: string;
+      title: string;
+      state: string;
+      confirmed: number;
+      retracted_at: string | null;
+    }[];
     for (const row of rows) {
       const unconfirmed = row.confirmed === 0 ? " [unconfirmed]" : "";
-      context.stdout(`${row.id}  ${row.title}  (${row.state})${unconfirmed}`);
+      const retracted = row.retracted_at !== null ? " (retracted)" : "";
+      context.stdout(`${row.id}  ${row.title}  (${row.state})${unconfirmed}${retracted}`);
     }
     return 0;
   }
@@ -826,7 +1049,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       }
       const resolved = resolveExistingQuest(context.database, values.done);
       if (!resolved) {
-        console.error(`unknown quest ${values.done}`);
+        console.error(unavailableQuestMessage(context.database, values.done));
         return 1;
       }
       const heroForDoneId = currentHeroId(context.database);
@@ -913,14 +1136,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     if (values.quest) {
       const resolved = resolveExistingQuest(context.database, values.quest);
       if (!resolved) {
-        console.error(`unknown quest ${values.quest}`);
-        return 1;
-      }
-      const row = context.database
-        .query("SELECT retracted_at FROM quests WHERE id = ?")
-        .get(resolved) as { retracted_at: string | null };
-      if (row.retracted_at !== null) {
-        console.error(`quest ${resolved} is retracted`);
+        console.error(unavailableQuestMessage(context.database, values.quest));
         return 1;
       }
       resolvedQuest = resolved;
@@ -961,7 +1177,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
   }
 
   console.error(
-    "usage: tempad quest add|reword|replace|end|edit|confirm|merge|pause|resume|done|abandon|branch|return|list|declare ...",
+    "usage: tempad quest add|reword|replace|end|edit|confirm|merge|pause|resume|done|abandon|branch|return|retract|delete|list|declare ...",
   );
   return 2;
 }
@@ -1349,6 +1565,10 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
     );
   } else {
     questId = resolveQuest(context.database, quest);
+    if (questRetracted(context.database, questId)) {
+      console.error(`quest ${questId} is retracted`);
+      return 1;
+    }
   }
 
   // `--origin current` is the answer-time equivalent of a live declaration's

@@ -66,6 +66,7 @@ const USAGE_LINES: string[] = [
   '  tempad client add <slug> "<name>"',
   '  tempad saga add --owner hero|party:<slug> "<title>" [--statement] | reword <id> "<title>" | replace <id> "<title>" --reason "..." | end <id> --reason ... | list [--all] [--as-of <iso>]',
   '  tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment] | confirm|merge|pause|resume|done|abandon|branch|return <id> | list [--all] [--unconfirmed] [--side] [--as-of <iso>]',
+  '  tempad quest retract <id> --reason "..." [--force]   (undo a quest created by mistake; alias: delete)',
   '  tempad quest declare --session <id> (--quest <id> | --new "<title>" --outcome "<text>" | --done <quest>) [--plan "a; b; c"] ...',
   "  tempad stint list [--open] [--quest <id>]",
   "  tempad trace list [--since <iso>] [--stint <id>]",
