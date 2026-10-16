@@ -18,6 +18,14 @@ export interface SyncedUpsertTable {
   name: string;
   /** Natural key, in the order the tombstone `pk` JSON array lists it. */
   keyColumns: readonly string[];
+  /**
+   * Columns that describe this machine rather than the shared fact. They are
+   * not content: changing one does not restamp or re-dirty the row (the
+   * `_sync_update` trigger leaves them out). Push leaves them out of the
+   * payload and pull never overwrites them, so a row first seen through a
+   * pull has them NULL until this host's own collector writes them.
+   */
+  localColumns: readonly string[];
 }
 
 export const SYNCED_APPEND_TABLES: readonly SyncedAppendTable[] = [
@@ -30,12 +38,17 @@ export const SYNCED_APPEND_TABLES: readonly SyncedAppendTable[] = [
  * `claude_messages`), so the remote never holds a child without its parent.
  */
 export const SYNCED_UPSERT_TABLES: readonly SyncedUpsertTable[] = [
-  { name: "gh_repos", keyColumns: ["full_name"] },
-  { name: "claude_sessions", keyColumns: ["id"] },
-  { name: "gh_commits", keyColumns: ["sha"] },
-  { name: "gh_pull_requests", keyColumns: ["repo", "number"] },
-  { name: "monday_items", keyColumns: ["id"] },
-  { name: "claude_messages", keyColumns: ["uuid"] },
+  // mirrored_at is when *this* host last fetched its own bare mirror.
+  { name: "gh_repos", keyColumns: ["full_name"], localColumns: ["mirrored_at"] },
+  // claude_dir, file_path and file_mtime name a file on the owning host, but
+  // only that host's collector ever writes them (other hosts never see the
+  // file), they are NOT NULL, and they record where the session came from:
+  // they sync as content.
+  { name: "claude_sessions", keyColumns: ["id"], localColumns: [] },
+  { name: "gh_commits", keyColumns: ["sha"], localColumns: [] },
+  { name: "gh_pull_requests", keyColumns: ["repo", "number"], localColumns: [] },
+  { name: "monday_items", keyColumns: ["id"], localColumns: [] },
+  { name: "claude_messages", keyColumns: ["uuid"], localColumns: [] },
 ];
 
 /** Never shipped: projections (rebuilt from events) and per-host state. */

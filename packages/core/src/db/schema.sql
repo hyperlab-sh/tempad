@@ -284,7 +284,11 @@ CREATE TABLE IF NOT EXISTS impacts (
 -- `<table>_sync_update` and `<table>_sync_delete` (defined only in the
 -- migration): insert without a stamp -> stamp, tag with sync_local's host,
 -- dirty; content update with the stamp untouched -> same; delete -> upsert a
--- `sync_tombstones` row keyed by the JSON array of the natural key. The table
+-- `sync_tombstones` row keyed by the JSON array of the natural key. Each new
+-- version of a key is stamped MAX(now, previous version's stamp + 1 ms), so
+-- stamps strictly increase per key on one host. Host-local columns
+-- (gh_repos.mirrored_at; `localColumns` in src/sync/tables.ts) are not
+-- content and never restamp. The table
 -- classification (synced-append / synced-upsert / local-only) lives in
 -- src/sync/tables.ts.
 

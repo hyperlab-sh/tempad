@@ -92,24 +92,42 @@ ALTER TABLE claude_messages ADD COLUMN sync_dirty INTEGER NOT NULL DEFAULT 1;
 UPDATE claude_messages SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now');
 
 -- Per-mirror triggers. Content columns are every column except sync_host,
--- sync_updated_at and sync_dirty; a column added to a mirror later must be
--- added to its `_sync_update` trigger too (a test checks).
+-- sync_updated_at, sync_dirty and the table's host-local columns
+-- (`localColumns` in src/sync/tables.ts, e.g. gh_repos.mirrored_at); a column
+-- added to a mirror later must be added to its `_sync_update` trigger or to
+-- `localColumns` (a test checks).
+--
+-- Stamps are strictly increasing per natural key on this host: each new
+-- version gets MAX(now, previous version's stamp + 1 ms), so a burst of writes
+-- in one millisecond never reuses a stamp. Push's "mark pushed WHERE
+-- sync_updated_at = <pushed stamp>" then cannot clear a newer unpushed
+-- version, and the server's last-writer-wins never ties two versions written
+-- by one host. The previous version is OLD for an update or delete and the
+-- key's tombstone (if any) for an insert. COALESCE guards a NULL or
+-- unparseable previous stamp, which multi-argument MAX would turn into NULL.
 --
 -- _sync_insert: a row inserted without a stamp (every collector insert) is
 -- stamped and tagged here. A pull inserts with an explicit stamp, so skips it.
+-- An existing tombstone for the key is left alone: the re-insert's stamp is
+-- above its deleted_at, so the row wins over it by stamp.
 -- _sync_update: restamp and re-dirty only when the stamp is untouched and a
 -- content column changed. A pull writes its own stamp; marking a row pushed
 -- changes only sync_dirty/sync_host; an unchanged re-collection changes no
--- content column. None of those fire it.
+-- content column; a host-local column is not content. None of those fire it.
 -- _sync_delete: upsert a tombstone keyed by the JSON natural key, so a
 -- re-delete after a re-insert refreshes it.
 
--- gh_repos: natural key (full_name)
+-- gh_repos: natural key (full_name); local, not content: mirrored_at
 CREATE TRIGGER gh_repos_sync_insert AFTER INSERT ON gh_repos
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE gh_repos
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'gh_repos' AND pk = json_array(NEW.full_name)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_repos_sync_update AFTER UPDATE ON gh_repos
@@ -118,19 +136,22 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
   NEW.org IS NOT OLD.org OR
   NEW.is_personal IS NOT OLD.is_personal OR
   NEW.default_branch IS NOT OLD.default_branch OR
-  NEW.mirrored_at IS NOT OLD.mirrored_at OR
   NEW.project IS NOT OLD.project OR
   NEW.meta IS NOT OLD.meta
 )
 BEGIN
   UPDATE gh_repos
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_repos_sync_delete AFTER DELETE ON gh_repos
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('gh_repos', json_array(OLD.full_name), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('gh_repos', json_array(OLD.full_name),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
@@ -140,7 +161,12 @@ CREATE TRIGGER gh_commits_sync_insert AFTER INSERT ON gh_commits
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE gh_commits
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'gh_commits' AND pk = json_array(NEW.sha)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_commits_sync_update AFTER UPDATE ON gh_commits
@@ -160,13 +186,17 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
 )
 BEGIN
   UPDATE gh_commits
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_commits_sync_delete AFTER DELETE ON gh_commits
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('gh_commits', json_array(OLD.sha), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('gh_commits', json_array(OLD.sha),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
@@ -176,7 +206,12 @@ CREATE TRIGGER gh_pull_requests_sync_insert AFTER INSERT ON gh_pull_requests
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE gh_pull_requests
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'gh_pull_requests' AND pk = json_array(NEW.repo, NEW.number)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_pull_requests_sync_update AFTER UPDATE ON gh_pull_requests
@@ -195,13 +230,17 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
 )
 BEGIN
   UPDATE gh_pull_requests
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER gh_pull_requests_sync_delete AFTER DELETE ON gh_pull_requests
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('gh_pull_requests', json_array(OLD.repo, OLD.number), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('gh_pull_requests', json_array(OLD.repo, OLD.number),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
@@ -211,7 +250,12 @@ CREATE TRIGGER monday_items_sync_insert AFTER INSERT ON monday_items
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE monday_items
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'monday_items' AND pk = json_array(NEW.id)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER monday_items_sync_update AFTER UPDATE ON monday_items
@@ -235,13 +279,17 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
 )
 BEGIN
   UPDATE monday_items
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER monday_items_sync_delete AFTER DELETE ON monday_items
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('monday_items', json_array(OLD.id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('monday_items', json_array(OLD.id),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
@@ -251,7 +299,12 @@ CREATE TRIGGER claude_sessions_sync_insert AFTER INSERT ON claude_sessions
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE claude_sessions
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'claude_sessions' AND pk = json_array(NEW.id)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER claude_sessions_sync_update AFTER UPDATE ON claude_sessions
@@ -280,13 +333,17 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
 )
 BEGIN
   UPDATE claude_sessions
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER claude_sessions_sync_delete AFTER DELETE ON claude_sessions
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('claude_sessions', json_array(OLD.id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('claude_sessions', json_array(OLD.id),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
@@ -296,7 +353,12 @@ CREATE TRIGGER claude_messages_sync_insert AFTER INSERT ON claude_messages
 WHEN NEW.sync_updated_at IS NULL
 BEGIN
   UPDATE claude_messages
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           COALESCE((SELECT strftime('%Y-%m-%dT%H:%M:%fZ', deleted_at, '+0.001 seconds') FROM sync_tombstones
+                      WHERE tbl = 'claude_messages' AND pk = json_array(NEW.uuid)), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER claude_messages_sync_update AFTER UPDATE ON claude_messages
@@ -315,13 +377,17 @@ WHEN NEW.sync_updated_at IS OLD.sync_updated_at AND (
 )
 BEGIN
   UPDATE claude_messages
-     SET sync_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), sync_host = (SELECT host_slug FROM sync_local WHERE id = 1), sync_dirty = 1
+     SET sync_updated_at = MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+         sync_host = (SELECT host_slug FROM sync_local WHERE id = 1),
+         sync_dirty = 1
    WHERE rowid = NEW.rowid;
 END;
 CREATE TRIGGER claude_messages_sync_delete AFTER DELETE ON claude_messages
 BEGIN
   INSERT INTO sync_tombstones (tbl, pk, deleted_at, sync_host, sync_dirty)
-  VALUES ('claude_messages', json_array(OLD.uuid), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), (SELECT host_slug FROM sync_local WHERE id = 1), 1)
+  VALUES ('claude_messages', json_array(OLD.uuid),
+          MAX(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', OLD.sync_updated_at, '+0.001 seconds'), '')),
+          (SELECT host_slug FROM sync_local WHERE id = 1), 1)
   ON CONFLICT (tbl, pk) DO UPDATE SET
     deleted_at = excluded.deleted_at, sync_host = excluded.sync_host, sync_dirty = 1;
 END;
