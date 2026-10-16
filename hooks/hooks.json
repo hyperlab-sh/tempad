@@ -6,7 +6,8 @@
           {
             "type": "command",
             "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
-            "timeout": 30
+            "timeout": 30,
+            "async": true
           }
         ]
       }
@@ -17,7 +18,8 @@
           {
             "type": "command",
             "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
-            "timeout": 30
+            "timeout": 30,
+            "async": true
           }
         ]
       }
@@ -28,7 +30,8 @@
           {
             "type": "command",
             "command": "TEMPAD_HOOK_SOURCE=plugin bash \"${CLAUDE_PLUGIN_ROOT}/packages/core/hooks/w5-stop.sh\"",
-            "timeout": 30
+            "timeout": 30,
+            "async": true
           }
         ]
       }
