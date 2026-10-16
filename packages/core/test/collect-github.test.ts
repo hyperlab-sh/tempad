@@ -31,6 +31,19 @@ function daysAgo(days: number, offsetHours = 0): string {
 
 const HOUR_MS = 60 * 60 * 1000;
 
+const NORMALIZE_COMMIT_DATES_SQL = readFileSync(
+  join(import.meta.dir, "../src/db/migrations/0021_normalize_commit_dates.sql"),
+  "utf8",
+);
+
+/**
+ * Replays migration 0021 over rows planted after the database was opened, the way an
+ * upgrade rewrites a database that was written by a release before b699db6.
+ */
+function migrateLegacyDates(database: Database): void {
+  database.exec(NORMALIZE_COMMIT_DATES_SQL);
+}
+
 /**
  * Inserts a `gh_commits` row for a sha that is in no mirror, with `authored_at`
  * and `committed_at` in git's offset form (`...-03:00`) the way releases before
@@ -524,7 +537,7 @@ describe("github collector", () => {
     }
   });
 
-  test("reconcile compares instants: a legacy offset-form row is in or out of the window by its real time", async () => {
+  test("reconcile after 0021: a legacy offset-form row is in or out of the window by its real time", async () => {
     const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
     const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
     const sourceDirectory = await buildRepository([
@@ -546,11 +559,13 @@ describe("github collector", () => {
         .query("UPDATE sync_state SET last_sync_at = ? WHERE source = 'github'")
         .run(new Date(lastSyncMs).toISOString());
       const lowerMs = lastSyncMs - 7 * DAY_MS;
-      // Orphans as a pre-b699db6 release stored them (see `plantLegacyOrphan`). As
-      // strings, -03:00 wall clock sorts BELOW the UTC bound although the instant is
-      // inside the window, and +09:00 sorts ABOVE it although the instant is outside.
+      // Orphans as a pre-b699db6 release stored them (see `plantLegacyOrphan`). Left in
+      // offset form, -03:00 wall clock sorts BELOW the UTC bound although the instant is
+      // inside the window, and +09:00 sorts ABOVE it although the instant is outside;
+      // 0021 puts both on the instant, and reconcile compares text from there.
       plantLegacyOrphan(database, "1".repeat(40), lowerMs + HOUR_MS, -3);
       plantLegacyOrphan(database, "2".repeat(40), lowerMs - HOUR_MS, 9);
+      migrateLegacyDates(database);
 
       const summary = await collector.sync(database, config, {});
       expect(summary.deleted).toBe(1);
@@ -569,7 +584,7 @@ describe("github collector", () => {
     }
   });
 
-  test("reconcile with a date-only `since` bound reads it as UTC midnight against offset-form rows", async () => {
+  test("reconcile after 0021 with a date-only `since` bound reads it as UTC midnight", async () => {
     const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
     const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
     const sourceDirectory = await buildRepository([
@@ -590,6 +605,7 @@ describe("github collector", () => {
       const sinceMs = Date.parse("2026-08-01T00:00:00.000Z");
       plantLegacyOrphan(database, "1".repeat(40), sinceMs + HOUR_MS, -3); // 2026-07-31T22:00-03:00
       plantLegacyOrphan(database, "2".repeat(40), sinceMs - HOUR_MS, 9); // 2026-08-01T08:00+09:00
+      migrateLegacyDates(database);
 
       const summary = await collector.sync(database, config, {});
       expect(summary.deleted).toBe(1);
