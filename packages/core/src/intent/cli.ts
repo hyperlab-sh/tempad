@@ -459,8 +459,10 @@ interface QuestDependents {
 
 /**
  * Everything live that hangs off a quest. Child quests are found three ways:
- * a side quest branched from one of its stints (`deviates_from_stint_id`, which
- * the declare path also fills with a quest id), `serves`, and `advances`, which
+ * a side quest branched from one of its stints (`deviates_from_stint_id` of the
+ * child names a stint of this quest; the declare path writes the pair inverted,
+ * on the parent's row and naming the child's quest id, handled separately),
+ * `serves`, and `advances`, which
  * has no column and lives only on the `quest.created` payload. Quests merged
  * into it count as children too.
  */
@@ -486,10 +488,24 @@ function questDependents(database: Database, id: string): QuestDependents {
       .query(
         `SELECT id FROM quests
           WHERE retracted_at IS NULL
-            AND (serves = ? OR merged_into = ? OR deviates_from_stint_id = ?
+            AND (serves = ? OR merged_into = ?
                  OR deviates_from_stint_id IN (SELECT id FROM stints WHERE quest_id = ?))`,
       )
-      .all(id, id, id, id) as { id: string }[],
+      .all(id, id, id) as { id: string }[],
+  );
+  // `quest declare --new Y --deviates-from X` stores the pair the wrong way
+  // round: X's row gets `deviates_from_stint_id = Y` (a quest id, not a stint
+  // id). So when a quest's own column names a live quest, that quest is its
+  // child, never its parent. The reverse lookup (`deviates_from_stint_id = id`)
+  // would make X a child of Y and `--force` on Y would retract X.
+  collect(
+    database
+      .query(
+        `SELECT child.id AS id FROM quests AS parent
+           JOIN quests AS child ON child.id = parent.deviates_from_stint_id
+          WHERE parent.id = ? AND child.retracted_at IS NULL`,
+      )
+      .all(id) as { id: string }[],
   );
   collect(
     database
@@ -549,6 +565,19 @@ function retractRow(store: EventStore, database: Database, subject: string, reas
       payload: { retracts: subject, reason },
     }),
   );
+}
+
+/** Expires every question still watching or waiting for an answer about a (retracted) trace. */
+function expirePendingQuestions(store: EventStore, database: Database, traceId: string): void {
+  const pending = database
+    .query("SELECT id FROM questions WHERE trace_id = ? AND state IN ('watching', 'asked')")
+    .all(traceId) as { id: string }[];
+  for (const question of pending) {
+    applyIncremental(
+      database,
+      store.append({ actor: "hero", kind: "question.expired", subject: question.id, payload: {} }),
+    );
+  }
 }
 
 export const QUEST_DECLARE_OPTIONS = {
@@ -930,9 +959,9 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       return 0;
     }
     const dependents = questDependents(context.database, id);
+    // Traces only exist under stints, so a trace count adds nothing here.
     const blocked =
       dependents.stints.length > 0 ||
-      dependents.traces.length > 0 ||
       dependents.childQuests.length > 0 ||
       dependents.mergedInto !== null;
     if (blocked && !values.force) {
@@ -941,34 +970,44 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     }
 
     const retracted = { traces: 0, stints: 0, quests: 0 };
-    if (blocked) {
-      // `--force` retracts dependents, it does not detach them: there is no
-      // event that moves a stint or child quest off a quest, and a stint left
-      // pointing at a retracted quest would report its time as unattributed
-      // work on a quest nobody can see. Traces go first, then stints, then
-      // child quests (each with its own dependents), then the quest itself, so
-      // a crash part-way leaves nothing live under a retracted parent and a
-      // rerun finishes the job. Quests merged into this one go too: their work
-      // was folded into it. The quest this one was merged into is untouched.
-      const closure = questClosure(context.database, id);
-      for (const questId of closure) {
-        const own = questDependents(context.database, questId);
-        for (const trace of own.traces) {
-          retractRow(store, context.database, trace, `${reason} (with quest ${id})`);
-          retracted.traces += 1;
+    // One transaction: a push between two of these events would otherwise ship
+    // a half-applied cascade. The store shares this handle, so its own
+    // per-append transaction nests as a savepoint.
+    context.database
+      .transaction(() => {
+        if (blocked) {
+          // `--force` retracts dependents, it does not detach them: there is no
+          // event that moves a stint or child quest off a quest, and a stint left
+          // pointing at a retracted quest would report its time as unattributed
+          // work on a quest nobody can see. Traces go first, then stints, then
+          // child quests (each with its own dependents), then the quest itself.
+          // Quests merged into this one go too: their work was folded into it.
+          // The quest this one was merged into is untouched. A question still
+          // waiting on a retracted trace is expired, or the hand-back would
+          // later ask about work that no longer exists.
+          const cascadeReason = `${reason} (with quest ${id})`;
+          const closure = questClosure(context.database, id);
+          for (const questId of closure) {
+            const own = questDependents(context.database, questId);
+            for (const trace of own.traces) {
+              retractRow(store, context.database, trace, cascadeReason);
+              retracted.traces += 1;
+              expirePendingQuestions(store, context.database, trace);
+            }
+            for (const stint of own.stints) {
+              retractRow(store, context.database, stint, cascadeReason);
+              retracted.stints += 1;
+            }
+          }
+          for (const questId of [...closure].reverse()) {
+            if (questId === id) continue;
+            retractRow(store, context.database, questId, cascadeReason);
+            retracted.quests += 1;
+          }
         }
-        for (const stint of own.stints) {
-          retractRow(store, context.database, stint, `${reason} (with quest ${id})`);
-          retracted.stints += 1;
-        }
-      }
-      for (const questId of [...closure].reverse()) {
-        if (questId === id) continue;
-        retractRow(store, context.database, questId, `${reason} (with quest ${id})`);
-        retracted.quests += 1;
-      }
-    }
-    retractRow(store, context.database, id, reason);
+        retractRow(store, context.database, id, reason);
+      })
+      .immediate();
     const cascade = blocked
       ? ` (also retracted: ${retracted.traces} traces, ${retracted.stints} stints, ${retracted.quests} child quests)`
       : "";
@@ -1142,6 +1181,24 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       resolvedQuest = resolved;
     }
 
+    // The quests a new one advances or pivots away from must exist and be live;
+    // a retracted one is gone, and a relation to it would dangle.
+    const relations: Record<"advances" | "origin" | "deviates-from", string | undefined> = {
+      advances: undefined,
+      origin: undefined,
+      "deviates-from": undefined,
+    };
+    for (const flag of ["advances", "origin", "deviates-from"] as const) {
+      const named = values[flag];
+      if (!named) continue;
+      const resolved = resolveExistingQuest(context.database, named);
+      if (!resolved) {
+        console.error(unavailableQuestMessage(context.database, named));
+        return 1;
+      }
+      relations[flag] = resolved;
+    }
+
     const plan = values.plan
       ? values.plan
           .split(";")
@@ -1159,11 +1216,11 @@ function runQuestCommand(args: string[], context: IntentContext): number {
             outcome: values.outcome as string,
             commitment: (values.commitment as Commitment) ?? "personal",
             project: values.project,
-            origin: values.origin ?? values["deviates-from"],
+            origin: relations.origin ?? relations["deviates-from"],
             trigger: values.trigger,
             kind: values.kind as BranchKind | undefined,
             serves: values.serves,
-            advances: values.advances,
+            advances: relations.advances,
           }
         : undefined,
       plan,
@@ -1190,7 +1247,7 @@ function runStintCommand(args: string[], context: IntentContext): number {
       options: { open: { type: "boolean", default: false }, quest: { type: "string" } },
       strict: true,
     });
-    const clauses: string[] = [];
+    const clauses: string[] = ["retracted_at IS NULL"];
     const parameters: string[] = [];
     if (values.open) clauses.push("closed_at IS NULL");
     if (values.quest) {

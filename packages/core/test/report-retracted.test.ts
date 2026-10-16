@@ -125,4 +125,33 @@ describe("reports hide a retracted quest", () => {
     expect(queryDismissedMinutesByQuest(database, RANGE)).toEqual([]);
     database.close();
   });
+
+  test("dismissed short work is not credited to a retracted quest", () => {
+    const seed = (...retract: string[]) => {
+      const database = seedRetracted(...retract);
+      database.exec(
+        `INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, dismissed_at, revision)
+         VALUES ('stint-short', 'quest-1', 'quick look', '2026-09-01T14:00:00.000Z', '2026-09-01T14:03:00.000Z', '2026-09-01T14:03:00.000Z', 1)`,
+      );
+      database.exec(
+        `INSERT INTO traces (id, stint_id, tool, place, source, source_ref, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
+         VALUES ('trace-short', 'stint-short', 'edit', '/Users/octocat/work/acme/widgets', 'session', 'session-1', '2026-09-01T14:00:00.000Z', '2026-09-01T14:03:00.000Z', 'hero-1', 'looked', 'checking', '/Users/octocat/work/acme/widgets', 'assistant edit', 0.9, 'model', 'session-1', '2026-09-01T14:03:00.000Z')`,
+      );
+      database.exec(
+        `INSERT INTO trace_links (trace_id, stint_id, linked_at, superseded_at, reason)
+         VALUES ('trace-short', 'stint-short', '2026-09-01T14:03:00.000Z', NULL, NULL)`,
+      );
+      return database;
+    };
+
+    const control = seed();
+    expect(queryDismissedMinutesByQuest(control, RANGE).map((row) => row.questId)).toEqual([
+      "quest-1",
+    ]);
+    control.close();
+
+    const database = seed("quest-1");
+    expect(queryDismissedMinutesByQuest(database, RANGE)).toEqual([]);
+    database.close();
+  });
 });

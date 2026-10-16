@@ -584,3 +584,297 @@ describe("a retracted quest disappears from every surface", () => {
     expect(await h.run(["saga", "edit", saga, "Renamed"])).toBe(0);
   });
 });
+
+async function declareSide(h: ReturnType<typeof harness>, flag: string, parent: string) {
+  const code = await h.run([
+    "quest",
+    "declare",
+    "--session",
+    "s1",
+    "--new",
+    "Side",
+    "--outcome",
+    "o",
+    flag,
+    parent,
+    "--trigger",
+    "noticed",
+    "--kind",
+    "curiosity",
+  ]);
+  expect(code).toBe(0);
+  return (h.database.query("SELECT id FROM quests WHERE title = 'Side'").get() as { id: string })
+    .id;
+}
+
+// `quest declare --new Side --deviates-from Main` (and its `--origin` spelling)
+// writes the branch pair inverted: Main's row gets `deviates_from_stint_id =
+// Side`. Retraction must still treat Side as Main's child, never the reverse.
+describe.each(["--deviates-from", "--origin"])("a side quest declared with %s", (flag) => {
+  async function withSide() {
+    const h = await setup();
+    const main = await addQuest(h, "Main");
+    addStint(h.database, "A1", main);
+    addTrace(h.database, "T1", "A1");
+    const side = await declareSide(h, flag, main);
+    addStint(h.database, "A2", side);
+    addTrace(h.database, "T2", "A2");
+    return { h, main, side };
+  }
+
+  test("fixture control: the real declare path stores the pair on the parent's row", async () => {
+    const { h, main, side } = await withSide();
+    const row = h.database
+      .query("SELECT deviates_from_stint_id AS value FROM quests WHERE id = ?")
+      .get(main) as { value: string | null };
+    expect(row.value).toBe(side);
+  });
+
+  test("retracting the side quest is refused for its own stints and never touches the parent", async () => {
+    const { h, main, side } = await withSide();
+
+    expect(await h.run(["quest", "retract", side, "--reason", "x"])).toBe(1);
+    expect(errors.join("\n")).not.toContain(main);
+    expect(retractedEvents(h.database)).toHaveLength(0);
+  });
+
+  test("retracting the side quest with --force leaves the parent, its stints and traces live", async () => {
+    const { h, main, side } = await withSide();
+
+    expect(await h.run(["quest", "retract", side, "--reason", "x", "--force"])).toBe(0);
+
+    expect(retractedAt(h.database, "quests", side)).not.toBeNull();
+    expect(retractedAt(h.database, "stints", "A2")).not.toBeNull();
+    expect(retractedAt(h.database, "traces", "T2")).not.toBeNull();
+    expect(retractedAt(h.database, "quests", main)).toBeNull();
+    expect(retractedAt(h.database, "stints", "A1")).toBeNull();
+    expect(retractedAt(h.database, "traces", "T1")).toBeNull();
+  });
+
+  test("a side quest with no stints retracts without --force and leaves the parent live", async () => {
+    const h = await setup();
+    const main = await addQuest(h, "Main");
+    const side = await declareSide(h, flag, main);
+
+    expect(await h.run(["quest", "retract", side, "--reason", "x"])).toBe(0);
+
+    expect(retractedAt(h.database, "quests", side)).not.toBeNull();
+    expect(retractedAt(h.database, "quests", main)).toBeNull();
+  });
+
+  test("retracting the parent is refused and names the side quest as its child", async () => {
+    const { h, main, side } = await withSide();
+    h.database.query("UPDATE stints SET retracted_at = 'x' WHERE id = 'A1'").run();
+    h.database.query("UPDATE traces SET retracted_at = 'x' WHERE id = 'T1'").run();
+
+    expect(await h.run(["quest", "retract", main, "--reason", "x"])).toBe(1);
+
+    expect(errors.join("\n")).toContain(`child quests`);
+    expect(errors.join("\n")).toContain(side);
+    expect(retractedAt(h.database, "quests", main)).toBeNull();
+    expect(retractedAt(h.database, "quests", side)).toBeNull();
+  });
+
+  test("retracting the parent with --force retracts the side quest and everything under both", async () => {
+    const { h, main, side } = await withSide();
+
+    expect(await h.run(["quest", "retract", main, "--reason", "x", "--force"])).toBe(0);
+
+    for (const [table, id] of [
+      ["quests", main],
+      ["quests", side],
+      ["stints", "A1"],
+      ["stints", "A2"],
+      ["traces", "T1"],
+      ["traces", "T2"],
+    ] as const) {
+      expect(retractedAt(h.database, table, id), `${table} ${id}`).not.toBeNull();
+    }
+    expect(h.lines.join("\n")).toContain("2 traces, 2 stints, 1 child quests");
+  });
+
+  test("once the side quest is retracted the parent no longer lists it as a child", async () => {
+    const { h, main, side } = await withSide();
+    h.database.query("UPDATE stints SET retracted_at = 'x' WHERE id = 'A1'").run();
+    h.database.query("UPDATE traces SET retracted_at = 'x' WHERE id = 'T1'").run();
+    await h.run(["quest", "retract", side, "--reason", "x", "--force"]);
+    errors.length = 0;
+
+    expect(await h.run(["quest", "retract", main, "--reason", "x"])).toBe(0);
+  });
+});
+
+describe("declare --new refuses a retracted quest as a relation", () => {
+  for (const [flag, extra] of [
+    ["--advances", []],
+    ["--deviates-from", ["--trigger", "t", "--kind", "curiosity"]],
+    ["--origin", ["--trigger", "t", "--kind", "curiosity"]],
+  ] as const) {
+    test(`${flag} naming a retracted quest exits 1 and creates nothing`, async () => {
+      const h = await setup();
+      const gone = await addQuest(h, "Gone");
+      await h.run(["quest", "retract", gone, "--reason", "oops"]);
+      const eventsBefore = (
+        h.database.query("SELECT count(*) AS n FROM events").get() as { n: number }
+      ).n;
+      errors.length = 0;
+
+      const code = await h.run([
+        "quest",
+        "declare",
+        "--session",
+        "s1",
+        "--new",
+        "Fresh",
+        "--outcome",
+        "o",
+        flag,
+        gone,
+        ...extra,
+      ]);
+
+      expect(code).toBe(1);
+      expect(errors.join("\n")).toContain(`quest ${gone} is retracted`);
+      expect(h.database.query("SELECT 1 FROM quests WHERE title = 'Fresh'").get()).toBeNull();
+      expect((h.database.query("SELECT count(*) AS n FROM events").get() as { n: number }).n).toBe(
+        eventsBefore,
+      );
+    });
+
+    test(`${flag} naming an unknown quest exits 1`, async () => {
+      const h = await setup();
+
+      const code = await h.run([
+        "quest",
+        "declare",
+        "--session",
+        "s1",
+        "--new",
+        "Fresh",
+        "--outcome",
+        "o",
+        flag,
+        "NOPE",
+        ...extra,
+      ]);
+
+      expect(code).toBe(1);
+      expect(errors.join("\n")).toContain("unknown quest NOPE");
+    });
+  }
+
+  test("a live quest is still accepted", async () => {
+    const h = await setup();
+    const live = await addQuest(h, "Live");
+
+    expect(
+      await h.run([
+        "quest",
+        "declare",
+        "--session",
+        "s1",
+        "--new",
+        "Fresh",
+        "--outcome",
+        "o",
+        "--advances",
+        live,
+      ]),
+    ).toBe(0);
+  });
+});
+
+describe("--force expires the questions waiting on the traces it retracts", () => {
+  test("watching and asked questions expire; others stay", async () => {
+    const h = await setup();
+    const id = await addQuest(h, "Mistake");
+    addStint(h.database, "A1", id);
+    addTrace(h.database, "T1", "A1");
+    const other = await addQuest(h, "Other");
+    addStint(h.database, "A2", other);
+    addTrace(h.database, "T2", "A2");
+    const insert = (qid: string, trace: string, kind: string, state: string) =>
+      h.database
+        .query(
+          "INSERT INTO questions (id, trace_id, session_id, text, kind, state, turns_watched) VALUES (?, ?, 's1', 'q', ?, ?, 0)",
+        )
+        .run(qid, trace, kind, state);
+    insert("Q-watch", "T1", "belongs", "watching");
+    insert("Q-declare", "T1", "declare", "watching");
+    insert("Q-which", "T1", "which_quest", "asked");
+    insert("Q-answered", "T1", "which_quest", "answered");
+    insert("Q-other", "T2", "belongs", "watching");
+
+    expect(await h.run(["quest", "retract", id, "--reason", "x", "--force"])).toBe(0);
+
+    const state = (qid: string) =>
+      (h.database.query("SELECT state FROM questions WHERE id = ?").get(qid) as { state: string })
+        .state;
+    expect(state("Q-watch")).toBe("expired");
+    expect(state("Q-declare")).toBe("expired");
+    expect(state("Q-which")).toBe("expired");
+    expect(state("Q-answered")).toBe("answered");
+    expect(state("Q-other")).toBe("watching");
+    expect(
+      h.database.query("SELECT count(*) AS n FROM events WHERE kind = 'question.expired'").get(),
+    ).toEqual({ n: 3 });
+  });
+});
+
+describe("the cascade is atomic", () => {
+  test("a failure part-way through rolls every retraction back", async () => {
+    const h = await setup();
+    const id = await addQuest(h, "Mistake");
+    addStint(h.database, "A1", id);
+    addTrace(h.database, "T1", "A1");
+    addStint(h.database, "A2", id);
+    addTrace(h.database, "T2", "A2");
+    // Make the second retraction fail: its projection update raises.
+    h.database.exec(
+      `CREATE TRIGGER fail_second BEFORE UPDATE OF retracted_at ON stints WHEN NEW.id = 'A2'
+       BEGIN SELECT RAISE(ABORT, 'boom'); END`,
+    );
+
+    expect(await h.run(["quest", "retract", id, "--reason", "x", "--force"])).toBe(1);
+    expect(errors.join("\n")).toContain("boom");
+
+    expect(retractedEvents(h.database)).toHaveLength(0);
+    expect(retractedAt(h.database, "traces", "T1")).toBeNull();
+    expect(retractedAt(h.database, "quests", id)).toBeNull();
+  });
+});
+
+describe("stint list", () => {
+  test("hides retracted stints, including with --open and --quest", async () => {
+    const h = await setup();
+    const id = await addQuest(h, "Work");
+    addStint(h.database, "A-live", id);
+    addStint(h.database, "A-gone", id);
+    h.database.query("UPDATE stints SET retracted_at = 'x' WHERE id = 'A-gone'").run();
+
+    for (const args of [
+      ["stint", "list"],
+      ["stint", "list", "--open"],
+      ["stint", "list", "--quest", id],
+    ]) {
+      h.lines.length = 0;
+      expect(await h.run(args)).toBe(0);
+      expect(h.lines.join("\n"), args.join(" ")).toContain("A-live");
+      expect(h.lines.join("\n"), args.join(" ")).not.toContain("A-gone");
+    }
+  });
+});
+
+describe("a quest whose only stints are retracted", () => {
+  test("is not an edit blocker (attachment count ignores retracted stints)", async () => {
+    const h = await setup();
+    const id = await addQuest(h, "Quiet");
+    addStint(h.database, "A1", id);
+    expect(await h.run(["quest", "edit", id, "Renamed"])).toBe(1);
+
+    h.database.query("UPDATE stints SET retracted_at = 'x' WHERE id = 'A1'").run();
+    errors.length = 0;
+
+    expect(await h.run(["quest", "edit", id, "Renamed"])).toBe(0);
+  });
+});

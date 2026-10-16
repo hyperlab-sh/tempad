@@ -78,7 +78,7 @@ classifier.
 tempad quest retract <quest id> --reason "<why it was a mistake>"
 ```
 
-It refuses when the quest already has stints, traces or child quests (the work happened, so
-abandon or merge it instead). `--force` retracts those too; use it only when all of that work was
+It refuses when the quest already has stints, traces or child quests, or was merged into another
+quest (the work happened, so abandon or merge it instead). `--force` retracts those too; use it only when all of that work was
 also a mistake. Retracting a quest that is already retracted is a no-op. `tempad quest delete` is
 an alias.
