@@ -8,12 +8,23 @@ import { syncOneSessionFile } from "../src/collect/claude.ts";
 import type { Config } from "../src/config/env.ts";
 import { legacyEventUid, openDatabase } from "../src/db/database.ts";
 import { MIRROR_SYNC_COLUMNS, SYNCED_UPSERT_TABLES } from "../src/sync/tables.ts";
+import { enableMirrorSync } from "../src/sync/triggers.ts";
 
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const OLD_STAMP = "2020-01-01T00:00:00.000Z";
 
 function temporaryDirectory(): string {
   return mkdtempSync(join(tmpdir(), "tempad-migration-0019-"));
+}
+
+/**
+ * The mirror triggers exist only once sync has run on a database (migration
+ * 0022, src/sync/triggers.ts); the trigger tests below open one where it has.
+ */
+function openSynced(path: string, options?: Parameters<typeof openDatabase>[1]): Database {
+  const database = openDatabase(path, options);
+  enableMirrorSync(database);
+  return database;
 }
 
 function userVersion(database: Database): number {
@@ -106,7 +117,7 @@ describe("migration 0019_push_sync on a pre-0019 database with data", () => {
 
       const before = Date.now();
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(21);
+      expect(userVersion(database)).toBe(22);
       expect(database.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
       expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
 
@@ -148,9 +159,9 @@ describe("migration 0019_push_sync on a pre-0019 database with data", () => {
     }
   });
 
-  test("a fresh database migrates straight to head (21)", () => {
+  test("a fresh database migrates straight to head (22)", () => {
     const database = openDatabase(":memory:");
-    expect(userVersion(database)).toBe(21);
+    expect(userVersion(database)).toBe(22);
     expect(database.query("SELECT COUNT(*) AS n FROM sync_local").get()).toEqual({ n: 0 });
     database.close();
   });
@@ -357,7 +368,7 @@ describe("legacy uids are deterministic", () => {
 
 describe("mirror sync triggers", () => {
   test("an insert without a stamp is stamped, tagged with the local host and dirty", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     for (const table of SYNCED_UPSERT_TABLES) {
       const columns = syncColumns(database, table.name, MIRROR_KEYS[table.name] as string);
@@ -368,7 +379,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("with no sync_local row the insert trigger writes sync_host NULL", () => {
-    const database = openDatabase(":memory:");
+    const database = openSynced(":memory:");
     seedMirrors(database);
     const columns = syncColumns(database, "gh_commits", "sha = 'abc123'");
     expect(columns.sync_updated_at).toMatch(STAMP);
@@ -377,7 +388,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("an insert carrying its own stamp (a pull) is left exactly as written", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     database.exec(`
       INSERT INTO gh_repos (full_name, org, is_personal, sync_host, sync_updated_at, sync_dirty)
         VALUES ('acme/widgets', 'acme', 0, 'host-b', '${OLD_STAMP}', 0);
@@ -390,7 +401,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("a content update restamps, retags with the local host and re-dirties", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     for (const table of SYNCED_UPSERT_TABLES) {
       const where = MIRROR_KEYS[table.name] as string;
@@ -422,7 +433,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("a content update with no sync_local row sets sync_host NULL", () => {
-    const database = openDatabase(":memory:");
+    const database = openSynced(":memory:");
     seedMirrors(database);
     database.exec(
       `UPDATE gh_commits SET sync_updated_at = '${OLD_STAMP}', sync_host = 'host-b', sync_dirty = 0`,
@@ -435,7 +446,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("marking a row pushed (sync_dirty, filling sync_host) does not restamp", () => {
-    const database = openDatabase(":memory:");
+    const database = openSynced(":memory:");
     seedMirrors(database);
     database.exec(`UPDATE gh_commits SET sync_updated_at = '${OLD_STAMP}'`);
     expect(syncColumns(database, "gh_commits", "sha = 'abc123'")).toEqual({
@@ -456,7 +467,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("an update writing an explicit new stamp (a pull) is not restamped", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(
       `UPDATE gh_pull_requests SET title = 'pulled title', sync_updated_at = '${OLD_STAMP}', sync_host = 'host-b', sync_dirty = 0`,
@@ -474,7 +485,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("an update that writes identical content values (an unguarded upsert) does not fire", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(
       `UPDATE gh_repos SET sync_updated_at = '${OLD_STAMP}', sync_host = 'host-b', sync_dirty = 0`,
@@ -497,7 +508,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("the github commit upsert re-run with identical values leaves the row clean", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     // A faithful copy of upsertCommit's SQL (src/collect/github.ts).
     const upsert = database.query(
@@ -607,7 +618,7 @@ describe("mirror sync triggers", () => {
         home,
       };
 
-      const database = openDatabase(join(root, "tempad.db"), { hostSlug: "host-a" });
+      const database = openSynced(join(root, "tempad.db"), { hostSlug: "host-a" });
       await syncOneSessionFile(database, config, sessionFile);
       expect(database.query("SELECT COUNT(*) AS n FROM claude_messages").get()).toEqual({ n: 2 });
       // As push would leave them.
@@ -640,7 +651,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("a delete writes a tombstone keyed by the JSON natural key, composite PR key included", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(`
       DELETE FROM claude_messages;
@@ -675,7 +686,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("a re-delete after a re-insert refreshes the tombstone instead of failing", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec("DELETE FROM gh_pull_requests");
     // As push would leave it.
@@ -699,7 +710,7 @@ describe("mirror sync triggers", () => {
   });
 
   test("each mirror's update trigger names every content column and no local one (fails when a column is added)", () => {
-    const database = openDatabase(":memory:");
+    const database = openSynced(":memory:");
     for (const table of SYNCED_UPSERT_TABLES) {
       const triggers = database
         .query("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?")
@@ -746,7 +757,7 @@ const FUTURE_STAMP = "2999-01-01T00:00:00.000Z";
 
 describe("per-key stamps are strictly increasing on one host", () => {
   test("a host-local column (gh_repos.mirrored_at) is not content: no restamp, no re-dirty", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(
       `UPDATE gh_repos SET sync_updated_at = '${OLD_STAMP}', sync_host = 'host-b', sync_dirty = 0`,
@@ -760,7 +771,7 @@ describe("per-key stamps are strictly increasing on one host", () => {
   });
 
   test("1000 content updates in the same millisecond each step exactly +1 ms (no rounding drift)", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     // A stamp far ahead of the wall clock: every update lands in "the same
     // millisecond" as far as MAX(now, previous + 1 ms) is concerned.
@@ -779,7 +790,7 @@ describe("per-key stamps are strictly increasing on one host", () => {
   });
 
   test("1000 back-to-back content updates at the real clock never repeat a stamp", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     const update = database.query("UPDATE claude_messages SET tokens_in = ? WHERE uuid = 'm1'");
     const read = database.query("SELECT sync_updated_at FROM claude_messages WHERE uuid = 'm1'");
@@ -793,7 +804,7 @@ describe("per-key stamps are strictly increasing on one host", () => {
   });
 
   test("a delete's tombstone is stamped after the deleted version", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(`UPDATE gh_pull_requests SET sync_updated_at = '${FUTURE_STAMP}'`);
     database.exec("DELETE FROM gh_pull_requests");
@@ -805,7 +816,7 @@ describe("per-key stamps are strictly increasing on one host", () => {
   });
 
   test("a re-insert is stamped after the key's tombstone, which stays and loses by stamp", () => {
-    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    const database = openSynced(":memory:", { hostSlug: "host-a" });
     seedMirrors(database);
     database.exec(`UPDATE claude_messages SET sync_updated_at = '${FUTURE_STAMP}'`);
     database.exec("DELETE FROM claude_messages");

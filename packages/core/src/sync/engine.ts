@@ -12,6 +12,7 @@ import { newUlid } from "../intent/ids";
 import { type RebuildOptions, rebuildAll } from "../intent/projections";
 import { registerAllProjections } from "../intent/projections/register";
 import { MIRROR_SYNC_COLUMNS, SYNCED_UPSERT_TABLES, type SyncedUpsertTable } from "./tables";
+import { enableMirrorSync } from "./triggers";
 
 export type SqlValue = string | number | bigint | null;
 
@@ -354,6 +355,10 @@ export async function runSyncEngine(
   const own = options.hostSlug;
   const rebuild = options.rebuildProjections ?? defaultRebuild;
   const warn = options.warn ?? ((message: string) => console.error(message));
+  // First, before any network call: sync is in use from here on, so the
+  // mirror triggers go in (once) and rows written without them are stamped
+  // and dirtied, ready for the push below.
+  enableMirrorSync(database);
   // Before any network call: a previous run's pulled events must be
   // projected even when this run is push-only or cannot reach the server.
   // A failure here must not block push and pull (new local work would never
