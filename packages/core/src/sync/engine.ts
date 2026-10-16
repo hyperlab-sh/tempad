@@ -70,6 +70,9 @@ export const REMOTE_SCHEMA: readonly string[] = [
   "CREATE TABLE IF NOT EXISTS sync_events (uid TEXT PRIMARY KEY, data TEXT NOT NULL, sync_host TEXT NOT NULL, seq INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS sync_rows_seq ON sync_rows(seq)",
   "CREATE INDEX IF NOT EXISTS sync_events_seq ON sync_events(seq)",
+  // The own-history check reads a host's newest entry on every run.
+  "CREATE INDEX IF NOT EXISTS sync_rows_host_seq ON sync_rows(sync_host, seq)",
+  "CREATE INDEX IF NOT EXISTS sync_events_host_seq ON sync_events(sync_host, seq)",
 ];
 
 /** Columns of `events` that are not content (the payload never carries them). */
@@ -98,7 +101,11 @@ const RESEED_PENDING = "reseed_pending";
  * (compare-and-delete) once a pull has run to the end. While it is set the
  * pull takes this host's own rows and events too: a machine reinstalled or
  * restored under the same HOST_SLUG starts with an empty database and must
- * get back what it pushed before. Own rows tie on `(stamp, host)` or lose
+ * get back what it pushed before. It is also set, with the same cursor
+ * reset, when the server's newest own event or row is missing locally
+ * (`ownHistoryMissing`): a tempad.db restored from an older backup keeps
+ * its server id, cursors and probes, so it never looks unknown, yet lacks
+ * everything it pushed after that backup. Own rows tie on `(stamp, host)` or lose
  * to a newer local version, and own events dedupe by uid, so the only cost
  * is bandwidth during one full pull.
  */
@@ -175,6 +182,54 @@ async function pushProbeLost(database: Database, remote: SyncRemote): Promise<bo
     if (found.length === 0) return true;
   }
   return false;
+}
+
+/**
+ * Whether the server holds own history this database lacks: the newest
+ * event, or the newest mirror row or tombstone, tagged with this host's
+ * slug (by server seq) is not held locally at that version or newer. In
+ * normal operation the newest own entry is one this database pushed, so it
+ * never fires; a false positive costs one full pull.
+ */
+async function ownHistoryMissing(
+  database: Database,
+  remote: SyncRemote,
+  own: string,
+  shapes: Map<string, MirrorShape>,
+): Promise<boolean> {
+  const [event] = await remote.query(
+    "SELECT uid FROM sync_events WHERE sync_host = ? ORDER BY seq DESC LIMIT 1",
+    [own],
+  );
+  if (
+    event !== undefined &&
+    database.query("SELECT 1 FROM events WHERE uid = ?").get(String(event.uid)) === null
+  ) {
+    return true;
+  }
+  const [row] = await remote.query(
+    "SELECT tbl, pk, sync_updated_at FROM sync_rows WHERE sync_host = ? ORDER BY seq DESC LIMIT 1",
+    [own],
+  );
+  if (row === undefined) return false;
+  const shape = shapes.get(String(row.tbl));
+  if (shape === undefined) return false; // a table this schema does not have
+  const pushed: [string, string] = [String(row.sync_updated_at), own];
+  const keyValues = JSON.parse(String(row.pk)) as SqlValue[];
+  const keyWhere = shape.table.keyColumns.map((column) => `${quoted(column)} = ?`).join(" AND ");
+  const local = database
+    .query(`SELECT sync_updated_at, sync_host FROM ${shape.table.name} WHERE ${keyWhere}`)
+    .get(...keyValues) as { sync_updated_at: string | null; sync_host: string | null } | null;
+  if (local !== null && !isNewer(pushed, [local.sync_updated_at ?? "", local.sync_host ?? own])) {
+    return false;
+  }
+  const tombstone = database
+    .query("SELECT deleted_at, sync_host FROM sync_tombstones WHERE tbl = ? AND pk = ?")
+    .get(shape.table.name, String(row.pk)) as {
+    deleted_at: string;
+    sync_host: string | null;
+  } | null;
+  return tombstone === null || isNewer(pushed, [tombstone.deleted_at, tombstone.sync_host ?? own]);
 }
 
 function storeRowProbe(database: Database, tbl: string, pk: string, stamp: string, host: string) {
@@ -386,6 +441,21 @@ export async function runSyncEngine(
   }
 
   const shapes = mirrorShapes(database);
+  if (
+    !unknown &&
+    localMeta(database, PULL_OWN_PENDING) === null &&
+    (await ownHistoryMissing(database, remote, own, shapes))
+  ) {
+    // Restored from an older backup: the server is fine and knows this
+    // host, but this database lacks writes it pushed later. No re-seed
+    // (nothing on the server is missing); pull everything from 0, own rows
+    // included. Durable like the unknown path: a push-only or interrupted
+    // run keeps the marker and the reset cursors.
+    database.transaction(() => {
+      database.query(META_UPSERT).run(PULL_OWN_PENDING, newUlid());
+      database.exec("DELETE FROM sync_cursors");
+    })();
+  }
   const summary: SyncRunSummary = {
     pushed: { events: 0, rows: 0, tombstones: 0 },
     pulled: { events: 0, rows: 0, tombstones: 0 },
