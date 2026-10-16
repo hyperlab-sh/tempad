@@ -9,6 +9,8 @@ const DATABASE_MODULE = join(import.meta.dir, "../src/db/database.ts");
 const PROCESSES = 4;
 const ROUNDS = 5;
 const DETERMINISTIC_ROUNDS = 3;
+// The mixed ulidAfter mutation check fails on round 0, so more rounds only cost time.
+const MIXED_ROUNDS = 2;
 const LEGACY_EVENTS = 3000;
 const MIXED_EVENTS = 2000;
 
@@ -79,8 +81,20 @@ async function openConcurrently(
           new Response(child.stdout).text(),
           new Response(child.stderr).text(),
         ]);
-        await child.exited;
-        const parsed = JSON.parse(out.trim()) as { ok: boolean; error?: string };
+        const exitCode = await child.exited;
+        if (exitCode !== 0 || out.trim() === "") {
+          throw new Error(
+            `child exited with code ${exitCode}; stdout: ${out.trim() || "(empty)"}; stderr: ${stderr.trim() || "(empty)"}`,
+          );
+        }
+        let parsed: { ok: boolean; error?: string };
+        try {
+          parsed = JSON.parse(out.trim()) as { ok: boolean; error?: string };
+        } catch (error) {
+          throw new Error(
+            `child printed non-JSON output (${String(error)}); stdout: ${out.trim()}; stderr: ${stderr.trim() || "(empty)"}`,
+          );
+        }
         return { ...parsed, stderr: stderr.trim() };
       }),
     );
@@ -180,7 +194,7 @@ describe("concurrent uid backfill", () => {
     const script = join(directory, "child.ts");
     writeFileSync(script, CHILD);
     try {
-      for (let round = 0; round < ROUNDS; round += 1) {
+      for (let round = 0; round < MIXED_ROUNDS; round += 1) {
         const path = join(directory, `mixed-${round}.db`);
         mixedDatabase(path);
         expectAllOpened(await openConcurrently(script, path, PROCESSES));

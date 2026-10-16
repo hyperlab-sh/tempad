@@ -597,9 +597,10 @@ export function reresolveSessions(
   let moved = 0;
   for (const row of rows) {
     const resolveTarget = row.cwd ?? decodeProjectDir(row.project_dir);
-    if (!matchesPath(normalizedUnderPath, normalizePathForMatch(resolveTarget, home))) continue;
+    const normalizedTarget = normalizePathForMatch(resolveTarget, home);
+    if (!matchesPath(normalizedUnderPath, normalizedTarget)) continue;
 
-    const resolved = resolvePath(rules, resolveTarget);
+    const resolved = resolvePath(rules, resolveTarget, normalizedTarget);
     update.run(
       resolved.org,
       resolved.project,

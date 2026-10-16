@@ -236,9 +236,18 @@ export function matchesPath(underPath: string, candidatePath: string): boolean {
   return a.startsWith(b);
 }
 
-export function resolvePath(rules: Rules, absolutePath: string): ResolvedPath {
-  const home = homedir();
-  const normalizedInput = normalizePathForMatch(absolutePath, home);
+/**
+ * `normalizedPath` is `normalizePathForMatch(absolutePath, homedir())` when the
+ * caller already computed it (each normalization costs an `existsSync` plus a
+ * `realpathSync` per ancestor); omitted, it is computed here. `path` rules match
+ * against it, `pattern` rules still see the raw `absolutePath`.
+ */
+export function resolvePath(
+  rules: Rules,
+  absolutePath: string,
+  normalizedPath?: string,
+): ResolvedPath {
+  const normalizedInput = normalizedPath ?? normalizePathForMatch(absolutePath, homedir());
 
   for (const rule of rules.projects) {
     if (rule.kind === "path") {
