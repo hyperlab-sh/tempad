@@ -70,8 +70,9 @@ quest's `quest.created`. The projection put a quest id into the parent's
 (a `deviates_from` naming a quest other than the subject, created at the event's
 own `at`) and reads it as the new quest deviating from the subject. Any other
 quest id in `deviates_from` (a hand-run `quest branch` before it learned quest
-ids) reads as the subject deviating from that quest. `tempad rebuild` applies
-this to an existing database.
+ids) reads as the subject deviating from that quest. Migration 0024 replays the
+`quests` table through this reducer, so an existing database is repaired on
+upgrade.
 
 `advances` has no column yet: nothing in this codebase wrote the old `parent`
 relation, so there was nothing to rename. The legacy map already translates a

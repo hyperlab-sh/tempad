@@ -5,6 +5,7 @@
 -- naming a stint only. The `quests` projection fills both from
 -- `quest.branched` events, including the inverted ones `declare` wrote before
 -- this change (see the `quest.branched` case in
--- src/intent/projections/quest.ts). Run `tempad rebuild` once to re-project
--- existing rows.
+-- src/intent/projections/quest.ts). The TypeScript half of this migration
+-- (reprojectQuests, src/db/database.ts) replays the quests table from the
+-- event log in the same transaction, so existing rows are repaired here.
 ALTER TABLE quests ADD COLUMN deviates_from_quest_id TEXT;

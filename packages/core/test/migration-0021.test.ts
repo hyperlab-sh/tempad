@@ -301,8 +301,10 @@ describe("migration 0021_normalize_commit_dates", () => {
       expect(commitsBefore.length).toBeGreaterThan(0);
       old.close();
 
-      const database = openDatabase(path);
-      expect(userVersion(database)).toBe(24);
+      // Stops at 23: the report fixture inserts quest rows by hand with no
+      // events behind them, and 0024's step re-projects quests from events.
+      const database = openDatabase(path, { upToVersion: 23 });
+      expect(userVersion(database)).toBe(23);
       expect(snapshot(database)).toEqual(commitsBefore);
       expect(render(database)).toEqual(before);
       database.close();

@@ -154,7 +154,9 @@ describe("migration 0011", () => {
     old.query("INSERT INTO quests VALUES ('Q1', 'G1', 'an outcome', 'S0')").run();
     old.close();
 
-    const database = openDatabase(path);
+    // Stop before 0024: its step re-projects `quests` from the event log, and
+    // this hand-built row has no events behind it.
+    const database = openDatabase(path, { upToVersion: 23 });
 
     expect(
       (database.query("PRAGMA user_version").get() as { user_version: number }).user_version,
