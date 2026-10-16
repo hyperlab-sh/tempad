@@ -598,7 +598,7 @@ describe("races with another process", () => {
 
 describe("reconcile runs once per upgrade", () => {
   test(
-    "only the last pending migration reconciles, never an intermediate one, and an unchanged reopen not at all",
+    "reconcile runs once, at the end of the block from 22, and an unchanged reopen not at all",
     withDirectory((path) => {
       const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
       seedMirrors(old);
@@ -797,21 +797,25 @@ describe("migrations from 22 on apply as one transaction", () => {
   );
 
   test(
-    "a second process that already applied part of the block: the rest runs, reconciled once",
+    "a second process that already applied part of the block: only the rest runs, reconciled once",
     withDirectory((path) => {
       const old = openDatabase(path, { upToVersion: 21, hostSlug: "host-a" });
       seedMirrors(old);
       old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
       old.close();
 
+      // 23 fails if it runs twice, so re-running what the other process
+      // already applied would throw (CREATE TABLE, not ADD COLUMN, which
+      // runMigration tolerates as a duplicate).
       const chain = [
         ...migrationFiles.loadMigrations(),
-        { version: 23, sql: "UPDATE gh_commits SET subject = subject || ' (23)';" },
+        { version: 23, sql: "CREATE TABLE t23 (x);" },
+        { version: 24, sql: "CREATE TABLE t24 (x);" },
       ];
-      // Another process got 22 in after this one read user_version 21.
+      // Another process got 22 and 23 in after this one read user_version 21.
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => {
         load.mockImplementation(() => chain);
-        openDatabase(path, { hostSlug: "host-a", upToVersion: 22 }).close();
+        openDatabase(path, { hostSlug: "host-a", upToVersion: 23 }).close();
         return chain;
       });
       const original = triggers.reconcileMirrorTriggers;
@@ -820,13 +824,17 @@ describe("migrations from 22 on apply as one transaction", () => {
       );
       try {
         const upgraded = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(upgraded)).toBe(23);
-        // Once by the other process's 22, once here at the end of 23.
+        expect(userVersion(upgraded)).toBe(24);
+        // Once at the end of the other process's 22..23, once here after 24.
         expect(reconcile).toHaveBeenCalledTimes(2);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
-        expect(upgraded.query("SELECT subject FROM gh_commits").all()).toEqual([
-          { subject: "fix it (23)" },
-        ]);
+        expect(
+          upgraded
+            .query(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('t23', 't24') ORDER BY name",
+            )
+            .all(),
+        ).toEqual([{ name: "t23" }, { name: "t24" }]);
         upgraded.close();
       } finally {
         reconcile.mockRestore();
