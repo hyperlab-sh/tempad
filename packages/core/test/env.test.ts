@@ -411,6 +411,16 @@ describe("ignoreWorkingDirectoryEnvFiles", () => {
     expect(environment).toEqual({ DATABASE_URL: "postgres://x" });
   });
 
+  test("strips TEMPAD_SYNC_TOKEN injected by a project .env, keeps a different caller value", () => {
+    writeFileSync(join(cwd, ".env"), "TEMPAD_SYNC_TOKEN=project-token-from-cwd\n");
+    const injected: NodeJS.ProcessEnv = { TEMPAD_SYNC_TOKEN: "project-token-from-cwd" };
+    ignoreWorkingDirectoryEnvFiles(cwd, injected, []);
+    expect(injected).toEqual({});
+    const exported: NodeJS.ProcessEnv = { TEMPAD_SYNC_TOKEN: "caller-token" };
+    ignoreWorkingDirectoryEnvFiles(cwd, exported, []);
+    expect(exported.TEMPAD_SYNC_TOKEN).toBe("caller-token");
+  });
+
   test("also strips TEMPAD_HOME and ANTHROPIC_API_KEY injected by a project .env", () => {
     writeFileSync(join(cwd, ".env"), "TEMPAD_HOME=/evil\nANTHROPIC_API_KEY=sk-project");
     const environment: NodeJS.ProcessEnv = {

@@ -214,7 +214,14 @@ export const NOT_SET_UP_MESSAGE = `tempad is not set up yet; ${SETUP_HINT}`;
  * a stranger's file could override.
  */
 function guardedNames(): string[] {
-  return [...ENV_VARS.map((variable) => variable.name), "TEMPAD_HOME", "ANTHROPIC_API_KEY"];
+  return [
+    ...ENV_VARS.map((variable) => variable.name),
+    "TEMPAD_HOME",
+    "ANTHROPIC_API_KEY",
+    // Push sync's bearer token: a project's .env must never pick the server
+    // credential (loadSyncConfig prefers process.env over TEMPAD_HOME/.env).
+    "TEMPAD_SYNC_TOKEN",
+  ];
 }
 
 /** The files Bun auto-loads from the working directory, in its precedence order. */
