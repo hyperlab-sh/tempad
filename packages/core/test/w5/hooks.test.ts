@@ -575,6 +575,39 @@ describe("hook scripts: configuration and stand-down", () => {
     });
   }
 
+  test("plugin source stands down for a legacy hook in CLAUDE_CONFIG_DIR/settings.json", async () => {
+    const dir = configuredHome();
+    try {
+      const argvLog = join(dir, "argv.log");
+      const fakeCli = join(dir, "tempad");
+      writeFakeCli(fakeCli, argvLog);
+      const configDirectory = join(dir, "work-account");
+      writeLegacySettings(join(configDirectory, "settings.json"));
+
+      const env = hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" });
+      const withoutConfigDir = await runScript("w5-stop.sh", stopPayload, env);
+      expect(withoutConfigDir.exitCode).toBe(0);
+      expect(existsSync(argvLog)).toBe(true);
+      rmSync(argvLog);
+
+      const result = await runScript("w5-stop.sh", stopPayload, {
+        ...env,
+        CLAUDE_CONFIG_DIR: configDirectory,
+      });
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(existsSync(argvLog)).toBe(false);
+
+      // Legacy invocation is never affected by it.
+      await runScript("w5-stop.sh", stopPayload, {
+        ...hookEnv(dir, { TEMPAD_BIN: fakeCli }),
+        CLAUDE_CONFIG_DIR: configDirectory,
+      });
+      expect(existsSync(argvLog)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("plugin source runs when settings exist but carry no tempad marker", async () => {
     const dir = configuredHome();
     try {
@@ -741,6 +774,35 @@ describe("hook scripts: CLI resolution", () => {
     }
   });
 
+  test("tab, CR and other control characters in the context still produce valid JSON", async () => {
+    const dir = configuredHome();
+    try {
+      const fakeCli = join(dir, "tempad");
+      writeFileSync(
+        fakeCli,
+        "#!/bin/sh\nprintf 'Fix\\tthe \"flake\" \\\\ ok\\r\\nline2\\001\\033 end\\n'\n",
+      );
+      chmodSync(fakeCli, 0o755);
+
+      const result = await runScript(
+        "w5-prompt.sh",
+        stopPayload,
+        hookEnv(dir, { TEMPAD_BIN: fakeCli }),
+      );
+
+      expect(result.stdout.endsWith("\n")).toBe(true);
+      expect(result.stdout.trimEnd().split("\n")).toHaveLength(1);
+      expect(JSON.parse(result.stdout)).toEqual({
+        hookSpecificOutput: {
+          hookEventName: "UserPromptSubmit",
+          additionalContext: 'Fix\tthe "flake" \\ ok\nline2 end\n',
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("the prompt script's JSON output format is unchanged", async () => {
     const dir = configuredHome();
     try {
@@ -797,6 +859,13 @@ describe("plugin manifest and hooks.json", () => {
       expect(existsSync(join(REPOSITORY_ROOT, "packages", "core", "hooks", script))).toBe(true);
     }
     expect(hooksJson.hooks.UserPromptSubmit[0].hooks[0].timeout).toBeLessThanOrEqual(15);
+  });
+
+  test("Stop, PreCompact and SessionEnd run async; UserPromptSubmit stays synchronous (its stdout is the context)", () => {
+    for (const eventName of ["Stop", "PreCompact", "SessionEnd"]) {
+      expect(hooksJson.hooks[eventName][0].hooks[0].async).toBe(true);
+    }
+    expect(hooksJson.hooks.UserPromptSubmit[0].hooks[0].async).toBeUndefined();
   });
 
   test("no absolute path appears anywhere outside CLAUDE_PLUGIN_ROOT", () => {
