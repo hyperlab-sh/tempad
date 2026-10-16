@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve as resolvePathname } from "node:path";
+import { basename, dirname, join, resolve as resolvePathname } from "node:path";
 
 export interface PathRule {
   pattern?: string;
@@ -70,8 +70,8 @@ function stripTrailingSlash(path: string): string {
 }
 
 /**
- * `~`-expands, resolves symlinks (falling back to plain path resolution when
- * the path doesn't exist yet, e.g. a `path` rule for a folder created after
+ * `~`-expands, resolves symlinks (resolving only the deepest existing ancestor
+ * when the path doesn't exist, e.g. a `path` rule for a folder created after
  * being registered), and strips a trailing slash -- applied to both a
  * `path` rule's configured folder (at load time) and the `cwd` it's matched
  * against (at match time), so `~/work/x/`, a symlinked component, or a
@@ -80,8 +80,26 @@ function stripTrailingSlash(path: string): string {
  */
 export function normalizePathForMatch(path: string, home: string): string {
   const expanded = expandHome(path, home);
-  const resolved = existsSync(expanded) ? realpathSync(expanded) : resolvePathname(expanded);
-  return stripTrailingSlash(resolved);
+  return stripTrailingSlash(realpathThroughExistingAncestor(resolvePathname(expanded)));
+}
+
+/**
+ * `realpathSync` of the deepest ancestor that exists, with the missing tail
+ * re-appended. A `cwd` that no longer exists (or a rule for a folder not yet
+ * created) under a symlinked parent must still resolve through that parent,
+ * or it would never compare equal to the same location reached via the real
+ * path.
+ */
+function realpathThroughExistingAncestor(absolute: string): string {
+  const missing: string[] = [];
+  let current = absolute;
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) return absolute;
+    missing.unshift(basename(current));
+    current = parent;
+  }
+  return join(realpathSync(current), ...missing);
 }
 
 function pathsEqual(a: string, b: string): boolean {
