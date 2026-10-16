@@ -1,6 +1,7 @@
 import { Database as BunDatabase, type Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import { join } from "node:path";
 import { type RebuildOptions, rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import {
@@ -1043,5 +1044,110 @@ describe("event uid collisions are loud", () => {
     await sync(hostA, fresh, "host-a");
     await sync(hostB, fresh, "host-b");
     expect(sourceSnapshot(hostA).events).toEqual(sourceSnapshot(hostB).events);
+  });
+});
+
+/** Fails the `failOn`-th rows page read (pull), passing everything else through. */
+function failingOnQuery(remote: SyncRemote, failOn: number): SyncRemote {
+  let pages = 0;
+  return {
+    async query(sql, args) {
+      if (sql.includes("FROM sync_rows") && sql.includes("seq > ?")) {
+        pages += 1;
+        if (pages === failOn) throw new Error("injected remote failure");
+      }
+      return remote.query(sql, args);
+    },
+    write: (statements) => remote.write(statements),
+    close: () => remote.close(),
+  };
+}
+
+describe("a host reinstalled under the same HOST_SLUG", () => {
+  let root: string;
+  let server: FakeRemote;
+
+  beforeEach(() => {
+    root = temporaryDirectory();
+    server = new FakeRemote();
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function wipe(slug: string): void {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      rmSync(join(root, `${slug}.db${suffix}`), { force: true });
+    }
+  }
+
+  test("gets its own history back, rows, events and projections", async () => {
+    const laptop = openHost(root, "laptop");
+    addRepository(laptop, "acme/web");
+    for (let index = 0; index < 5; index++) addCommit(laptop, `c${index}`, "acme/web", `s${index}`);
+    addMondayItem(laptop, 0, "zero");
+    await intent(laptop, ["hero", "init", "Saulo"]);
+    await intent(laptop, ["party", "add", "acme", "Acme"]);
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 2, ...both });
+    const before = { source: sourceSnapshot(laptop), projections: projectionSnapshot(laptop) };
+    laptop.close();
+    wipe("laptop");
+
+    const fresh = openHost(root, "laptop");
+    const other = openHost(root, "desktop");
+    try {
+      const summary = await runSyncEngine(fresh, server, {
+        hostSlug: "laptop",
+        batchSize: 2,
+        ...both,
+      });
+      expect(summary.pulled.rows).toBe(7);
+      expect(summary.pulled.events).toBe(before.source.events?.length ?? -1);
+      expect(summary.rebuilt).toBe(true);
+      await runSyncEngine(other, server, { hostSlug: "desktop", batchSize: 2, ...both });
+      // Pulled rows come back clean; the snapshot compares everything else.
+      expect(sourceSnapshot(fresh)).toEqual(sourceSnapshot(other));
+      expect(projectionSnapshot(fresh)).toEqual(before.projections);
+      expect(projectionSnapshot(fresh)).toEqual(projectionSnapshot(other));
+      expect(
+        fresh.query("SELECT 1 FROM sync_meta WHERE key = 'pull_own_pending'").get(),
+      ).toBeNull();
+
+      // Afterwards own rows are skipped again: nothing comes back.
+      const again = await runSyncEngine(fresh, server, {
+        hostSlug: "laptop",
+        batchSize: 2,
+        ...both,
+      });
+      expect(again.pulled).toEqual({ events: 0, rows: 0, tombstones: 0 });
+      expect(again.pushed).toEqual({ events: 0, rows: 0, tombstones: 0 });
+    } finally {
+      fresh.close();
+      other.close();
+    }
+  });
+
+  test("a pull that dies part-way keeps taking own rows on the next run", async () => {
+    const laptop = openHost(root, "laptop");
+    for (let index = 1; index <= 6; index++) addMondayItem(laptop, index, `m${index}`);
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 1, ...both });
+    laptop.close();
+    wipe("laptop");
+
+    const fresh = openHost(root, "laptop");
+    try {
+      const flaky = failingOnQuery(server, 4);
+      await expect(
+        runSyncEngine(fresh, flaky, { hostSlug: "laptop", batchSize: 1, ...both }),
+      ).rejects.toThrow("injected remote failure");
+      expect(
+        fresh.query("SELECT 1 FROM sync_meta WHERE key = 'pull_own_pending'").get(),
+      ).not.toBeNull();
+      await runSyncEngine(fresh, server, { hostSlug: "laptop", batchSize: 1, ...both });
+      expect(count(fresh, "SELECT COUNT(*) AS n FROM monday_items")).toBe(6);
+    } finally {
+      fresh.close();
+    }
   });
 });
