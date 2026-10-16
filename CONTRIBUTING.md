@@ -2,16 +2,16 @@
 
 ## Reporting bugs
 
-Open a [bug report](https://github.com/svallory/tempad/issues/new?template=bug_report.yml). Include the command you ran, the output, and the versions of Bun and TemPad.
+Open a [bug report](https://github.com/hyperlab-sh/tempad/issues/new?template=bug_report.yml). Include the command you ran, the output, and the versions of Bun and TemPad.
 
 ## Suggesting features
 
-Open a [feature request](https://github.com/svallory/tempad/issues/new?template=feature_request.yml). Describe the problem before the solution.
+Open a [feature request](https://github.com/hyperlab-sh/tempad/issues/new?template=feature_request.yml). Describe the problem before the solution.
 
 ## Development setup
 
 ```sh
-git clone git@github.com:svallory/tempad.git
+git clone git@github.com:hyperlab-sh/tempad.git
 cd tempad
 bun install
 bun run lint
@@ -36,4 +36,4 @@ bun test
 
 ## Questions
 
-Use [GitHub Discussions](https://github.com/svallory/tempad/discussions).
+Use [GitHub Discussions](https://github.com/hyperlab-sh/tempad/discussions).

@@ -2,7 +2,7 @@
 
 > Reconstruct what you, and your agents, worked on, hour by hour, from git, Monday.com and Claude Code sessions.
 
-[![CI](https://github.com/svallory/tempad/actions/workflows/ci.yml/badge.svg)](https://github.com/svallory/tempad/actions/workflows/ci.yml)
+[![CI](https://github.com/hyperlab-sh/tempad/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperlab-sh/tempad/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-orange.svg)](LICENSE)
 
 <p align="center">
