@@ -20,7 +20,7 @@ Out of scope for this spec: the Go TUI, the `w5` hook and skill (separate spec),
 
 ```
 packages/core/
-  package.json          name: @tempad/core, bin: tempad
+  package.json          name: @hyperlab.sh/tempad, bin: tempad
   moon.yml              tasks: lint, typecheck, test, sync, report
   tsconfig.json
   .env.example
