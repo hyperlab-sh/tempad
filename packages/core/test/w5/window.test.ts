@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { openDatabase } from "../../src/db/database";
 import { declareQuest } from "../../src/intent/declarations";
-import { ensureTables } from "../../src/intent/projections";
+import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import { buildWindow, findSessionFile } from "../../src/w5/window";
@@ -259,6 +259,48 @@ describe("window builder", () => {
 
     expect(window.recentSideQuests).toEqual([
       { id: "Q2", title: "Compare Astryx", trigger: "what does Astryx do for agents?" },
+    ]);
+  });
+
+  test("recentSideQuests includes a side quest that deviates from a quest rather than a stint", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedOpenStint(database);
+    const store = new EventStore(database);
+    const append = (event: Parameters<EventStore["append"]>[0]) =>
+      applyIncremental(database, store.append(event));
+    append({
+      actor: "hero",
+      kind: "quest.created",
+      subject: "Q3",
+      at: "2026-09-04T12:30:00.000Z",
+      payload: { owner: { kind: "hero", id: "H1" }, title: "Silence the hook", confirmed: false },
+    });
+    // What `quest declare --new ... --deviates-from <quest>` writes: no stint,
+    // only `quests.deviates_from_quest_id`.
+    append({
+      actor: "hero",
+      kind: "quest.branched",
+      subject: "Q3",
+      at: "2026-09-04T12:30:00.000Z",
+      payload: { deviates_from_quest: "Q1", trigger: "the hook prints noise", kind: "curiosity" },
+    });
+    expect(
+      database
+        .query("SELECT deviates_from_stint_id, deviates_from_quest_id FROM quests WHERE id = 'Q3'")
+        .get(),
+    ).toEqual({ deviates_from_stint_id: null, deviates_from_quest_id: "Q1" });
+
+    const window = buildWindow(database, {
+      sessionId: "s1",
+      sinceTs: "2026-09-04T14:30:00.000Z",
+      mode: "inferred",
+      ...memoryInput,
+    });
+
+    expect(window.recentSideQuests).toEqual([
+      { id: "Q3", title: "Silence the hook", trigger: "the hook prints noise" },
     ]);
   });
 
