@@ -552,14 +552,16 @@ function applyHookAction(
 /** `YYYY-MM-DD`, or a datetime with `T`, optional fractional seconds and `Z` or `+-HH:MM`. `Date.parse` alone reads `1` as 2001-01-01. */
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/;
 
-/** The instant `value` names, or null when it is not strict ISO 8601 or not a real date (`2026-02-30`). */
+/** The instant `value` names, or null when it is not strict ISO 8601 or its calendar date is not real (`2026-02-30`). */
 function parseIsoInstant(value: string): number | null {
   if (!ISO_8601.test(value)) return null;
   const milliseconds = Date.parse(value);
   if (Number.isNaN(milliseconds)) return null;
-  if (!value.includes("T") && new Date(milliseconds).toISOString().slice(0, 10) !== value) {
-    return null;
-  }
+  // `Date.parse` rolls an impossible day over to the next month. Check the written date itself,
+  // not the parsed instant: an offset may legitimately move the instant to another UTC day.
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  const written = new Date(Date.UTC(year as number, (month as number) - 1, day as number));
+  if (written.toISOString().slice(0, 10) !== value.slice(0, 10)) return null;
   return milliseconds;
 }
 

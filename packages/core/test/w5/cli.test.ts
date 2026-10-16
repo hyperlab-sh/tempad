@@ -1276,6 +1276,8 @@ describe("w5 backfill --from", () => {
     "",
     "2026-13-45",
     "2026-02-30",
+    "2026-02-30T10:00:00Z",
+    "2026-04-31T10:00:00+02:00",
     "not a date",
     "1",
     "Oct 1",
@@ -1300,12 +1302,27 @@ describe("w5 backfill --from", () => {
     "2026-10-01T10:00:00.123Z",
     "2026-10-01T10:00:00-03:00",
     "2026-10-01T10:00:00.5+05:30",
+    "2026-10-01T23:30:00-03:00",
+    "2024-02-29T10:00:00Z",
   ]) {
     test(`--from ${good} is accepted`, async () => {
       const result = await run(["--from", good]);
       expect(result.code).toBe(0);
     });
   }
+
+  test("a datetime whose offset moves it to the next UTC day keeps the instant", async () => {
+    // 2026-10-01 23:30 at -03:00 is 2026-10-02 02:30 UTC.
+    const endedAt = "2026-10-02T02:30:00.000Z";
+    const at = await run(["--from", "2026-10-01T23:30:00-03:00"], (database) =>
+      seedSession(database, endedAt),
+    );
+    expect(at.output).toContain("failed=1");
+    const after = await run(["--from", "2026-10-01T23:30:01-03:00"], (database) =>
+      seedSession(database, endedAt),
+    );
+    expect(after.output).not.toContain("failed=1");
+  });
 
   test("a date-only --from names midnight UTC of that day", async () => {
     const day = new Date(Date.now() - 2 * DAY).toISOString().slice(0, 10);
