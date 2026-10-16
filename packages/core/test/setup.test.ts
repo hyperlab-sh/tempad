@@ -14,17 +14,17 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { ENV_VARS, loadConfig, parseDotEnv } from "../src/config/env.ts";
 import { loadRules } from "../src/config/rules.ts";
-import { flagNameFor, formatEnvValue, renderEnvFile } from "../src/init/env-file.ts";
-import { type InitDeps, runInit } from "../src/init/index.ts";
-import { createPrompter, InputAborted, InputEnded } from "../src/init/prompt.ts";
-import { renderTomlFile } from "../src/init/toml-file.ts";
+import { defaultIntentConfig, loadIntentConfig } from "../src/intent/config.ts";
+import { flagNameFor, formatEnvValue, renderEnvFile } from "../src/setup/env-file.ts";
+import { runSetup, type SetupDeps } from "../src/setup/index.ts";
+import { createPrompter, InputAborted, InputEnded } from "../src/setup/prompt.ts";
+import { renderTomlFile } from "../src/setup/toml-file.ts";
 import {
   isValidSince,
   isValidTimeZone,
   type SpawnFunction,
   type SpawnResult,
-} from "../src/init/validate.ts";
-import { defaultIntentConfig, loadIntentConfig } from "../src/intent/config.ts";
+} from "../src/setup/validate.ts";
 import { installHooks } from "../src/w5/hooks.ts";
 
 const MONDAY_TOKEN = "monday-secret-token-0123456789";
@@ -48,7 +48,7 @@ let fakeHome: string;
 let tempadHome: string;
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), "tempad-init-test-"));
+  root = mkdtempSync(join(tmpdir(), "tempad-setup-test-"));
   fakeHome = join(root, "home");
   tempadHome = join(root, "tempad-home");
   mkdirSync(join(fakeHome, ".claude", "projects"), { recursive: true });
@@ -74,7 +74,7 @@ function jsonResponse(status: number, body: unknown): FetchResponse {
 }
 
 interface Harness {
-  deps: Partial<InitDeps>;
+  deps: Partial<SetupDeps>;
   stdout: () => string;
   stderr: () => string;
   everything: () => string;
@@ -124,7 +124,7 @@ function harness(options: HarnessOptions = {}): Harness {
     stdin.end();
   }
 
-  const deps: Partial<InitDeps> = {
+  const deps: Partial<SetupDeps> = {
     env: options.env ?? {},
     homedir: fakeHome,
     stdin,
@@ -145,7 +145,7 @@ function harness(options: HarnessOptions = {}): Harness {
     everything: () => stdout.join("") + stderr.join(""),
     fetchCalls,
     spawnCalls,
-    run: (args) => runInit(args, deps),
+    run: (args) => runSetup(args, deps),
   };
 }
 
@@ -282,7 +282,7 @@ describe("non-interactive", () => {
   test("an unknown flag is a usage error (exit 2)", async () => {
     const h = harness();
     expect(await h.run(["--non-interactive", "--bogus", "x"])).toBe(2);
-    expect(h.stderr()).toContain("usage: tempad init");
+    expect(h.stderr()).toContain("usage: tempad setup");
   });
 
   test("without --non-interactive and without a terminal it fails instead of hanging", async () => {
@@ -1085,11 +1085,11 @@ describe("next steps", () => {
   });
 });
 
-describe("tempad init through the CLI", () => {
+describe("tempad setup through the CLI", () => {
   const cli = join(import.meta.dir, "..", "src", "cli.ts");
 
   async function runCli(args: string[], input: "ignore" | "pipe" = "ignore") {
-    const child = Bun.spawn([process.execPath, cli, "init", ...args], {
+    const child = Bun.spawn([process.execPath, cli, "setup", ...args], {
       cwd: root,
       env: { PATH: process.env.PATH ?? "", HOME: fakeHome },
       stdin: input,
@@ -1103,6 +1103,19 @@ describe("tempad init through the CLI", () => {
     ]);
     return { stdout, stderr, exitCode };
   }
+
+  test("the old name `init` still runs the same command", async () => {
+    const child = Bun.spawn([process.execPath, cli, "init", "--non-interactive", "--bogus"], {
+      cwd: root,
+      env: { PATH: process.env.PATH ?? "", HOME: fakeHome },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(2);
+    expect(stderr).toContain("usage: tempad setup");
+  });
 
   test("needs no configuration and opens no database", async () => {
     const result = await runCli([

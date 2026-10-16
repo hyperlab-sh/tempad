@@ -34,7 +34,7 @@ export interface EnvVar {
   /** The `Config` field the variable fills. */
   key: ConfigKey;
   description: string;
-  /** Secrets are read without echo by `tempad init` and shown as `set`, never printed. */
+  /** Secrets are read without echo by `tempad setup` and shown as `set`, never printed. */
   secret: boolean;
   kind: EnvVarKind;
   /** Optional variables never make a command fail when absent. */
@@ -43,7 +43,7 @@ export interface EnvVar {
 
 /**
  * The one table of every environment variable tempad reads. `loadConfig`,
- * `tempad init` and the error messages all read this; nothing else lists names.
+ * `tempad setup` and the error messages all read this; nothing else lists names.
  */
 export const ENV_VARS: readonly EnvVar[] = [
   {
@@ -198,12 +198,15 @@ export function tempadHome(): string {
   return configured ? expandHome(configured, user) : join(user, ".tempad");
 }
 
-/** A home is set up once `tempad init` (or a hand-written `.env`) or a database exists in it. */
+/** A home is set up once `tempad setup` / `/tempad:setup` (or a hand-written `.env`) or a database exists in it. */
 export function isConfigured(home: string): boolean {
   return existsSync(join(home, ".env")) || existsSync(join(home, "tempad.db"));
 }
 
-export const NOT_SET_UP_MESSAGE = "tempad is not set up yet; run: bunx @hyperlab.sh/tempad init";
+/** Where to send someone whose home is not configured: the skill inside Claude Code, the wizard in a terminal. */
+export const SETUP_HINT = "run /tempad:setup in Claude Code, or `tempad setup` in a terminal";
+
+export const NOT_SET_UP_MESSAGE = `tempad is not set up yet; ${SETUP_HINT}`;
 
 /**
  * Names a cwd `.env` could inject. Bun loads `./.env` into `process.env` before any
@@ -280,7 +283,7 @@ export function loadConfig<K extends ConfigKey>(
     .map((variable) => variable.name);
   if (missing.length > 0) {
     throw new ConfigError(
-      `${command} needs ${missing.join(", ")}; set ${missing.length === 1 ? "it" : "them"} in ${join(home, ".env")} or run: bunx @hyperlab.sh/tempad init`,
+      `${command} needs ${missing.join(", ")}; set ${missing.length === 1 ? "it" : "them"} in ${join(home, ".env")} or ${SETUP_HINT}`,
       command,
       missing,
     );

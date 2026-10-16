@@ -180,7 +180,7 @@ async function checkGitHub(
         headers: {
           Authorization: `Bearer ${token}`,
           Accept: "application/vnd.github+json",
-          "User-Agent": "tempad-init",
+          "User-Agent": "tempad-setup",
         },
         signal: AbortSignal.timeout(deps.timeoutMs),
       });

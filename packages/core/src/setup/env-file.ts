@@ -7,7 +7,7 @@ export function flagNameFor(variable: EnvVar): string {
 
 /**
  * Quotes a value the way `parseDotEnv` unquotes it (one outer pair of double quotes,
- * nothing inside is an escape), so what `tempad init` writes is what `loadConfig` reads.
+ * nothing inside is an escape), so what `tempad setup` writes is what `loadConfig` reads.
  * Values with whitespace, quotes, `#` or shell metacharacters are quoted so the file also
  * survives `source`. A value with a line break cannot be represented on one line.
  */
@@ -20,14 +20,14 @@ export function formatEnvValue(value: string): string {
  * The text of `<home>/.env`. Every variable of `ENV_VARS` gets a commented description;
  * an optional variable without a value is written commented out, since a blank
  * `GH_TOKEN=` would read back as an empty token rather than as unset. `extras` are
- * lines of an earlier file that `tempad init` does not own; they are carried over verbatim.
+ * lines of an earlier file that `tempad setup` does not own; they are carried over verbatim.
  */
 export function renderEnvFile(
   values: Readonly<Record<string, string>>,
   extras: Readonly<Record<string, string>> = {},
 ): string {
   const lines = [
-    "# tempad configuration, written by `tempad init`.",
+    "# tempad configuration, written by `tempad setup`.",
     "# Real environment variables win over this file. Keep it private: it holds secrets.",
   ];
   for (const variable of ENV_VARS) {

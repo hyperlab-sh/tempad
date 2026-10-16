@@ -26,11 +26,11 @@ import {
 const CHECK_TIMEOUT_MS = 5000;
 const DETECT_TIMEOUT_MS = 3000;
 
-export const INIT_USAGE =
-  "tempad init [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]";
+export const SETUP_USAGE =
+  "tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]";
 
-/** Everything `runInit` touches outside the file system, injectable so tests never hit the network. */
-export interface InitDeps {
+/** Everything `runSetup` touches outside the file system, injectable so tests never hit the network. */
+export interface SetupDeps {
   env: Readonly<Record<string, string | undefined>>;
   homedir: string;
   stdin: PromptInput;
@@ -64,7 +64,7 @@ export const spawnWithTimeout: SpawnFunction = async (command, { timeoutMs }) =>
   }
 };
 
-export function defaultInitDeps(): InitDeps {
+export function defaultSetupDeps(): SetupDeps {
   return {
     env: process.env,
     homedir: process.env.HOME ?? osHomedir(),
@@ -109,7 +109,7 @@ function blocking(findings: readonly Finding[]): Finding[] {
 }
 
 /** The user `settings.json` a legacy `tempad w5 hook install` may have written to. */
-function legacyHookSettingsPath(deps: InitDeps): string {
+function legacyHookSettingsPath(deps: SetupDeps): string {
   return settingsPathFor("user", {
     CLAUDE_CONFIG_DIR: deps.env.CLAUDE_CONFIG_DIR,
     HOME: deps.homedir,
@@ -125,7 +125,7 @@ interface Options {
   flagValues: Map<string, string>;
 }
 
-function parseOptions(args: string[], deps: InitDeps): Options {
+function parseOptions(args: string[], deps: SetupDeps): Options {
   const { values } = parseArgs({
     args,
     options: {
@@ -200,12 +200,15 @@ function describeValue(variable: EnvVar, value: string | undefined): string {
 }
 
 /**
- * `tempad init`: creates `TEMPAD_HOME` with a private `.env` and a commented `tempad.toml`.
+ * `tempad setup`: creates `TEMPAD_HOME` with a private `.env` and a commented `tempad.toml`.
  * Needs no configuration and never opens the database. Returns the exit code: 0 done,
  * 1 refused or failed, 2 bad usage, 130 aborted with Ctrl-C (nothing written).
  */
-export async function runInit(args: string[], overrides: Partial<InitDeps> = {}): Promise<number> {
-  const deps: InitDeps = { ...defaultInitDeps(), ...overrides };
+export async function runSetup(
+  args: string[],
+  overrides: Partial<SetupDeps> = {},
+): Promise<number> {
+  const deps: SetupDeps = { ...defaultSetupDeps(), ...overrides };
   const secrets = new Set<string>();
   const redact = (text: string): string => {
     let result = text;
@@ -221,8 +224,8 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
   try {
     options = parseOptions(args, deps);
   } catch (error) {
-    errLine(`tempad init: ${error instanceof Error ? error.message : String(error)}`);
-    errLine(`usage: ${INIT_USAGE}`);
+    errLine(`tempad setup: ${error instanceof Error ? error.message : String(error)}`);
+    errLine(`usage: ${SETUP_USAGE}`);
     return 2;
   }
 
@@ -235,7 +238,7 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
 
   if (!options.nonInteractive && !deps.isTTY) {
     errLine(
-      "tempad init: stdin is not a terminal, so it cannot ask questions. " +
+      "tempad setup: stdin is not a terminal, so it cannot ask questions. " +
         `Rerun with --non-interactive and one flag per variable, e.g. ${ENV_VARS.filter(
           (variable) => !variable.optional,
         )
@@ -254,7 +257,7 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
   noteSecrets(ENV_VARS.map((variable) => [variable.name, deps.env[variable.name]]));
 
   if (options.nonInteractive && envExists && !options.force) {
-    errLine(`tempad init: ${envPath} already exists; rerun with --force to overwrite it`);
+    errLine(`tempad setup: ${envPath} already exists; rerun with --force to overwrite it`);
     return 1;
   }
 
@@ -276,17 +279,17 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
         values[variable.name] = value;
       }
       if (missing.length > 0) {
-        errLine(`tempad init: missing required value(s): ${missing.join(", ")}`);
+        errLine(`tempad setup: missing required value(s): ${missing.join(", ")}`);
         errLine("Pass each as a flag, or set it in the environment.");
         return 1;
       }
       const invalid = validateFormat(ENV_VARS, values);
       if (invalid.length > 0) {
-        for (const finding of invalid) errLine(`tempad init: ${finding.message}`);
+        for (const finding of invalid) errLine(`tempad setup: ${finding.message}`);
         return 1;
       }
     } else {
-      outLine(`tempad init: setting up ${options.home}`);
+      outLine(`tempad setup: setting up ${options.home}`);
       if (envExists && !options.force) {
         const proceed = await prompter.confirm(`${envPath} already exists. Update it?`);
         if (!proceed) {
@@ -362,7 +365,7 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
       if (problems.length > 0) {
         if (prompter === undefined) {
           errLine(
-            `tempad init: ${problems.length} check(s) failed or could not be verified; fix them or rerun with --no-verify`,
+            `tempad setup: ${problems.length} check(s) failed or could not be verified; fix them or rerun with --no-verify`,
           );
           return 1;
         }
@@ -422,14 +425,14 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
     return 0;
   } catch (error) {
     if (error instanceof InputAborted) {
-      errLine("tempad init: aborted; nothing was written");
+      errLine("tempad setup: aborted; nothing was written");
       return 130;
     }
     if (error instanceof InputEnded) {
-      errLine(`tempad init: ${error.message}; nothing was written`);
+      errLine(`tempad setup: ${error.message}; nothing was written`);
       return 1;
     }
-    errLine(`tempad init: ${error instanceof Error ? error.message : String(error)}`);
+    errLine(`tempad setup: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   } finally {
     prompter?.close();
