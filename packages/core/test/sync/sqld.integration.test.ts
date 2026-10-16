@@ -13,6 +13,7 @@ import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, type KeyObject, randomBytes, sign } from "node:crypto";
 import { rmSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import type { SyncConfig } from "../../src/sync/config";
 import { runSyncEngine, type SyncRemote } from "../../src/sync/engine";
@@ -36,6 +37,10 @@ import {
 const IMAGE =
   "ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67";
 const LABEL = "tempad-test=sqld";
+const OWNER_LABEL = "tempad-test-owner";
+/** `<hostname>:<pid>:<start ms>` of this test process. */
+const OWNER = `${hostname()}:${process.pid}:${Date.now()}`;
+const STALE_AFTER_MS = 30 * 60_000;
 const PULL_TIMEOUT_MS = 300_000;
 const DOCKER_TIMEOUT_MS = 60_000;
 
@@ -110,9 +115,53 @@ async function removeContainers(names: string[]): Promise<void> {
 }
 
 /** Removes labelled containers a killed earlier run left behind. */
+function ownerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the pid exists but belongs to someone else, so it is alive.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Whether a leftover test container may be removed. Another run of this
+ * suite (a parallel worktree, a second agent) may be using its own right
+ * now, so only two cases qualify: its owner ran on this machine and that
+ * process is gone, or it is older than STALE_AFTER_MS. A container whose
+ * owner runs on this machine and is alive is never touched, however old;
+ * one with no parseable owner (an older version of this suite) or another
+ * machine's owner goes by age alone.
+ */
+function sweepable(owner: string, createdAt: string, now: number): boolean {
+  const match = /^(.+):(\d+):(\d+)$/.exec(owner);
+  if (match !== null && match[1] === hostname()) {
+    const pid = Number(match[2]);
+    if (pid === process.pid || ownerAlive(pid)) return false;
+    return true;
+  }
+  const created = Date.parse(createdAt);
+  return Number.isFinite(created) && now - created > STALE_AFTER_MS;
+}
+
 async function sweepStaleContainers(): Promise<void> {
   const ids = await docker(["ps", "-aq", "--filter", `label=${LABEL}`]);
-  if (ids !== "") await removeContainers(ids.split("\n"));
+  if (ids === "") return;
+  const lines = await docker([
+    "inspect",
+    "--format",
+    `{{.Name}}\t{{index .Config.Labels "${OWNER_LABEL}"}}\t{{.Created}}`,
+    ...ids.split("\n"),
+  ]);
+  const now = Date.now();
+  const stale = lines
+    .split("\n")
+    .map((line) => line.split("\t"))
+    .filter(([, owner = "", created = ""]) => sweepable(owner, created, now))
+    .map(([name = ""]) => name.replace(/^\//, ""))
+    .filter((name) => name !== "");
+  if (stale.length > 0) await removeContainers(stale);
 }
 
 async function ensureImage(): Promise<void> {
@@ -162,6 +211,8 @@ async function startServer(publicKey: string): Promise<Server> {
       "--rm",
       "--label",
       LABEL,
+      "--label",
+      `${OWNER_LABEL}=${OWNER}`,
       "--name",
       name,
       "-p",
@@ -218,6 +269,31 @@ async function stopServer(server: Server | undefined): Promise<void> {
   }
   await removeContainers([server.name]);
 }
+
+describe("leftover container sweep", () => {
+  const now = Date.parse("2026-10-16T12:00:00Z");
+  const old = "2026-10-16T11:00:00Z";
+  const fresh = "2026-10-16T11:55:00Z";
+  const deadPid = 2 ** 22 + 12_345;
+
+  test("never sweeps a container whose owner on this machine is alive, however old", () => {
+    expect(sweepable(`${hostname()}:${process.pid}:1`, old, now)).toBe(false);
+    expect(sweepable(`${hostname()}:1:1`, old, now)).toBe(false);
+  });
+
+  test("sweeps a container whose owner on this machine is gone, however young", () => {
+    expect(ownerAlive(deadPid)).toBe(false);
+    expect(sweepable(`${hostname()}:${deadPid}:1`, fresh, now)).toBe(true);
+  });
+
+  test("another machine's or an unowned container goes by age", () => {
+    expect(sweepable(`elsewhere:${process.pid}:1`, fresh, now)).toBe(false);
+    expect(sweepable(`elsewhere:${process.pid}:1`, old, now)).toBe(true);
+    expect(sweepable("", fresh, now)).toBe(false);
+    expect(sweepable("", old, now)).toBe(true);
+    expect(sweepable("<no value>", "not a date", now)).toBe(false);
+  });
+});
 
 describe.skipIf(skipReason !== null)("push sync against sqld", () => {
   let server: Server | undefined;
