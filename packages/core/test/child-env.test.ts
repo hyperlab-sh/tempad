@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { defaultRunner } from "../src/collect/index.ts";
 import { childEnvironment } from "../src/config/child-env.ts";
 import { ENV_VARS } from "../src/config/env.ts";
 import { spawnWithTimeout } from "../src/setup/index.ts";
@@ -40,6 +41,23 @@ describe("childEnvironment", () => {
     Object.assign(process.env, environment);
     try {
       const result = await spawnWithTimeout(["env"], { timeoutMs: 5_000 });
+      // Booleans, so a failure never prints the machine's real environment.
+      const lines = result.stdout.split("\n");
+      expect(lines.includes("GH_TOKEN=github-secret")).toBe(true);
+      expect(lines.some((line) => line.startsWith("TEMPAD_SYNC_TOKEN="))).toBe(false);
+      expect(lines.some((line) => line.startsWith("MONDAY_API_TOKEN="))).toBe(false);
+    } finally {
+      for (const name of Object.keys(environment)) delete process.env[name];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  test("the collector's default runner: gh keeps GH_TOKEN, no other secret", async () => {
+    const saved = { ...process.env };
+    Object.assign(process.env, environment);
+    try {
+      const result = await defaultRunner.run(["env"], process.cwd());
+      expect(result.code).toBe(0);
       // Booleans, so a failure never prints the machine's real environment.
       const lines = result.stdout.split("\n");
       expect(lines.includes("GH_TOKEN=github-secret")).toBe(true);

@@ -5,7 +5,8 @@ import { createGithubCollector } from "./github.ts";
 import { mondayCollector } from "./monday.ts";
 import type { Collector } from "./types.ts";
 
-const defaultRunner: CommandRunner = {
+/** @internal exported for tests */
+export const defaultRunner: CommandRunner = {
   async run(argv, cwd) {
     const proc = Bun.spawn(argv, {
       cwd,
