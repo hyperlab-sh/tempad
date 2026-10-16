@@ -215,7 +215,7 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
           .query(
             `SELECT quests.id as id, quests.title as title, quests.trigger as trigger
          FROM quests
-        WHERE quests.deviates_from_stint_id IS NOT NULL
+        WHERE quests.branched_at IS NOT NULL
           AND quests.trigger IS NOT NULL
           AND quests.retracted_at IS NULL
           AND (

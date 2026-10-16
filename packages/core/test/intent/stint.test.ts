@@ -413,8 +413,9 @@ describe("tempad answer --belongs", () => {
     expect(originQuest.questId).toBe(quest.id);
   });
 
-  test("--origin current records a null origin when nothing preceded the doubted stint", async () => {
+  test("--origin current falls back to the quest being left when nothing preceded the doubted stint", async () => {
     const { database, context, question } = await seedBelongsQuestion();
+    const left = database.query("SELECT id FROM quests").get() as { id: string };
 
     expect(
       await runIntentCommand(
@@ -426,9 +427,18 @@ describe("tempad answer --belongs", () => {
     const branched = database
       .query("SELECT payload FROM events WHERE kind = 'quest.branched'")
       .get() as { payload: string };
-    // The doubted stint is the session's first on that quest: there is nothing
-    // it branched away from, and nothing is invented.
-    expect(JSON.parse(branched.payload).deviates_from).toBeNull();
+    // The doubted stint is the session's first on that quest: there is no
+    // earlier stint it branched away from, and none is invented. The side quest
+    // still deviates from the quest the work was declared under.
+    const payload = JSON.parse(branched.payload);
+    expect(payload.deviates_from).toBeUndefined();
+    expect(payload.deviates_from_quest).toBe(left.id);
+    const side = database
+      .query(
+        "SELECT deviates_from_stint_id, deviates_from_quest_id FROM quests WHERE title = 'Compare Astryx'",
+      )
+      .get();
+    expect(side).toEqual({ deviates_from_stint_id: null, deviates_from_quest_id: left.id });
   });
 
   test("--origin is refused without a new quest, and an unknown --kind is refused", async () => {

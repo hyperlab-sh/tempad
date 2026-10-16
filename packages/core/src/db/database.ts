@@ -2,7 +2,10 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { encodeTime } from "ulid";
 import { normalizeOffsetTimestamp } from "../collect/github/log";
+import { IDENTITY_ALIASES_SQL } from "../intent/identity";
 import { ulidAfter } from "../intent/ids";
+import { questProjection } from "../intent/projections/quest";
+import { EventStore } from "../intent/store";
 import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
 import { loadMigrations, type MigrationFile } from "./migration-files";
 
@@ -329,6 +332,42 @@ function normalizeWideOffsetCommitDates(database: Database): void {
 }
 
 /**
+ * Re-projects the `quests` table from the event log, as the TypeScript half of
+ * migration 0024 (`MIGRATION_STEPS`). Before 0024, `quest declare --new
+ * --deviates-from` wrote `quest.branched` inverted and the reducer stored the
+ * relation on the wrong quest; hosts on an older version that pulled the new
+ * `deviates_from_quest` shape stored the string "undefined" as a stint id.
+ * Events are never rewritten, so the fix is the reducer: replaying through it
+ * corrects every row without the operator running `tempad rebuild`.
+ *
+ * Only `quests` is replayed. Its reducer writes nothing else and reads only
+ * `quests` and `identity_aliases`, whose current contents are what a full
+ * rebuild would hand it (`rebuildAll` replays every hero and party event before
+ * any quest event). A database whose intent layer was never used has no
+ * `quests` table and nothing to do: the projection's own `createSql` makes it
+ * later. Events read in `EventStore.read` order (uid, then id); a chain that
+ * reaches here from below 0019 still has NULL uids, which `openDatabase`
+ * backfills afterwards in id order, so the order is the same either way.
+ * `projection_state` gets the same stamp `rebuildAll` would write; nothing
+ * resumes from it, `applyIncremental` applies exactly the event it is given.
+ */
+function reprojectQuests(database: Database): void {
+  const exists = database
+    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quests'")
+    .get();
+  if (!exists) return;
+  database.exec(IDENTITY_ALIASES_SQL);
+  database.exec("DELETE FROM quests");
+  const events = new EventStore(database).read();
+  for (const event of events) questProjection.apply(database, event);
+  database
+    .query(
+      "INSERT INTO projection_state (name, last_event_id) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET last_event_id = excluded.last_event_id",
+    )
+    .run(questProjection.name, events.at(-1)?.id ?? 0);
+}
+
+/**
  * TypeScript halves of migrations, keyed by version. `applyMigrations` runs
  * each right after that migration's SQL, inside the same transaction, so a throw
  * rolls back the SQL, the step and the version bump together. For a rewrite SQL
@@ -336,6 +375,7 @@ function normalizeWideOffsetCommitDates(database: Database): void {
  */
 const MIGRATION_STEPS: Readonly<Record<number, (database: Database) => void>> = {
   23: normalizeWideOffsetCommitDates,
+  24: reprojectQuests,
 };
 
 /**

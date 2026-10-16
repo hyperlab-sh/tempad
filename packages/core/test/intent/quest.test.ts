@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { openDatabase } from "../../src/db/database";
+import { openStint } from "../../src/intent/api";
 import { runIntentCommand } from "../../src/intent/cli";
 import { defaultIntentConfig } from "../../src/intent/config";
 import { activeDeclaredQuests } from "../../src/intent/declarations";
 import { resolveQuest } from "../../src/intent/projections/quest";
+import { EventStore } from "../../src/intent/store";
 
 function harness() {
   const database = openDatabase(":memory:");
@@ -70,13 +72,19 @@ describe("quests", () => {
     const side = database.query("SELECT id FROM quests WHERE title = 'Compare Astryx'").get() as {
       id: string;
     };
+    const left = openStint(new EventStore(database), database, {
+      outcome: "fix walk order",
+      quest: main.id,
+      at: "2026-09-04T15:00:00.000Z",
+      actor: "hook",
+    });
     expect(
       await run([
         "quest",
         "branch",
         side.id,
         "--deviates-from",
-        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        left,
         "--trigger",
         "what does Astryx do for agents?",
         "--kind",
@@ -93,7 +101,7 @@ describe("quests", () => {
       branch_kind: string;
       returned_at: string | null;
     };
-    expect(row.deviates_from_stint_id).toBe("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    expect(row.deviates_from_stint_id).toBe(left);
     expect(row.branch_kind).toBe("curiosity");
     expect(row.returned_at).toBeNull();
     expect(await run(["quest", "return", side.id, "--to", main.id])).toBe(0);

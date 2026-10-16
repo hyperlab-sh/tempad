@@ -7,9 +7,13 @@ import { openDatabase } from "../../src/db/database";
 import { runIntentCommand } from "../../src/intent/cli";
 import { defaultIntentConfig } from "../../src/intent/config";
 import { activeDeclaredQuests } from "../../src/intent/declarations";
+import { currentHeroId } from "../../src/intent/identity";
+import { rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
+import { EventStore } from "../../src/intent/store";
 import { runReviewCommand, runW5Command } from "../../src/w5/cli";
 import { buildWindow } from "../../src/w5/window";
+import { appendLegacyDeclaredSideQuest } from "../fixtures/legacy-side-quest";
 
 registerAllProjections();
 
@@ -340,7 +344,11 @@ describe("a retracted quest disappears from every surface", () => {
   test("quest list --unconfirmed and --side hide it", async () => {
     const h = await withRetracted();
     h.database.query("UPDATE quests SET confirmed = 0").run();
-    h.database.query("UPDATE quests SET deviates_from_stint_id = 'A1'").run();
+    h.database
+      .query(
+        "UPDATE quests SET deviates_from_stint_id = 'A1', branched_at = '2026-09-04T13:00:00.000Z'",
+      )
+      .run();
 
     await h.run(["quest", "list", "--unconfirmed"]);
     expect(h.lines.join("\n")).toContain("Kept");
@@ -585,7 +593,22 @@ describe("a retracted quest disappears from every surface", () => {
   });
 });
 
+// The inverted `quest.branched` that `declare` wrote before
+// `deviates_from_quest` existed, re-projected by a rebuild as an upgraded
+// database is.
+const LEGACY = "a legacy declare event";
+
 async function declareSide(h: ReturnType<typeof harness>, flag: string, parent: string) {
+  if (flag === LEGACY) {
+    const side = appendLegacyDeclaredSideQuest(new EventStore(h.database), {
+      heroId: currentHeroId(h.database) as string,
+      parentQuestId: parent,
+      title: "Side",
+      at: "2026-09-04T13:00:00.000Z",
+    });
+    rebuildAll(h.database);
+    return side;
+  }
   const code = await h.run([
     "quest",
     "declare",
@@ -608,26 +631,32 @@ async function declareSide(h: ReturnType<typeof harness>, flag: string, parent: 
 }
 
 // `quest declare --new Side --deviates-from Main` (and its `--origin` spelling)
-// writes the branch pair inverted: Main's row gets `deviates_from_stint_id =
-// Side`. Retraction must still treat Side as Main's child, never the reverse.
-describe.each(["--deviates-from", "--origin"])("a side quest declared with %s", (flag) => {
+// stores the relation on Side's row, naming Main. Retraction treats Side as
+// Main's child, never the reverse.
+describe.each(["--deviates-from", "--origin", LEGACY])("a side quest declared with %s", (flag) => {
   async function withSide() {
     const h = await setup();
     const main = await addQuest(h, "Main");
+    // Declared first: the legacy variant rebuilds, which would drop the
+    // hand-inserted stints and traces below.
+    const side = await declareSide(h, flag, main);
     addStint(h.database, "A1", main);
     addTrace(h.database, "T1", "A1");
-    const side = await declareSide(h, flag, main);
     addStint(h.database, "A2", side);
     addTrace(h.database, "T2", "A2");
     return { h, main, side };
   }
 
-  test("fixture control: the real declare path stores the pair on the parent's row", async () => {
+  test("fixture control: the real declare path stores the relation on the side quest's row", async () => {
     const { h, main, side } = await withSide();
-    const row = h.database
-      .query("SELECT deviates_from_stint_id AS value FROM quests WHERE id = ?")
-      .get(main) as { value: string | null };
-    expect(row.value).toBe(side);
+    const relation = (id: string) =>
+      h.database
+        .query(
+          "SELECT deviates_from_stint_id AS stint, deviates_from_quest_id AS quest, branched_at IS NOT NULL AS branched FROM quests WHERE id = ?",
+        )
+        .get(id);
+    expect(relation(side)).toEqual({ stint: null, quest: main, branched: 1 });
+    expect(relation(main)).toEqual({ stint: null, quest: null, branched: 0 });
   });
 
   test("retracting the side quest is refused for its own stints and never touches the parent", async () => {

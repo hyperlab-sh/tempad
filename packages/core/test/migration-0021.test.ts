@@ -177,7 +177,7 @@ describe("migration 0021_normalize_commit_dates", () => {
       old.close();
 
       const database = openDatabase(path);
-      expect(userVersion(database)).toBe(23);
+      expect(userVersion(database)).toBe(24);
       const rows = new Map(snapshot(database).map((row) => [row.sha, row]));
 
       for (const original of SEEDS) {
@@ -256,7 +256,7 @@ describe("migration 0021_normalize_commit_dates", () => {
 
   test("an empty gh_commits table migrates cleanly", () => {
     const database = openDatabase(":memory:");
-    expect(userVersion(database)).toBe(23);
+    expect(userVersion(database)).toBe(24);
     expect(snapshot(database)).toEqual([]);
     database.close();
   });
@@ -301,7 +301,9 @@ describe("migration 0021_normalize_commit_dates", () => {
       expect(commitsBefore.length).toBeGreaterThan(0);
       old.close();
 
-      const database = openDatabase(path);
+      // Stops at 23: the report fixture inserts quest rows by hand with no
+      // events behind them, and 0024's step re-projects quests from events.
+      const database = openDatabase(path, { upToVersion: 23 });
       expect(userVersion(database)).toBe(23);
       expect(snapshot(database)).toEqual(commitsBefore);
       expect(render(database)).toEqual(before);

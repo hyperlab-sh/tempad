@@ -79,16 +79,20 @@ export function declareQuest(
       }),
     );
     created = true;
+    // The new quest is the side quest: the relation goes on its row and names
+    // the quest it deviates from. Events written before
+    // `deviates_from_quest` existed had the pair inverted; the quests
+    // projection reads both (`branchRelation`).
     if (input.newQuest.origin) {
       applyIncremental(
         database,
         store.append({
           actor: input.declaredBy === "hero" ? "hero" : "hook",
           kind: "quest.branched",
-          subject: input.newQuest.origin,
+          subject: questId,
           at: input.at,
           payload: {
-            deviates_from: questId,
+            deviates_from_quest: input.newQuest.origin,
             trigger: input.newQuest.trigger ?? "unknown",
             kind: input.newQuest.kind ?? "unknown",
           },

@@ -313,3 +313,7 @@ CREATE TABLE sync_tombstones (
 
 -- Migration 0021_normalize_commit_dates.sql rewrote legacy offset-form
 -- gh_commits.authored_at / committed_at to UTC ('...Z'). No schema change.
+--
+-- Migration 0024_side_quest_parent.sql added deviates_from_quest_id TEXT to
+-- quests (mirrored in the `quests` projection's CREATE TABLE): the quest a
+-- side quest deviates from when the branch names a quest instead of a stint.
