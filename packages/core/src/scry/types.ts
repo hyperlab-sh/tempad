@@ -61,16 +61,29 @@ export interface W5Stats {
   jobsStuckRunning: number;
 }
 
-export interface IntentStats {
-  events: number;
-  quests: Record<string, number>;
-  questsUnconfirmed: number;
-  stints: { open: number; closed: number; dismissed: number };
-  stintsWithoutQuestInWindow: number;
-  tracesInWindow: number;
-  doubtedTracesLast7Days: number;
-  questions: Record<string, number>;
-  questionsExpiredUnanswered: number;
+export interface QuestStats {
+  /** Live quests per state (`started`, `done`, ...). */
+  byState: Record<string, number>;
+  unconfirmed: number;
+}
+
+export interface StintStats {
+  open: number;
+  closed: number;
+  dismissed: number;
+  /** Live stints opened in the health window that no quest claims. */
+  withoutQuestInWindow: number;
+}
+
+export interface TraceStats {
+  inWindow: number;
+  doubtedLast7Days: number;
+}
+
+export interface QuestionStats {
+  /** Questions per state (`watching`, `asked`, `expired`, `answered`). */
+  byState: Record<string, number>;
+  expiredUnanswered: number;
 }
 
 export interface ScryStats {
@@ -83,7 +96,11 @@ export interface ScryStats {
     mondayItems: SourceStats;
   };
   collectors: CollectorStats[];
-  intent: IntentStats | null;
+  events: number;
+  quests: QuestStats;
+  stints: StintStats;
+  traces: TraceStats;
+  questions: QuestionStats;
   w5: W5Stats | null;
   sync: SyncStats | null;
 }

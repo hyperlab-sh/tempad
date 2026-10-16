@@ -12,6 +12,17 @@ import type { Check, Recommendation, ScryReport } from "./types";
 export const SCRY_USAGE =
   "usage: tempad scry [--json] [--days <n>] [--fast]   (read-only health check: Health, Stats, Recommendations; exit 1 when a check fails)";
 
+/** About ten years: far enough back for any real history, and `now - days` stays a valid date. */
+export const MAX_DAYS = 3650;
+
+/** A failure of SQLite itself (not a file, not a database, locked, corrupt), as opposed to a bug in scry. */
+function isSqliteError(error: unknown): error is Error {
+  return (
+    error instanceof Error &&
+    (error.name === "SQLiteError" || /^SQLITE_/.test(String((error as { code?: unknown }).code)))
+  );
+}
+
 export interface ScryCommandOptions {
   now?: Date;
   stdout?: (line: string) => void;
@@ -75,8 +86,11 @@ export function runScryCommand(args: string[], options: ScryCommandOptions = {})
     stderr(SCRY_USAGE);
     return 2;
   }
-  if (values.days !== undefined && !/^[1-9]\d*$/.test(values.days)) {
-    stderr(`scry: --days needs a positive integer, got "${values.days}"`);
+  if (
+    values.days !== undefined &&
+    !(/^[1-9]\d*$/.test(values.days) && Number.parseInt(values.days, 10) <= MAX_DAYS)
+  ) {
+    stderr(`scry: --days needs a whole number from 1 to ${MAX_DAYS}, got "${values.days}"`);
     stderr(SCRY_USAGE);
     return 2;
   }
@@ -160,6 +174,8 @@ export function runScryCommand(args: string[], options: ScryCommandOptions = {})
         sizeBytes: statSync(databasePath).size,
       });
     } catch (error) {
+      // Only SQLite's own failures mean "cannot read the database"; anything else is a bug and surfaces.
+      if (!isSqliteError(error)) throw error;
       report = reportWithoutDatabase(
         home,
         windowDays,

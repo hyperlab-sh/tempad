@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigError } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
@@ -13,6 +13,7 @@ import type { Check, ScryReport } from "../../src/scry/types";
 import { enableMirrorSync } from "../../src/sync/triggers";
 import {
   ago,
+  classifyAll,
   DAY,
   HOUR,
   type Home,
@@ -93,6 +94,35 @@ describe("healthy home", () => {
     expect(report.notes.join(" ")).toContain("cannot say one is due");
   });
 
+  test("the eval baseline counts sessions with traces in the 7 days it prints, not in the whole window", async () => {
+    // Six classified sessions, all 8-13 days old: inside the 15-day health window, outside the eval's 7.
+    const home = track(makeHome());
+    seedHero(home.database);
+    for (let index = 0; index < 6; index += 1) {
+      seedSession(home.database, { id: `older-${index}`, endedAt: ago(8 * DAY + index * DAY) });
+    }
+    await classifyAll(home.database);
+    const { report } = scryJson(home);
+    expect(report.stats?.w5?.sessionsWithTraces).toBe(6);
+    expect(recommendationIds(report)).not.toContain("eval");
+    expect(report.notes.join(" ")).toContain(
+      "only 0 sessions with traces in the last 7 days (need 5)",
+    );
+  });
+
+  test("the eval line counts the sessions of its own 7 days, and a shorter --days shortens it", async () => {
+    const home = track(await makeHealthyHome()); // six sessions with traces within 12 hours
+    seedSession(home.database, { id: "older", endedAt: ago(10 * DAY) });
+    await classifyAll(home.database);
+    const evaluation = scryJson(home).report.recommendations.find((entry) => entry.id === "eval");
+    expect(evaluation?.reason).toContain("last 7 days (6 sessions with traces)");
+    const short = scryJson(home, "--days", "3").report.recommendations.find(
+      (entry) => entry.id === "eval",
+    );
+    expect(short?.command).toBe("tempad w5 eval --from 2026-10-13 --to 2026-10-16");
+    expect(short?.reason).toContain("last 3 days (6 sessions with traces)");
+  });
+
   test("the text report has Health, Stats and Recommendations sections", async () => {
     const home = track(await makeHealthyHome());
     process.env.TEMPAD_HOME = home.directory;
@@ -140,6 +170,22 @@ describe("backfill recommendation", () => {
     expect(backfill?.command).toBe("tempad w5 backfill --days 4");
     expect(backfill?.reason).toContain("classifier call");
     expect(backfill?.condition).toBeUndefined();
+  });
+
+  test("the printed --days reaches the oldest unclassified session even when it is a fraction of a day short", async () => {
+    const home = track(await makeHealthyHome());
+    // 14 d 23 h 40 m old: 15 days would drop it twenty minutes after this report.
+    const endedAt = ago(15 * DAY - 20 * 60_000);
+    seedSession(home.database, { id: "edge", endedAt });
+    const { report } = scryJson(home);
+    expect(report.stats?.w5?.windowsPending).toBe(1);
+    const command = report.recommendations.find((entry) => entry.id === "backfill")?.command;
+    expect(command).toBe("tempad w5 backfill --days 16");
+    // Twenty minutes later (the run), the recommended range still holds the session.
+    const days = Number(command?.split("--days ")[1]);
+    const later = new Date(NOW.getTime() + 20 * 60_000);
+    const cutoff = new Date(later.getTime() - days * DAY).toISOString();
+    expect(endedAt >= cutoff).toBe(true);
   });
 
   test("--days narrows the window, so older unclassified sessions are not recommended", async () => {
@@ -233,6 +279,31 @@ describe("classification jobs", () => {
     );
   });
 
+  test("unknown-session failures for sessions now in the database do not recommend collecting", async () => {
+    const home = track(await makeHealthyHome());
+    for (const id of ["healthy-0", "healthy-1"]) {
+      insertFailedJob(home.database, `unknown claude session: ${id}`, ago(DAY), id);
+    }
+    const { report } = scryJson(home);
+    expect(recommendationIds(report)).toContain("w5-log");
+    expect(recommendationIds(report)).not.toContain("w5-unknown-session");
+    expect(checkOf(report, "w5-queue").details.join("\n")).toContain(
+      "all 2 `unknown claude session` failures are for sessions that are in the database now",
+    );
+  });
+
+  test("unknown-session failures for sessions still missing recommend collecting, once per session count", async () => {
+    const home = track(await makeHealthyHome());
+    insertFailedJob(home.database, "unknown claude session: healthy-0", ago(DAY), "healthy-0");
+    insertFailedJob(home.database, "unknown claude session: gone-a", ago(DAY), "gone-a");
+    insertFailedJob(home.database, "unknown claude session: gone-a", ago(2 * DAY), "gone-a");
+    insertFailedJob(home.database, "unknown claude session: gone-b", ago(2 * DAY), "gone-b");
+    const { report } = scryJson(home);
+    const entry = report.recommendations.find((item) => item.id === "w5-unknown-session");
+    expect(entry?.command).toBe("tempad sync claude");
+    expect(entry?.reason).toContain("2 sessions named by failed jobs");
+  });
+
   test("a recommended full collect replaces the claude-only one", async () => {
     const home = track(await makeHealthyHome());
     setSyncState(home.database, "claude", ago(3 * DAY));
@@ -240,6 +311,7 @@ describe("classification jobs", () => {
       home.database,
       "unknown claude session: 11111111-2222-3333-4444-555555555555",
       ago(DAY),
+      "missing-session",
     );
     const ids = recommendationIds(scryJson(home).report);
     expect(ids).toContain("collect");
@@ -281,6 +353,39 @@ describe("projections", () => {
     expect(code).toBe(1);
     expect(checkOf(report, "projections").details.join("\n")).toContain(
       "traces: stored 6, replay 6 (1 missing, 1 extra)",
+    );
+  });
+
+  test("a dropped projection table fails the check, even one the replay leaves empty", async () => {
+    for (const table of ["w5_windows", "identity_aliases", "traces"]) {
+      const home = track(await makeHealthyHome());
+      home.database.exec(`DROP TABLE ${table}`);
+      const { code, report } = scryJson(home);
+      expect(code).toBe(1);
+      const projections = checkOf(report, "projections");
+      expect(projections.status).toBe("fail");
+      expect(projections.details).toContain(`${table}: the table does not exist`);
+      expect(report.recommendations.find((entry) => entry.id === "rebuild")?.command).toBe(
+        "tempad rebuild",
+      );
+    }
+  });
+
+  test("a dropped column fails the check and names the column", async () => {
+    const home = track(await makeHealthyHome());
+    home.database.exec("ALTER TABLE traces DROP COLUMN doubt");
+    const { code, report } = scryJson(home);
+    expect(code).toBe(1);
+    expect(checkOf(report, "projections").details.join("\n")).toContain("lacks column(s) doubt");
+  });
+
+  test("an extra column fails the check and names the column", async () => {
+    const home = track(await makeHealthyHome());
+    home.database.exec("ALTER TABLE traces ADD COLUMN leftover TEXT");
+    const { code, report } = scryJson(home);
+    expect(code).toBe(1);
+    expect(checkOf(report, "projections").details.join("\n")).toContain(
+      "has unexpected column(s) leftover",
     );
   });
 
@@ -495,6 +600,23 @@ describe("sync", () => {
     );
     expect(recommendationIds(pending)).not.toContain("sync-push");
 
+    const fromStart = pending.recommendations.find((entry) => entry.id === "sync-pull-own");
+    expect(fromStart?.reason).toBe(
+      "first pull on this database, or after a re-seed: downloads the full history from the server",
+    );
+    expect(checkOf(pending, "sync").details.join("\n")).toContain("no pull position yet");
+
+    // With a pull position kept, the server holds rows of this host that this database lacks.
+    home.database.query("INSERT INTO sync_cursors (stream, seq) VALUES ('events', 5)").run();
+    const withCursor = scryJson(home).report;
+    expect(withCursor.recommendations.find((entry) => entry.id === "sync-pull-own")?.reason).toBe(
+      "fetches this host's own rows back from the server",
+    );
+    expect(checkOf(withCursor, "sync").details.join("\n")).toContain(
+      "a reinstall under the same host name, or a restored backup",
+    );
+
+    home.database.query("DELETE FROM sync_cursors").run();
     home.database
       .query("DELETE FROM sync_meta WHERE key IN ('pull_own_pending', 'reseed_pending')")
       .run();
@@ -569,10 +691,8 @@ describe("needs a human", () => {
     home.database.query("UPDATE quests SET confirmed = 0 WHERE id = ?").run(declared.questId);
 
     const { report } = scryJson(home, "--fast");
-    expect(report.stats?.intent).toMatchObject({
-      questionsExpiredUnanswered: 2,
-      questsUnconfirmed: 1,
-    });
+    expect(report.stats?.questions.expiredUnanswered).toBe(2);
+    expect(report.stats?.quests.unconfirmed).toBe(1);
     expect(checkOf(report, "attention").summary).toBe(
       "2 expired questions, 1 unconfirmed quest, 0 doubted traces in the last 7 days",
     );
@@ -611,10 +731,86 @@ describe("report shape", () => {
       expect(entry.reason.length).toBeGreaterThan(0);
     }
     expect(Object.keys(report.stats ?? {}).sort()).toEqual(
-      ["collectors", "database", "intent", "sources", "sync", "w5"].sort(),
+      [
+        "collectors",
+        "database",
+        "events",
+        "questions",
+        "quests",
+        "sources",
+        "stints",
+        "sync",
+        "traces",
+        "w5",
+      ].sort(),
     );
     expect(report.stats?.database.schemaVersion).toBe(report.stats?.database.latestSchemaVersion);
     expect(report.generatedAt).toBe(NOW.toISOString());
+  });
+
+  test("--json stats have a pinned shape, key by key", async () => {
+    const home = track(
+      await makeHealthyHome({ toml: '[sync]\nurl = "libsql://example.invalid"\n' }),
+    );
+    const stats = scryJson(home).report.stats;
+    const keys = (value: unknown) => Object.keys(value as object).sort();
+    expect(typeof stats?.events).toBe("number");
+    expect(keys(stats?.database)).toEqual(
+      ["latestSchemaVersion", "path", "schemaVersion", "sizeBytes"].sort(),
+    );
+    expect(keys(stats?.sources)).toEqual(
+      [
+        "claudeMessages",
+        "claudeSessions",
+        "githubCommits",
+        "githubPullRequests",
+        "mondayItems",
+      ].sort(),
+    );
+    for (const source of Object.values(stats?.sources ?? {})) {
+      expect(keys(source)).toEqual(["newest", "rows"]);
+    }
+    expect(keys(stats?.collectors[0])).toEqual(["ageHours", "lastSyncAt", "source"]);
+    expect(keys(stats?.quests)).toEqual(["byState", "unconfirmed"]);
+    expect(keys(stats?.stints)).toEqual(["closed", "dismissed", "open", "withoutQuestInWindow"]);
+    expect(keys(stats?.traces)).toEqual(["doubtedLast7Days", "inWindow"]);
+    expect(keys(stats?.questions)).toEqual(["byState", "expiredUnanswered"]);
+    expect(keys(stats?.w5)).toEqual(
+      [
+        "jobs",
+        "jobsFailedLast7Days",
+        "jobsStuckRunning",
+        "oldestPendingSessionEndedAt",
+        "ownHostOnly",
+        "pendingSessions",
+        "sessionsDeclared",
+        "sessionsInWindow",
+        "sessionsUndeclared",
+        "sessionsWithTraces",
+        "windowDays",
+        "windowsCovered",
+        "windowsInFlight",
+        "windowsPending",
+      ].sort(),
+    );
+    expect(keys(stats?.w5?.jobs)).toEqual(["done", "failed", "queued", "running"]);
+    expect(keys(stats?.sync)).toEqual(
+      [
+        "dirty",
+        "enabled",
+        "forgottenServers",
+        "lastPushedStamp",
+        "mirrorTriggers",
+        "pending",
+        "serverKnown",
+      ].sort(),
+    );
+    expect(keys(stats?.sync?.dirty)).toEqual(["events", "mirrors", "tombstones"]);
+    expect(keys(stats?.sync?.pending)).toEqual(["pullOwn", "rebuild", "reseed"]);
+    expect(stats?.stints.open).toBeGreaterThan(-1);
+    expect(stats?.traces.inWindow).toBe(6);
+    expect(stats?.quests.byState).toEqual({});
+    expect(JSON.stringify(stats)).not.toContain('"intent"');
   });
 
   test("with a stale clock the whole run still finishes quickly on a small database", async () => {
@@ -631,6 +827,9 @@ describe("report shape", () => {
       ["--days", "0"],
       ["--days", "abc"],
       ["--days", "-3"],
+      ["--days", "3651"],
+      ["--days", "99999999999"],
+      ["--days", "1e3"],
       ["extra"],
     ]) {
       const out: string[] = [];
@@ -643,6 +842,43 @@ describe("report shape", () => {
       ).toBe(2);
       expect(out).toEqual([]);
       expect(err.join("\n")).toContain("usage: tempad scry");
+    }
+  });
+});
+
+describe("--days range and database errors", () => {
+  test("3650 is the longest range and still produces a report", async () => {
+    const home = track(await makeHealthyHome());
+    const { code, report } = scryJson(home, "--days", "3650");
+    expect(code).toBe(0);
+    expect(report.windowDays).toBe(3650);
+  });
+
+  test("a file that is not a database is a failed database check, exit 1", () => {
+    const home = track(makeHome());
+    home.database.close();
+    writeFileSync(home.databasePath, "this is not a sqlite database".repeat(100));
+    const { code, report } = scryJson(home);
+    expect(code).toBe(1);
+    expect(checkOf(report, "database").status).toBe("fail");
+    expect(checkOf(report, "database").summary).toContain("cannot read");
+    // The afterEach closes the handle again; reopen a throwaway one so that stays valid.
+    home.database = new Database(":memory:");
+  });
+
+  test("a bug inside scry is not reported as an unreadable database", () => {
+    const home = track(makeHome());
+    process.env.TEMPAD_HOME = home.directory;
+    const original = Database.prototype.query;
+    Database.prototype.query = () => {
+      throw new TypeError("boom: not a sqlite failure");
+    };
+    try {
+      expect(() => runScryCommand(["--json"], { now: NOW, stdout: () => {} })).toThrow(
+        "boom: not a sqlite failure",
+      );
+    } finally {
+      Database.prototype.query = original;
     }
   });
 });

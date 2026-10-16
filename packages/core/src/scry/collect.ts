@@ -13,13 +13,12 @@ import {
 } from "../sync/engine";
 import { SYNCED_UPSERT_TABLES } from "../sync/tables";
 import { MIRROR_SYNC_ENABLED } from "../sync/triggers";
-import { planBackfillWindows, selectBackfillSessions } from "../w5/backfill";
+import { backfillWindowMinutes, planBackfillWindows, selectBackfillSessions } from "../w5/backfill";
 import { compareProjectionsToReplay } from "./replay";
 import type {
   Check,
   CheckStatus,
   CollectorStats,
-  IntentStats,
   Recommendation,
   ScryReport,
   ScryStats,
@@ -28,6 +27,7 @@ import type {
   W5Stats,
 } from "./types";
 
+const BACKFILL_MARGIN_MS = 60 * 60 * 1000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** A collector that has not run for this long is called stale. */
@@ -262,9 +262,18 @@ function projectionsCheck(database: Database, fast: boolean): Check {
     if (differences.length > 0) {
       status = "fail";
       for (const difference of differences) {
-        details.push(
-          `${difference.table}: stored ${difference.stored}, replay ${difference.replayed} (${difference.missing} missing, ${difference.extra} extra)`,
-        );
+        if (difference.tableMissing) {
+          details.push(`${difference.table}: the table does not exist`);
+          continue;
+        }
+        const parts = [
+          `stored ${difference.stored}, replay ${difference.replayed} (${difference.missing} missing, ${difference.extra} extra)`,
+        ];
+        if (difference.columnsMissing.length > 0)
+          parts.push(`lacks column(s) ${difference.columnsMissing.join(", ")}`);
+        if (difference.columnsExtra.length > 0)
+          parts.push(`has unexpected column(s) ${difference.columnsExtra.join(", ")}`);
+        details.push(`${difference.table}: ${parts.join("; ")}`);
       }
     }
   }
@@ -335,6 +344,25 @@ interface QueueResult {
   stuck: number;
 }
 
+/** Failed jobs whose session was missing when they ran, and how many of those sessions still are. */
+function unknownSessionFailures(
+  database: Database,
+  since: string,
+): { total: number; missingSessions: number } {
+  const row = safely<{ total: number; missing: number } | null>(null, () => {
+    return database
+      .query(
+        `SELECT COUNT(*) AS total,
+                COUNT(DISTINCT CASE WHEN NOT EXISTS (SELECT 1 FROM claude_sessions s WHERE s.id = j.session_id) THEN j.session_id END) AS missing
+           FROM w5_jobs j
+          WHERE j.state = 'failed' AND j.error LIKE 'unknown claude session%'
+            AND COALESCE(j.finished_at, j.requested_at) >= ?`,
+      )
+      .get(since) as { total: number; missing: number };
+  });
+  return { total: row?.total ?? 0, missingSessions: row?.missing ?? 0 };
+}
+
 function queueCheck(database: Database, now: Date, home: string): QueueResult {
   const states = groupCounts(
     database,
@@ -391,14 +419,19 @@ function queueCheck(database: Database, now: Date, home: string): QueueResult {
       command: `tail -n 50 ${home}/logs/w5.log`,
       reason: `${failedLast7Days} classification jobs failed in the last 7 days; the log has the error`,
     });
-    const unknown = top.some(([message]) => message.includes("unknown claude session"));
-    if (unknown) {
-      recommendations.push({
-        id: "w5-unknown-session",
-        command: "tempad sync claude",
-        reason:
-          "jobs failed with `unknown claude session`: the session was not in the database when the job ran; collect it first, then backfill",
-      });
+    const unknown = unknownSessionFailures(database, since);
+    if (unknown.total > 0) {
+      if (unknown.missingSessions > 0) {
+        recommendations.push({
+          id: "w5-unknown-session",
+          command: "tempad sync claude",
+          reason: `${plural(unknown.missingSessions, "session")} named by failed jobs (\`unknown claude session\`) ${unknown.missingSessions === 1 ? "is" : "are"} still not in the database; collect ${unknown.missingSessions === 1 ? "it" : "them"}, then backfill`,
+        });
+      } else {
+        details.push(
+          `all ${unknown.total} \`unknown claude session\` failures are for sessions that are in the database now: the job ran before the session was collected, and the backfill below covers them`,
+        );
+      }
     }
   }
   return {
@@ -434,7 +467,7 @@ function coverageCheck(input: ScryInput): CoverageResult {
     hostSlug: ownHostOnly ? input.hostSlug : undefined,
   });
   const planned = planBackfillWindows(database, sessions, {
-    windowMinutes: w5.throttleMinutes * 3,
+    windowMinutes: backfillWindowMinutes(w5),
   });
   const inFlightAfter = new Date(now.getTime() - IN_FLIGHT_MS).toISOString();
   const covered = planned.filter((window) => window.covered);
@@ -473,7 +506,9 @@ function coverageCheck(input: ScryInput): CoverageResult {
     };
   }
   const oldestEnd = oldest === null ? now.getTime() : Date.parse(oldest);
-  const days = Math.max(1, Math.ceil((now.getTime() - oldestEnd) / DAY_MS));
+  // Backfill keeps sessions that ended at or after `now - days`; the margin covers the time between
+  // this report and the run, so the oldest pending session is not dropped in between.
+  const days = Math.max(1, Math.ceil((now.getTime() - oldestEnd + BACKFILL_MARGIN_MS) / DAY_MS));
   return {
     check: check(
       "w5-coverage",
@@ -591,6 +626,7 @@ function syncCheck(input: ScryInput): SyncResult {
       lastPushedStamp = null;
     }
   }
+  const cursorCount = count(database, "SELECT COUNT(*) AS n FROM sync_cursors");
   const pending = {
     reseed: meta(database, RESEED_PENDING) !== null,
     pullOwn: meta(database, PULL_OWN_PENDING) !== null,
@@ -665,11 +701,20 @@ function syncCheck(input: ScryInput): SyncResult {
       });
     }
     if (pending.pullOwn) {
-      details.push("this host's own history has not been pulled back yet");
+      // Both ways in delete the pull cursors, so they tell the cases apart only with a re-seed:
+      // cursors present means the server holds rows of this host that this database lacks.
+      const fromStart = cursorCount === 0;
+      details.push(
+        fromStart
+          ? "this host has no pull position yet: the next pull downloads everything from the server, this host's own rows included"
+          : "the server holds rows written by this host that this database lacks (a reinstall under the same host name, or a restored backup)",
+      );
       recommendations.push({
         id: "sync-pull-own",
         command: "tempad sync --pull",
-        reason: "a pull of this host's own rows is pending (reinstall or restored backup)",
+        reason: fromStart
+          ? "first pull on this database, or after a re-seed: downloads the full history from the server"
+          : "fetches this host's own rows back from the server",
       });
     }
   }
@@ -691,49 +736,64 @@ function syncCheck(input: ScryInput): SyncResult {
 
 // --- stats ----------------------------------------------------------------
 
-function intentStats(
+function recordStats(
   database: Database,
   windowSince: string,
   attention: AttentionResult,
-): IntentStats {
+): Pick<ScryStats, "events" | "quests" | "stints" | "traces" | "questions"> {
+  const stintCount = (where: string) =>
+    count(database, `SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND ${where}`);
   return {
     events: count(database, "SELECT COUNT(*) AS n FROM events"),
-    quests: groupCounts(
-      database,
-      "SELECT state AS key, COUNT(*) AS n FROM quests WHERE retracted_at IS NULL GROUP BY state",
-    ),
-    questsUnconfirmed: attention.unconfirmed,
+    quests: {
+      byState: groupCounts(
+        database,
+        "SELECT state AS key, COUNT(*) AS n FROM quests WHERE retracted_at IS NULL GROUP BY state",
+      ),
+      unconfirmed: attention.unconfirmed,
+    },
     stints: {
-      open: count(
+      open: stintCount("dismissed_at IS NULL AND closed_at IS NULL"),
+      closed: stintCount("dismissed_at IS NULL AND closed_at IS NOT NULL"),
+      dismissed: stintCount("dismissed_at IS NOT NULL"),
+      withoutQuestInWindow: count(
         database,
-        "SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND dismissed_at IS NULL AND closed_at IS NULL",
-      ),
-      closed: count(
-        database,
-        "SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND dismissed_at IS NULL AND closed_at IS NOT NULL",
-      ),
-      dismissed: count(
-        database,
-        "SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND dismissed_at IS NOT NULL",
+        "SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND dismissed_at IS NULL AND quest_id IS NULL AND opened_at >= ?",
+        windowSince,
       ),
     },
-    stintsWithoutQuestInWindow: count(
-      database,
-      "SELECT COUNT(*) AS n FROM stints WHERE retracted_at IS NULL AND dismissed_at IS NULL AND quest_id IS NULL AND opened_at >= ?",
-      windowSince,
-    ),
-    tracesInWindow: count(
-      database,
-      "SELECT COUNT(*) AS n FROM traces WHERE retracted_at IS NULL AND started_at >= ?",
-      windowSince,
-    ),
-    doubtedTracesLast7Days: attention.doubtedLast7Days,
-    questions: groupCounts(
-      database,
-      "SELECT state AS key, COUNT(*) AS n FROM questions GROUP BY state",
-    ),
-    questionsExpiredUnanswered: attention.expiredUnanswered,
+    traces: {
+      inWindow: count(
+        database,
+        "SELECT COUNT(*) AS n FROM traces WHERE retracted_at IS NULL AND started_at >= ?",
+        windowSince,
+      ),
+      doubtedLast7Days: attention.doubtedLast7Days,
+    },
+    questions: {
+      byState: groupCounts(
+        database,
+        "SELECT state AS key, COUNT(*) AS n FROM questions GROUP BY state",
+      ),
+      expiredUnanswered: attention.expiredUnanswered,
+    },
   };
+}
+
+/** How many of `sessionIds` have a live trace starting at or after `since`. */
+function sessionsWithTraces(database: Database, sessionIds: string[], since: string): number {
+  const withTraces = new Set(
+    safely<{ session_id: string }[]>(
+      [],
+      () =>
+        database
+          .query(
+            "SELECT DISTINCT session_id FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL AND started_at >= ?",
+          )
+          .all(since) as { session_id: string }[],
+    ).map((row) => row.session_id),
+  );
+  return sessionIds.filter((id) => withTraces.has(id)).length;
 }
 
 function w5Stats(
@@ -744,22 +804,11 @@ function w5Stats(
   queue: QueueResult,
   sessionIdsInWindow: string[],
 ): W5Stats {
-  const withTraces = new Set(
-    safely<{ session_id: string }[]>(
-      [],
-      () =>
-        database
-          .query(
-            "SELECT DISTINCT session_id FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL AND started_at >= ?",
-          )
-          .all(windowSince) as { session_id: string }[],
-    ).map((row) => row.session_id),
-  );
   const declared = sessionIdsInWindow.filter((id) => hasAnyDeclaration(database, id)).length;
   return {
     windowDays,
     ...coverage.stats,
-    sessionsWithTraces: sessionIdsInWindow.filter((id) => withTraces.has(id)).length,
+    sessionsWithTraces: sessionsWithTraces(database, sessionIdsInWindow, windowSince),
     sessionsDeclared: declared,
     sessionsUndeclared: sessionIdsInWindow.length - declared,
     jobs: queue.jobs,
@@ -874,9 +923,10 @@ export function scry(input: ScryInput): ScryReport {
 
     // Eval: the database records no classifier model, prompt or config, so it cannot say that an eval is due.
     const windowSince = new Date(now.getTime() - input.windowDays * DAY_MS).toISOString();
+    const hostFilter = coverage.stats.ownHostOnly ? input.hostSlug : undefined;
     const sessionIds = selectBackfillSessions(database, {
       cutoff: windowSince,
-      hostSlug: coverage.stats.ownHostOnly ? input.hostSlug : undefined,
+      hostSlug: hostFilter,
     }).map((session) => session.id);
     const stats: ScryStats = {
       database: database_,
@@ -888,7 +938,7 @@ export function scry(input: ScryInput): ScryReport {
         mondayItems: sourceStats(database, "monday_items", "updated_at"),
       },
       collectors: collectors.collectors,
-      intent: intentStats(database, windowSince, attention),
+      ...recordStats(database, windowSince, attention),
       w5: w5Stats(database, input.windowDays, windowSince, coverage, queue, sessionIds),
       sync: sync.stats,
     };
@@ -896,7 +946,15 @@ export function scry(input: ScryInput): ScryReport {
     const evalDays = Math.min(input.windowDays, EVAL_WINDOW_DAYS);
     const evalFrom = new Date(now.getTime() - evalDays * DAY_MS).toISOString().slice(0, 10);
     const evalTo = now.toISOString().slice(0, 10);
-    const baselineSessions = stats.w5?.sessionsWithTraces ?? 0;
+    // The baseline is the range the printed command covers, not the (possibly longer) health window.
+    const evalSince = new Date(now.getTime() - evalDays * DAY_MS).toISOString();
+    const baselineSessions = sessionsWithTraces(
+      database,
+      selectBackfillSessions(database, { cutoff: evalSince, hostSlug: hostFilter }).map(
+        (session) => session.id,
+      ),
+      evalSince,
+    );
     if (baselineSessions >= EVAL_MIN_SESSIONS) {
       recommendations.push({
         id: "eval",
@@ -910,7 +968,7 @@ export function scry(input: ScryInput): ScryReport {
       );
     } else {
       notes.push(
-        `Eval: not recommended; only ${plural(baselineSessions, "session")} with traces in the last ${input.windowDays} days (need ${EVAL_MIN_SESSIONS}), too little to compare against.`,
+        `Eval: not recommended; only ${plural(baselineSessions, "session")} with traces in the last ${plural(evalDays, "day")} (need ${EVAL_MIN_SESSIONS}), too little to compare against.`,
       );
     }
     return finish(stats);

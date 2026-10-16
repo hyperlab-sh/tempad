@@ -183,10 +183,15 @@ export async function makeHealthyHome(
   return home;
 }
 
-export function insertFailedJob(database: Database, error: string, finishedAt: string): void {
+export function insertFailedJob(
+  database: Database,
+  error: string,
+  finishedAt: string,
+  sessionId = "x",
+): void {
   database
     .query(
-      "INSERT INTO w5_jobs (session_id, requested_at, claimed_at, finished_at, state, error) VALUES ('x', ?, ?, ?, 'failed', ?)",
+      "INSERT INTO w5_jobs (session_id, requested_at, claimed_at, finished_at, state, error) VALUES (?, ?, ?, ?, 'failed', ?)",
     )
-    .run(finishedAt, finishedAt, finishedAt, error);
+    .run(sessionId, finishedAt, finishedAt, finishedAt, error);
 }

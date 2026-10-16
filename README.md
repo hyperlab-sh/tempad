@@ -221,7 +221,7 @@ A read-only health check of the data. It prints **Health** (config, schema, `qui
 tempad scry                # human-readable
 tempad scry --json         # the same report as JSON
 tempad scry --fast         # skip quick_check and the projection replay
-tempad scry --days 30      # look further back for unclassified windows
+tempad scry --days 30      # look further back for unclassified windows (1 to 3650)
 ```
 
 Exit 0 when no check failed (warnings and recommendations alone do not fail), 1 when one did, 2 on a usage error. It opens the database read-only, so it applies no migration, repairs nothing and never touches the network.

@@ -31,24 +31,22 @@ function checkLines(entry: Check): string[] {
 }
 
 function statsLines(stats: ScryStats): string[] {
-  const { database, sources, collectors, intent, w5, sync } = stats;
+  const { database, sources, collectors, quests, stints, traces, questions, w5, sync } = stats;
   const lines = [
-    `  database       ${formatBytes(database.sizeBytes)}, schema ${database.schemaVersion}${intent ? `, ${intent.events} events` : ""}`,
+    `  database       ${formatBytes(database.sizeBytes)}, schema ${database.schemaVersion}, ${stats.events} events`,
     `  claude         ${sources.claudeSessions.rows} sessions (newest ${shortTimestamp(sources.claudeSessions.newest)}), ${sources.claudeMessages.rows} messages (newest ${shortTimestamp(sources.claudeMessages.newest)})`,
     `  github         ${sources.githubCommits.rows} commits (newest ${shortTimestamp(sources.githubCommits.newest)}), ${sources.githubPullRequests.rows} pull requests`,
     `  monday         ${sources.mondayItems.rows} items (newest update ${shortTimestamp(sources.mondayItems.newest)})`,
     `  collectors     ${collectors.map((collector) => `${collector.source} ${formatAge(collector.ageHours)}`).join(", ")}`,
   ];
-  if (intent) {
+  lines.push(
+    `  quests         ${counts(quests.byState)}${quests.unconfirmed > 0 ? ` (${quests.unconfirmed} unconfirmed)` : ""}`,
+    `  stints         ${stints.open} open, ${stints.closed} closed, ${stints.dismissed} dismissed`,
+    `  questions      ${counts(questions.byState)}`,
+  );
+  if (w5) {
     lines.push(
-      `  quests         ${counts(intent.quests)}${intent.questsUnconfirmed > 0 ? ` (${intent.questsUnconfirmed} unconfirmed)` : ""}`,
-      `  stints         ${intent.stints.open} open, ${intent.stints.closed} closed, ${intent.stints.dismissed} dismissed`,
-      `  questions      ${counts(intent.questions)}`,
-    );
-  }
-  if (w5 && intent) {
-    lines.push(
-      `  last ${w5.windowDays} days    ${w5.sessionsInWindow} sessions${w5.ownHostOnly ? " on this host" : ""} (${w5.sessionsDeclared} declared a quest, ${w5.sessionsUndeclared} did not), ${w5.sessionsWithTraces} with traces; ${intent.tracesInWindow} traces, ${intent.stintsWithoutQuestInWindow} stints without a quest`,
+      `  last ${w5.windowDays} days    ${w5.sessionsInWindow} sessions${w5.ownHostOnly ? " on this host" : ""} (${w5.sessionsDeclared} declared a quest, ${w5.sessionsUndeclared} did not), ${w5.sessionsWithTraces} with traces; ${traces.inWindow} traces, ${stints.withoutQuestInWindow} stints without a quest`,
       `  windows        ${w5.windowsCovered} classified, ${w5.windowsPending} not${w5.windowsInFlight > 0 ? `, ${w5.windowsInFlight} in flight` : ""}`,
       `  jobs           queued ${w5.jobs.queued}, running ${w5.jobs.running}, done ${w5.jobs.done}, failed ${w5.jobs.failed} (${w5.jobsFailedLast7Days} in the last 7 days)`,
     );

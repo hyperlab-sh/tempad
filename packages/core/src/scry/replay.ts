@@ -13,6 +13,12 @@ export interface ProjectionDifference {
   missing: number;
   /** Rows the stored table holds that the replay does not produce. */
   extra: number;
+  /** The stored database has no such table at all. */
+  tableMissing: boolean;
+  /** Columns the replayed table has and the stored one lacks. */
+  columnsMissing: string[];
+  /** Columns the stored table has and the replayed one lacks. */
+  columnsExtra: string[];
 }
 
 /** Later than any `at` an event can carry, so `stateAsOf` replays the whole log. */
@@ -49,10 +55,12 @@ function multisetDifference(left: Map<string, number>, right: Map<string, number
 /**
  * Replays the whole event log into a throwaway in-memory database
  * (`stateAsOf`, the same path `tempad rebuild` takes) and compares every
- * projection table with the stored one, row for row, over the columns both
- * have. Read-only on `database`. A stored table that does not exist counts as
- * empty, so a log whose projections were never built shows as all-missing.
- * Returns the tables that differ; empty means the projections match the log.
+ * projection table with the stored one: the table must exist, have the same
+ * columns, and hold the same rows. Read-only on `database`. A stored table
+ * that does not exist counts as empty (and is reported as missing even when
+ * the replay is empty too), so a log whose projections were never built, or a
+ * dropped table, cannot pass. Returns the tables that differ; empty means the
+ * projections match the log.
  */
 export function compareProjectionsToReplay(database: Database): ProjectionDifference[] {
   const replayed = stateAsOf(database, END_OF_TIME);
@@ -61,19 +69,35 @@ export function compareProjectionsToReplay(database: Database): ProjectionDiffer
     for (const projection of listProjections()) {
       for (const table of projection.tables) {
         const replayColumns = tableColumns(replayed, table);
-        const storedColumns = new Set(tableColumns(database, table));
-        const columns = replayColumns.filter((column) => storedColumns.has(column));
+        const storedColumns = tableColumns(database, table);
+        const tableMissing = storedColumns.length === 0;
+        const columnsMissing = tableMissing
+          ? []
+          : replayColumns.filter((column) => !storedColumns.includes(column));
+        const columnsExtra = storedColumns.filter((column) => !replayColumns.includes(column));
+        // Rows are compared over the columns both sides have, in the replay's order.
+        const columns = replayColumns.filter((column) => storedColumns.includes(column));
         const stored = rowCounts(database, table, columns);
         const expected = rowCounts(replayed, table, columns);
         const missing = multisetDifference(expected, stored);
         const extra = multisetDifference(stored, expected);
-        if (missing === 0 && extra === 0) continue;
+        if (
+          !tableMissing &&
+          columnsMissing.length === 0 &&
+          columnsExtra.length === 0 &&
+          missing === 0 &&
+          extra === 0
+        )
+          continue;
         differences.push({
           table,
           stored: [...stored.values()].reduce((sum, count) => sum + count, 0),
           replayed: [...expected.values()].reduce((sum, count) => sum + count, 0),
           missing,
           extra,
+          tableMissing,
+          columnsMissing,
+          columnsExtra,
         });
       }
     }
