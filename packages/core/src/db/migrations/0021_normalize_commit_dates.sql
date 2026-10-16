@@ -26,12 +26,16 @@ UPDATE gh_commits
    SET authored_at = CASE
          -- Only [-+]HH:MM is matched: git's %aI/%cI never emits +0300 (no colon).
          WHEN authored_at GLOB '*[-+][0-9][0-9]:[0-9][0-9]'
+         -- Offsets at or beyond +-15:00 (invalid, never emitted by git) make strftime return NULL;
+         -- COALESCE keeps the original text on purpose.
            THEN COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', authored_at), authored_at)
          ELSE authored_at
        END,
        committed_at = CASE
          -- Only [-+]HH:MM is matched: git's %aI/%cI never emits +0300 (no colon).
          WHEN committed_at GLOB '*[-+][0-9][0-9]:[0-9][0-9]'
+         -- Offsets at or beyond +-15:00 (invalid, never emitted by git) make strftime return NULL;
+         -- COALESCE keeps the original text on purpose.
            THEN COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', committed_at), committed_at)
          ELSE committed_at
        END,

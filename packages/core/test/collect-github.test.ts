@@ -584,7 +584,7 @@ describe("github collector", () => {
     }
   });
 
-  test("reconcile after 0021 with a date-only `since` bound reads it as UTC midnight", async () => {
+  test("reconcile after 0021 with a date-only `since` keeps normalized rows in the window (regression guard; passes without toUtcIso)", async () => {
     const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
     const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
     const sourceDirectory = await buildRepository([
