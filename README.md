@@ -235,7 +235,9 @@ TEMPAD_SYNC_TOKEN=<a JWT signed with the server's key>
 
 With `[sync]` present, `tempad sync` pushes this machine's changes and pulls the others' after collecting. `tempad sync --push` or `tempad sync --pull` runs one direction only, without collecting. Without `[sync]`, tempad never opens a network connection for sync.
 
-If the server is lost or replaced, the next `tempad sync` from any one host re-seeds it with everything that host holds, including rows other hosts wrote.
+If the server is lost or replaced, the next `tempad sync` from any one host re-seeds it with everything that host holds, including rows other hosts wrote. After restoring the server from a backup, run `DELETE FROM sync_meta WHERE key = 'server_id'` on it, so every host re-seeds (see `docs/deploy/sqld-coolify.md`).
+
+`[sync].url` takes no query string, fragment or `user:pass@`; the token comes only from `TEMPAD_SYNC_TOKEN`.
 
 Every host must run identical `[[projects]]` rules in `tempad.toml`. Collectors compute org, project and display name from the local rules and sync them as data, so hosts with different rules overwrite each other's values on every sync.
 
