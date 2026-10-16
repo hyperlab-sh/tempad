@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { QuestionRow } from "./questions";
 
@@ -36,6 +37,48 @@ export const PLUGIN_RECOMMENDATION_MESSAGE =
 const PACKAGE_ROOT = join(import.meta.dir, "..", "..");
 const HOOKS_DIR = join(PACKAGE_ROOT, "hooks");
 const CLI_PATH = join(PACKAGE_ROOT, "src", "cli.ts");
+
+/**
+ * Message `tempad w5 hook install` prints when it runs from a throwaway location. `bunx`
+ * unpacks a package into `$TMPDIR/bunx-<uid>-<name>@<version>/` (bun 1.3), and the global
+ * install cache lives under `~/.bun/install/cache/`; settings.json entries pointing there
+ * stop working as soon as bun clears them.
+ */
+export const UNSTABLE_INSTALL_MESSAGE =
+  "tempad w5 hook install: this copy of tempad lives in a temporary location (bunx or a cache), and the hooks it would write into settings.json would break once that is cleared. The supported route for bunx users is the plugin: claude plugin install tempad@hyperlab. `w5 hook install` is for a checkout or a global install (bun add -g tempad).";
+
+function pathVariants(path: string): string[] {
+  try {
+    return [path, realpathSync(path)];
+  } catch {
+    return [path];
+  }
+}
+
+/**
+ * True when `path` sits where bun keeps disposable packages: a `bunx-<uid>-` directory,
+ * bun's install cache, or the operating system's temp directory.
+ */
+export function isUnstableInstallPath(path: string): boolean {
+  const temporaryRoots = [
+    ...pathVariants(tmpdir()),
+    "/tmp",
+    "/private/tmp",
+    "/var/folders",
+    "/private/var/folders",
+  ].map((root) => root.replace(/\/+$/, ""));
+  return pathVariants(path).some(
+    (candidate) =>
+      /(^|\/)bunx-\d+-/.test(candidate) ||
+      candidate.includes("/.bun/install/cache/") ||
+      temporaryRoots.some((root) => candidate === root || candidate.startsWith(`${root}/`)),
+  );
+}
+
+/** True when the hooks `installHooks` would write (scripts, and `binPath` if given) are on disposable ground. */
+export function hasUnstableInstall(binPath: string = CLI_PATH): boolean {
+  return [binPath, stopHookScriptPath(), promptHookScriptPath()].some(isUnstableInstallPath);
+}
 
 export function stopHookScriptPath(): string {
   return join(HOOKS_DIR, "w5-stop.sh");
@@ -103,6 +146,26 @@ export function installHooks(settingsPath: string, binPath: string = CLI_PATH): 
   }
 
   writeSettings(settingsPath, { ...settings, hooks });
+}
+
+/**
+ * True when `settingsPath` holds a hook marked `"tempad": true`, i.e. one written by
+ * `tempad w5 hook install`. Falls back to a text match when the file is not valid JSON,
+ * the same test the hook scripts' stand-down check (`w5-common.sh`) applies.
+ */
+export function hasTempadHooks(settingsPath: string): boolean {
+  if (!existsSync(settingsPath)) return false;
+  const text = readFileSync(settingsPath, "utf8");
+  try {
+    const settings = JSON.parse(text) as SettingsFile;
+    return Object.values(settings.hooks ?? {}).some((matchers) =>
+      (matchers ?? []).some((matcher) =>
+        (matcher.hooks ?? []).some((hook) => hook.tempad === true),
+      ),
+    );
+  } catch {
+    return /"tempad"\s*:\s*true/.test(text);
+  }
 }
 
 export function uninstallHooks(settingsPath: string): void {

@@ -15,7 +15,10 @@ import {
   buildBelongsHandback,
   buildDeclarationLine,
   buildDeclareHandback,
+  hasUnstableInstall,
   installHooks,
+  PLUGIN_RECOMMENDATION_MESSAGE,
+  UNSTABLE_INSTALL_MESSAGE,
   uninstallHooks,
 } from "./hooks";
 import { enqueueJob } from "./jobs";
@@ -460,11 +463,16 @@ function runHook(args: string[]): number {
   const settingsPath = settingsPathFor(scope);
 
   if (action === "install") {
+    if (hasUnstableInstall(values.bin)) {
+      console.error(UNSTABLE_INSTALL_MESSAGE);
+      return 1;
+    }
     if (values.bin) {
       installHooks(settingsPath, values.bin);
     } else {
       installHooks(settingsPath);
     }
+    console.log(PLUGIN_RECOMMENDATION_MESSAGE);
     return 0;
   }
   if (action === "uninstall") {
