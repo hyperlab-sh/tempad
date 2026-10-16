@@ -549,16 +549,35 @@ function applyHookAction(
   return 2;
 }
 
+const BACKFILL_USAGE =
+  "usage: tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]";
+
 async function runBackfill(args: string[], context: W5Context): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
       days: { type: "string" },
+      from: { type: "string" },
       model: { type: "string" },
       force: { type: "boolean", default: false },
     },
     strict: true,
   });
+
+  if (values.days !== undefined && values.from !== undefined) {
+    context.stdout(`${BACKFILL_USAGE}\n--days and --from cannot be combined: pick one lower bound`);
+    return 2;
+  }
+  // An explicit lower bound, normalized to the form `claude_sessions.ended_at` is compared in.
+  let from: string | undefined;
+  if (values.from !== undefined) {
+    const fromMs = Date.parse(values.from);
+    if (values.from.trim() === "" || Number.isNaN(fromMs)) {
+      context.stdout(`${BACKFILL_USAGE}\n--from is not a valid date: ${values.from}`);
+      return 2;
+    }
+    from = new Date(fromMs).toISOString();
+  }
 
   const days = values.days
     ? Number.parseInt(values.days, 10)
@@ -577,6 +596,7 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     classifier,
     {
       days,
+      ...(from !== undefined ? { from } : {}),
       now: new Date().toISOString(),
       log: (line) => {
         log(context.config, line);

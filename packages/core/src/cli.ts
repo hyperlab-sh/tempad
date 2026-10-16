@@ -78,7 +78,7 @@ const USAGE_LINES: string[] = [
   "  tempad w5 context --session <id>",
   "  tempad w5 run [--detached]",
   "  tempad w5 hook install|uninstall [--scope user|project]",
-  "  tempad w5 backfill [--days <n>] [--model <name>] [--force]",
+  "  tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)",
   "  tempad w5 dedupe [--dry-run]",
   "  tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
   "  tempad quiet <2h|30m>",
