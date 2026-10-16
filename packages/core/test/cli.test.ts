@@ -374,6 +374,20 @@ describe("cli --help", () => {
     });
   }
 
+  test("`tempad <unknown> --help` is still a usage error: exit 2, usage on stderr", async () => {
+    const sandbox = makeSandbox();
+    try {
+      for (const flag of ["--help", "-h"]) {
+        const result = await runCli(sandbox, ["bogus", flag]);
+        expect(result.exitCode).toBe(2);
+        expect(result.stderr).toContain("Usage:");
+        expect(result.stdout).toBe("");
+      }
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
   test("`tempad <command> --help` prints the usage instead of failing on an unknown option", async () => {
     const sandbox = makeSandbox();
     try {
@@ -883,6 +897,32 @@ describe("tempad skill install", () => {
     } finally {
       process.env.HOME = previousHome;
       rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test("--scope user follows CLAUDE_CONFIG_DIR when set and non-empty, else HOME", () => {
+    const tempHome = mkdtempSync(join(tmpdir(), "tempad-skill-home-"));
+    const configDir = mkdtempSync(join(tmpdir(), "tempad-skill-config-"));
+    const previousHome = process.env.HOME;
+    const previousConfig = process.env.CLAUDE_CONFIG_DIR;
+    process.env.HOME = tempHome;
+    try {
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      expect(existsSync(join(configDir, "skills", "tempad-quest", "SKILL.md"))).toBe(true);
+      expect(existsSync(join(tempHome, ".claude"))).toBe(false);
+
+      process.env.CLAUDE_CONFIG_DIR = "";
+      expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      expect(existsSync(join(tempHome, ".claude", "skills", "tempad-quest", "SKILL.md"))).toBe(
+        true,
+      );
+    } finally {
+      process.env.HOME = previousHome;
+      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfig;
+      rmSync(tempHome, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
     }
   });
 

@@ -3,7 +3,7 @@ import { homedir as osHomedir, hostname as osHostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ENV_VARS, type EnvVar, readDotEnv } from "../config/env.ts";
-import { hasTempadHooks } from "../w5/hooks.ts";
+import { hasTempadHooks, settingsPathFor } from "../w5/hooks.ts";
 import { flagNameFor, renderEnvFile } from "./env-file.ts";
 import {
   createPrompter,
@@ -108,12 +108,12 @@ function blocking(findings: readonly Finding[]): Finding[] {
   return findings.filter((finding) => finding.level === "error" || finding.level === "unverified");
 }
 
-/** `settings.json` files a legacy `tempad w5 hook install` may have written to. */
-function legacyHookSettingsPaths(deps: InitDeps): string[] {
-  const paths = [join(deps.homedir, ".claude", "settings.json")];
-  const configured = deps.env.CLAUDE_CONFIG_DIR;
-  if (configured) paths.push(join(configured, "settings.json"));
-  return [...new Set(paths)];
+/** The user `settings.json` a legacy `tempad w5 hook install` may have written to. */
+function legacyHookSettingsPath(deps: InitDeps): string {
+  return settingsPathFor("user", {
+    CLAUDE_CONFIG_DIR: deps.env.CLAUDE_CONFIG_DIR,
+    HOME: deps.homedir,
+  });
 }
 
 interface Options {
@@ -375,13 +375,11 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
       }
     }
 
-    const keepExtras = envExists && !options.force;
     const knownNames = new Set(ENV_VARS.map((variable) => variable.name));
     const extras: Record<string, string> = {};
-    if (keepExtras) {
-      for (const [name, value] of Object.entries(existing)) {
-        if (!knownNames.has(name)) extras[name] = value;
-      }
+    // Lines tempad does not own (e.g. ANTHROPIC_API_KEY) survive every rewrite, --force included.
+    for (const [name, value] of Object.entries(existing)) {
+      if (!knownNames.has(name)) extras[name] = value;
     }
 
     const written = writeFiles({
@@ -404,13 +402,13 @@ export async function runInit(args: string[], overrides: Partial<InitDeps> = {})
       outLine(`  ${variable.name}=${describeValue(variable, values[variable.name])}`);
     }
 
-    const legacy = legacyHookSettingsPaths(deps).some((path) => {
+    const legacy = (() => {
       try {
-        return hasTempadHooks(path);
+        return hasTempadHooks(legacyHookSettingsPath(deps));
       } catch {
         return false;
       }
-    });
+    })();
     outLine();
     outLine("Next steps (use `bunx tempad` where tempad is not on your PATH):");
     outLine("  claude plugin install tempad@hyperlab");

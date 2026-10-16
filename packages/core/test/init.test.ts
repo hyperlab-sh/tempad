@@ -858,13 +858,15 @@ describe("interactive wizard", () => {
       expect(statSync(join(tempadHome, ".env")).mode & 0o777).toBe(0o600);
     });
 
-    test("--force skips the confirmation and drops lines tempad does not own", async () => {
+    test("--force skips the confirmation but keeps lines tempad does not own", async () => {
       const h = harness({ isTTY: true, input: answers({}) });
       expect(await h.run(["--home", tempadHome, "--no-verify", "--force"])).toBe(0);
       expect(h.stdout()).not.toContain("Update it?");
       const written = parseDotEnv(readFileSync(join(tempadHome, ".env"), "utf8"));
-      expect(written.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(written.ANTHROPIC_API_KEY).toBe("sk-ant-keep-me");
       expect(written.MONDAY_API_TOKEN).toBe(MONDAY_TOKEN);
+      expect(h.stdout()).not.toContain("sk-ant-keep-me");
+      expect(h.stderr()).not.toContain("sk-ant-keep-me");
     });
 
     test("flags given in the wizard override the current value as the suggestion", async () => {
@@ -1054,6 +1056,24 @@ describe("next steps", () => {
     mkdirSync(configDir, { recursive: true });
     installHooks(join(configDir, "settings.json"), "/somewhere/tempad/src/cli.ts");
     const out = await stepsFor({ env: { CLAUDE_CONFIG_DIR: configDir } });
+    expect(out).toContain("tempad w5 hook uninstall");
+  });
+
+  test("with CLAUDE_CONFIG_DIR set, a stale entry in ~/.claude/settings.json is not the user's settings", async () => {
+    const configDir = join(root, "alt-claude");
+    mkdirSync(configDir, { recursive: true });
+    const out = await stepsFor({
+      env: { CLAUDE_CONFIG_DIR: configDir },
+      settings: (path) => installHooks(path, "/somewhere/tempad/src/cli.ts"),
+    });
+    expect(out).not.toContain("w5 hook uninstall");
+  });
+
+  test("an empty CLAUDE_CONFIG_DIR falls back to ~/.claude/settings.json", async () => {
+    const out = await stepsFor({
+      env: { CLAUDE_CONFIG_DIR: "" },
+      settings: (path) => installHooks(path, "/somewhere/tempad/src/cli.ts"),
+    });
     expect(out).toContain("tempad w5 hook uninstall");
   });
 

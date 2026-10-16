@@ -608,6 +608,82 @@ describe("hook scripts: configuration and stand-down", () => {
     }
   });
 
+  test("with CLAUDE_CONFIG_DIR set, a stale legacy entry in $HOME/.claude does not make the plugin stand down", async () => {
+    const dir = configuredHome();
+    try {
+      const argvLog = join(dir, "argv.log");
+      const fakeCli = join(dir, "tempad");
+      writeFakeCli(fakeCli, argvLog);
+      writeLegacySettings(join(dir, "home", ".claude", "settings.json"));
+      const configDirectory = join(dir, "work-account");
+      mkdirSync(configDirectory, { recursive: true });
+      writeFileSync(join(configDirectory, "settings.json"), "{}");
+
+      const result = await runScript("w5-stop.sh", stopPayload, {
+        ...hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" }),
+        CLAUDE_CONFIG_DIR: configDirectory,
+      });
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(existsSync(argvLog)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty CLAUDE_CONFIG_DIR means $HOME/.claude/settings.json", async () => {
+    const dir = configuredHome();
+    try {
+      const argvLog = join(dir, "argv.log");
+      const fakeCli = join(dir, "tempad");
+      writeFakeCli(fakeCli, argvLog);
+      writeLegacySettings(join(dir, "home", ".claude", "settings.json"));
+
+      const result = await runScript("w5-stop.sh", stopPayload, {
+        ...hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" }),
+        CLAUDE_CONFIG_DIR: "",
+      });
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(existsSync(argvLog)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("TEMPAD_HOME with a leading ~ or ~/ is expanded like tempadHome() does", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "tempad-hookscript-test-"));
+    try {
+      const fakeHome = join(parent, "home");
+      mkdirSync(join(fakeHome, ".tempad-work"), { recursive: true });
+      writeFileSync(join(fakeHome, ".tempad-work", ".env"), "");
+      const argvLog = join(parent, "argv.log");
+      const fakeCli = join(parent, "tempad");
+      writeFakeCli(fakeCli, argvLog);
+      const env = {
+        PATH: SYSTEM_PATH,
+        HOME: fakeHome,
+        TEMPAD_BIN: fakeCli,
+        TEMPAD_HOME: "~/.tempad-work",
+      };
+
+      const result = await runScript("w5-stop.sh", stopPayload, env);
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(readFileSync(argvLog, "utf8").trim()).toBe("w5 enqueue --session s1 --kind classify");
+
+      // A bare ~ is the home directory itself.
+      rmSync(argvLog);
+      writeFileSync(join(fakeHome, ".env"), "");
+      await runScript("w5-stop.sh", stopPayload, { ...env, TEMPAD_HOME: "~" });
+      expect(existsSync(argvLog)).toBe(true);
+
+      // A literal directory named "~" in the working directory is not what ~/ means.
+      rmSync(argvLog);
+      await runScript("w5-stop.sh", stopPayload, { ...env, TEMPAD_HOME: "~other" });
+      expect(existsSync(argvLog)).toBe(false);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   test("plugin source runs when settings exist but carry no tempad marker", async () => {
     const dir = configuredHome();
     try {

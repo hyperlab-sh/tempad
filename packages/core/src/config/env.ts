@@ -140,8 +140,10 @@ export class ConfigError extends Error {
   }
 }
 
+/** Expands a leading `~` or `~/`; `hooks/w5-common.sh` applies the same rule to TEMPAD_HOME. */
 function expandHome(value: string, home: string): string {
-  return value.startsWith("~") ? join(home, value.slice(1)) : value;
+  if (value === "~") return home;
+  return value.startsWith("~/") ? join(home, value.slice(2)) : value;
 }
 
 function parseCommaList(value: string): string[] {
@@ -179,6 +181,14 @@ export function parseDotEnv(text: string): Record<string, string> {
 export function readDotEnv(home: string): Record<string, string> {
   const envPath = join(home, ".env");
   return parseDotEnv(existsSync(envPath) ? readFileSync(envPath, "utf8") : "");
+}
+
+/**
+ * `ANTHROPIC_API_KEY` for the `api` classifier backend: the real environment first, then
+ * `<home>/.env`, like every other setting. No default; undefined when neither has one.
+ */
+export function anthropicApiKey(home: string): string | undefined {
+  return process.env.ANTHROPIC_API_KEY || readDotEnv(home).ANTHROPIC_API_KEY || undefined;
 }
 
 /** `TEMPAD_HOME` (with `~` expanded), or `~/.tempad` when unset. A location, not a credential. */

@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config/env";
@@ -784,4 +792,80 @@ describe("w5 hook settings location", () => {
     );
     expect(settingsPathFor("user", { HOME: "/home/x" })).toBe("/home/x/.claude/settings.json");
   });
+});
+
+describe("w5 backfill with the api backend reads ANTHROPIC_API_KEY from TEMPAD_HOME/.env", () => {
+  async function backfillOutput(dir: string): Promise<{ code: number; output: string[] }> {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const intentConfig = defaultIntentConfig();
+    intentConfig.w5.backend = "api";
+    const output: string[] = [];
+    const code = await runW5Command(["backfill"], {
+      database,
+      config: makeConfig(dir),
+      intentConfig,
+      stdout: (line) => output.push(line),
+      spawn: () => {},
+    });
+    return { code, output };
+  }
+
+  test("missing from both the environment and .env: refuses naming the variable", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    const previousKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      const { code, output } = await backfillOutput(dir);
+      expect(code).toBe(1);
+      expect(output).toContain("ANTHROPIC_API_KEY not set");
+    } finally {
+      if (previousKey !== undefined) process.env.ANTHROPIC_API_KEY = previousKey;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("present only in TEMPAD_HOME/.env: accepted, and never printed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    const previousKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      writeFileSync(join(dir, ".env"), "ANTHROPIC_API_KEY=sk-secret-from-file\n");
+      const { output } = await backfillOutput(dir);
+      expect(output).not.toContain("ANTHROPIC_API_KEY not set");
+      expect(output.join("\n")).not.toContain("sk-secret-from-file");
+    } finally {
+      if (previousKey !== undefined) process.env.ANTHROPIC_API_KEY = previousKey;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("w5 hook install|uninstall with an unparseable settings.json", () => {
+  for (const [label, content] of [
+    ["invalid JSON", "{ not json"],
+    ["a non-object top level", "[1, 2]"],
+    ["null", "null"],
+  ] as const) {
+    for (const action of ["install", "uninstall"] as const) {
+      test(`${action} exits 1 naming the file and leaves it untouched (${label})`, () => {
+        const home = mkdtempSync(join(tmpdir(), "tempad-hook-cli-"));
+        const settingsPath = join(home, ".claude", "settings.json");
+        mkdirSync(join(home, ".claude"), { recursive: true });
+        writeFileSync(settingsPath, content);
+        try {
+          const args =
+            action === "install" ? ["install", "--bin", "/opt/tempad/src/cli.ts"] : ["uninstall"];
+          const result = runHookCommand(args, { home });
+          expect(result.code).toBe(1);
+          expect(result.err.join("\n")).toContain(settingsPath);
+          expect(result.err.join("\n")).toContain("not valid JSON");
+          expect(result.err.join("\n")).not.toContain("    at ");
+          expect(readFileSync(settingsPath, "utf8")).toBe(content);
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      });
+    }
+  }
 });
