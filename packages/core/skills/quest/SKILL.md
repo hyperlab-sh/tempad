@@ -29,9 +29,8 @@ Before your first tempad call in this session, find the CLI once: `tempad` if `c
 succeeds, else `bunx @hyperlab.sh/tempad` if `command -v bun` succeeds. Use that form wherever a command below
 says `tempad`.
 
-- Neither exists: tell the user to run `/tempad:setup` (it installs bun guidance and the CLI) and stop.
-  Do not declare anything.
-- The CLI answers `tempad is not set up yet`: tell the user to run `/tempad:setup` (or `tempad setup` in a terminal) and stop.
+- Neither exists: tell the user: "In Claude Code with the tempad plugin, run `/tempad:setup`. Otherwise install bun (https://bun.sh), then run `bun add -g @hyperlab.sh/tempad && tempad setup`." Stop. Do not declare anything.
+- The CLI answers `tempad is not set up yet`: tell the user the same sentence and stop.
 
 ## Declare
 

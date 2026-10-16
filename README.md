@@ -160,7 +160,7 @@ Each command checks only the variables it needs and fails naming the command and
 | `TZ`                  | IANA time zone that places work on days, e.g. `Europe/Berlin`             | `report *`, `w5 eval`        |
 | `SINCE`               | Earliest date to sync, `YYYY-MM-DD`                                       | `sync github`, `sync claude` |
 
-`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx @hyperlab.sh/tempad init`.
+`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `--version`, `setup` (and its hidden alias `init`), `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run /tempad:setup in Claude Code, or `tempad setup` in a terminal`.
 
 `ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad setup --force` keeps that line when it rewrites the file.
 
