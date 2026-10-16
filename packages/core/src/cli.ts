@@ -29,6 +29,8 @@ import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
 import { runSetup } from "./setup/index.ts";
+import { isSyncEnabled } from "./sync/config.ts";
+import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
   planW5Command,
   runQuietCommand,
@@ -56,7 +58,7 @@ const USAGE_LINES: string[] = [
   "Usage:",
   "  tempad --help | -h | help | --version",
   "  tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
-  "  tempad sync [monday|github|claude] [--full]",
+  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull",
   "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
   '  tempad hero init "<name>"',
   '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
@@ -161,43 +163,83 @@ export async function runSync(
 async function runSyncCommand(args: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args,
-    options: { full: { type: "boolean", default: false } },
+    options: {
+      full: { type: "boolean", default: false },
+      push: { type: "boolean", default: false },
+      pull: { type: "boolean", default: false },
+    },
     strict: true,
     allowPositionals: true,
   });
   const source = positionals[0];
+  // --push/--pull run only those directions and skip the collectors, so they
+  // take no source and no --full.
+  const directional = values.push || values.pull;
 
   if (source !== undefined && !collectors.has(source as Collector["name"])) {
     printUsage();
     return 2;
   }
+  if (directional && (source !== undefined || values.full)) {
+    printUsage();
+    return 2;
+  }
 
-  const selected: Collector[] =
-    source !== undefined
+  const selected: Collector[] = directional
+    ? []
+    : source !== undefined
       ? [collectors.get(source as Collector["name"]) as Collector]
       : [...collectors.values()];
 
   // Only the selected collectors' variables are required, so `sync monday` works on a
   // machine that has never configured GitHub. `runSync` types the result as the full
-  // config; each collector's own `LoadedConfig` is what it actually reads.
-  const needs = [...new Set(selected.flatMap((collector) => collector.needs))];
+  // config; each collector's own `LoadedConfig` is what it actually reads. Push sync
+  // needs the host tag, and only when `[sync]` is enabled.
+  const syncEnabled = isSyncEnabled(tempadHome());
+  const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
+  if (syncEnabled && !needs.includes("hostSlug")) needs.push("hostSlug");
   const label = source === undefined ? "tempad sync" : `tempad sync ${source}`;
   const { config, database } = prepareCommand(label, needs);
 
-  if (values.full) {
-    const deleteSyncState = database.query("DELETE FROM sync_state WHERE source = ?");
-    for (const collector of selected) {
-      deleteSyncState.run(collector.name);
+  let failed = false;
+  if (!directional) {
+    if (values.full) {
+      const deleteSyncState = database.query("DELETE FROM sync_state WHERE source = ?");
+      for (const collector of selected) {
+        deleteSyncState.run(collector.name);
+      }
+    }
+
+    const result = await runSync(database, config, selected, values.full);
+    failed = result.failed;
+
+    for (const summary of result.summaries) {
+      const warnings = summary.warnings.length > 0 ? ` warnings=${summary.warnings.length}` : "";
+      console.log(
+        `${summary.source}: inserted=${summary.inserted} updated=${summary.updated} deleted=${summary.deleted}${warnings}`,
+      );
     }
   }
 
-  const { summaries, failed } = await runSync(database, config, selected, values.full);
-
-  for (const summary of summaries) {
-    const warnings = summary.warnings.length > 0 ? ` warnings=${summary.warnings.length}` : "";
-    console.log(
-      `${summary.source}: inserted=${summary.inserted} updated=${summary.updated} deleted=${summary.deleted}${warnings}`,
-    );
+  // Push sync, when [sync] is enabled: after the collectors (which keep
+  // their results whatever happens here), or alone with --push/--pull.
+  try {
+    const summary = await runPushSync({
+      database,
+      home: config.home,
+      hostSlug: config.hostSlug,
+      env: process.env,
+      push: directional ? values.push : true,
+      pull: directional ? values.pull : true,
+    });
+    if (summary === null) {
+      if (directional) throw new SyncNotConfiguredError();
+    } else {
+      console.log(formatSyncSummary(summary));
+    }
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return 1;
   }
 
   return failed ? 1 : 0;
