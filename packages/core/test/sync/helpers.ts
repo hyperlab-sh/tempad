@@ -6,7 +6,8 @@ import type { Config } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
 import { runIntentCommand } from "../../src/intent/cli";
 import { defaultIntentConfig } from "../../src/intent/config";
-import { ALL_PROJECTIONS } from "../../src/intent/projections/register";
+import { rebuildAll } from "../../src/intent/projections";
+import { ALL_PROJECTIONS, registerAllProjections } from "../../src/intent/projections/register";
 import type { RemoteStatement, SqlValue, SyncRemote } from "../../src/sync/engine";
 import { SYNCED_UPSERT_TABLES } from "../../src/sync/tables";
 
@@ -151,6 +152,19 @@ export async function intent(database: Database, args: string[]): Promise<void> 
   if (code !== 0) throw new Error(`tempad ${args.join(" ")} exited ${code}`);
 }
 
+/** Like `intent`, but returns what the command printed, one entry per line. */
+export async function intentLines(database: Database, args: string[]): Promise<string[]> {
+  const lines: string[] = [];
+  const code = await runIntentCommand(args, {
+    database,
+    config: { hostSlug: "test", home: "/nonexistent" } as Config,
+    intentConfig: defaultIntentConfig(),
+    stdout: (line: string) => lines.push(line),
+  });
+  if (code !== 0) throw new Error(`tempad ${args.join(" ")} exited ${code}`);
+  return lines;
+}
+
 /** Forces a row's stamp (and dirties it), to stage conflicts deterministically. */
 export function restamp(
   database: Database,
@@ -213,4 +227,38 @@ export function projectionSnapshot(database: Database): Record<string, unknown[]
     }
   }
   return snapshot;
+}
+
+/**
+ * A new in-memory database holding the same events as `source`, inserted in
+ * random order (local ids then disagree with uid order) and rebuilt once:
+ * the projections a host that had every event from the start would hold.
+ */
+export function rebuiltFromScratch(source: Database): Database {
+  registerAllProjections();
+  const target = openDatabase(":memory:");
+  const rows = source
+    .query(
+      "SELECT at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host FROM events ORDER BY RANDOM()",
+    )
+    .all() as Record<string, string | null>[];
+  const insert = target.query(
+    `INSERT INTO events (at, recorded_at, actor, session_id, kind, subject, payload, uid, sync_host, sync_dirty)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+  );
+  for (const row of rows) {
+    insert.run(
+      row.at,
+      row.recorded_at,
+      row.actor,
+      row.session_id,
+      row.kind,
+      row.subject,
+      row.payload,
+      row.uid,
+      row.sync_host,
+    );
+  }
+  rebuildAll(target);
+  return target;
 }
