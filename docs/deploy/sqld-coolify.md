@@ -2,7 +2,7 @@
 
 `tempad sync` pushes to and pulls from one sqld (the libSQL server). This page covers running that server on Coolify and wiring each host to it. Design: `docs/specs/push-sync.md`.
 
-Every claim below was checked against the `tursodatabase/libsql` sources unless it carries "(unverified)". Checked on 2026-10-16 against `main`.
+Every claim below was checked against the `tursodatabase/libsql` sources unless it carries "(unverified)". Checked on 2026-10-16 against `main`. Claims marked "(tested)" are also exercised by `packages/core/test/sync/sqld.integration.test.ts` against `libsql-server:latest`.
 
 ## 1. The server
 
@@ -50,8 +50,8 @@ What sqld checks (from `libsql-server/src/auth/user_auth_strategies/jwt.rs`):
 
 - Algorithm must be EdDSA (Ed25519). Anything else is rejected.
 - `exp` is optional, so a token without it never expires.
-- Every claim (`id`, `a`, `p`, `exp`) is optional. A token with none of them is accepted as a write token for the default namespace.
-- The public key is either an Ed25519 public key in PEM (PKCS#8-encoded per the sqld docs), or **the raw 32-byte key in URL-safe base64**. This page uses the second form: one line, safe in an environment variable.
+- Every claim (`id`, `a`, `p`, `exp`) is optional. A token with none of them is accepted as a write token for the default namespace (tested).
+- The public key is either an Ed25519 public key in PEM (PKCS#8-encoded per the sqld docs), or **the raw 32-byte key in URL-safe base64**. This page uses the second form: one line, safe in an environment variable. The JWK `x` value printed by the script below is exactly that form (tested).
 - Key sources: `SQLD_AUTH_JWT_KEY` (the key itself) or `--auth-jwt-key-file` / `SQLD_AUTH_JWT_KEY_FILE` (a path). There is no `--auth-jwt-key` flag.
 - A key file may hold several keys concatenated; sqld tries each against incoming tokens. How keys are delimited in the base64url form is not documented (unverified). Use PEM blocks if you need several.
 
@@ -81,7 +81,7 @@ if (command === "keygen") {
 
 1. `bun jwt.ts keygen ~/.config/tempad-sqld/signing.pem` writes the private key (mode 0600) and prints the public key. Keep the private key in your password manager or an encrypted vault. It never goes on the server and never into any repo.
 2. Paste the printed public key into Coolify as the environment variable `SQLD_AUTH_JWT_KEY`, then redeploy.
-3. For each host run `bun jwt.ts mint ~/.config/tempad-sqld/signing.pem <HOST_SLUG>`. The output is that host's `TEMPAD_SYNC_TOKEN`. `sub` only labels the token; sqld ignores it (extra claims are tolerated: unverified).
+3. For each host run `bun jwt.ts mint ~/.config/tempad-sqld/signing.pem <HOST_SLUG>`. The output is that host's `TEMPAD_SYNC_TOKEN`. `sub` only labels the token; sqld ignores it (extra claims are tolerated: tested).
 
 Equivalent with OpenSSL, if you prefer: `openssl genpkey -algorithm ed25519 -out signing.pem`, then `openssl pkey -in signing.pem -pubout -outform DER | tail -c 32 | basenc --base64url | tr -d '='` gives the same raw public key (`basenc` is GNU coreutils; on macOS use `base64 | tr '+/' '-_' | tr -d '='`). Signing a JWT with `openssl pkeyutl -rawin` needs OpenSSL 3 or newer, which is why the script above is the recommended path.
 
@@ -112,7 +112,7 @@ sqld stores SQLite databases under `/var/lib/sqld`. What I verified and what I d
 - **Recommended, simple and safe:** stop the service in Coolify, copy the volume, start it again. For example `docker run --rm -v <volume>:/data -v $PWD:/out alpine tar czf /out/sqld-$(date +%F).tgz -C /data .`. Do it from a scheduled job on the Coolify host or use Coolify's scheduled backups for volumes if your version offers them (unverified). A live copy of a WAL-mode SQLite directory can be inconsistent; I did not verify what sqld guarantees (unverified), so do not skip the stop.
 - Test a restore once: extract into a fresh volume, start the container, run the smoke check.
 
-**The remote is not the only copy.** Each host's local `tempad.db` already holds a complete copy of the source tables, so losing the server loses no data permanently. It does not, however, repopulate itself: a fresh server receives from each host only the rows still marked dirty (the dirty flag is cleared after a successful push, per the spec). A full re-seed of an empty server needs a reset procedure that does not exist yet; this is tracked as a follow-up. Until it does, back up the volume.
+**The remote is not the only copy.** Each host's local `tempad.db` already holds a complete copy of the source tables, so losing the server loses no data permanently. A fresh or reset server repopulates itself: the server holds a random `server_id` in its `sync_meta` table, and each host remembers the id it last synced with. When the id differs, or the server's clock is behind what the host has already pulled (a restore from an older backup), the host's next `tempad sync --push` re-sends every row, event and tombstone it authored, dirty or not, and pulls from the start. Once every host has pushed, the server is whole again (tested). A `--pull`-only run against such a server resets its cursors but leaves the re-seed to the next push. A restore that keeps the same `server_id` and a clock at or ahead of the hosts' cursors is not detected; back up the volume anyway and, after a restore, run `tempad sync` on every host.
 
 ## 5. Client side
 
@@ -129,13 +129,15 @@ In `TEMPAD_HOME/.env` (tempad has no default for this and throws at startup when
 TEMPAD_SYNC_TOKEN=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9...
 ```
 
-Accepted schemes are `libsql:`, `https:` and `wss:`. Plain `http:`/`ws:` work only for loopback hosts, so the token never crosses the network unencrypted. `libsql://` uses TLS in `@libsql/client` (unverified here); with the Coolify setup above both `libsql://` and `https://` terminate at the proxy.
+Accepted schemes are `libsql:`, `https:` and `wss:`. Plain `http:`/`ws:` work only for loopback hosts, so the token never crosses the network unencrypted. `libsql://` uses TLS in `@libsql/client` unless the URL carries `?tls=0` (checked in `@libsql/core` 0.18 `config.js`); with the Coolify setup above both `libsql://` and `https://` terminate at the proxy.
+
+Every host must run identical `[[projects]]` rules in `tempad.toml`. Org, project and display name are computed from the local rules and synced as data, so hosts with different rules overwrite each other's values on every sync (see `docs/specs/push-sync.md`).
 
 ### Smoke checks
 
-1. Server up (sqld exposes `/health`; unverified): `curl -i https://tempad-sync.example.com/health`.
+1. Server up (sqld answers `GET /health` with 200; tested): `curl -i https://tempad-sync.example.com/health`.
 2. Auth enforced. A request without a token must be refused, not served. Hrana-over-HTTP check: `curl -i -X POST https://tempad-sync.example.com/v2/pipeline -H 'content-type: application/json' -d '{"requests":[{"type":"close"}]}'` should return 401 (unverified endpoint shape). If it returns 200, stop: the key is not applied. Repeat with `-H "authorization: Bearer $TEMPAD_SYNC_TOKEN"` and expect 200.
-3. End to end, from a host: `tempad sync --push`. The first run creates the remote tables and prints the one-line `sync: pushed events=<n> rows=<n> ...` summary (format per the spec); a second run with nothing new pushes zero. A bad or missing token exits 1 with an auth error; a wrong key on the server does the same.
+3. End to end, from a host: `tempad sync --push`. The first run creates the remote tables and prints the one-line `sync: pushed events=<n> rows=<n> ...` summary (format per the spec); a second run with nothing new pushes zero. A bad token exits 1 with `SERVER_ERROR: Server returned HTTP status 401` (tested; the token never appears in the output), and so does a wrong key on the server. A missing token exits 1 before any connection with `TEMPAD_SYNC_TOKEN is required when [sync] is enabled`.
 4. On a second host: `tempad sync --pull`, then compare `tempad report` output for the same day.
 
 ## Related
