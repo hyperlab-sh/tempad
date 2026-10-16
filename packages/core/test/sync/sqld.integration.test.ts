@@ -1,8 +1,13 @@
 /**
- * Push sync against a real sqld (`ghcr.io/tursodatabase/libsql-server`),
- * started here with a fresh Ed25519 key and removed with its volume in
- * `afterAll`. Skipped, with the reason printed, only when no `docker` CLI is
- * on PATH.
+ * Push sync against a real sqld (`ghcr.io/tursodatabase/libsql-server`,
+ * pinned by digest), started here with a fresh Ed25519 key and removed with
+ * its volume in `afterAll`. Skipped, with the reason printed, when there is
+ * no `docker` CLI or `docker info` cannot reach a daemon; never silently.
+ *
+ * Containers are named `tempad-sqld-test-<hex>`, labelled `tempad-test=sqld`
+ * and run with `--rm`. A name is recorded before `docker run`, so `afterAll`
+ * and a `process.on("exit")` hook remove it even when `beforeAll` timed out
+ * mid-start; `beforeAll` first sweeps labelled containers a killed run left.
  */
 import type { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -26,9 +31,45 @@ import {
   temporaryDirectory,
 } from "./helpers";
 
-const IMAGE = "ghcr.io/tursodatabase/libsql-server:latest";
-const dockerPath = Bun.which("docker");
-if (dockerPath === null) console.warn("sqld integration tests skipped: no `docker` CLI on PATH");
+// `ghcr.io/tursodatabase/libsql-server:latest` as pulled on 2026-10-16 (image
+// created 2026-08-23). docs/deploy/sqld-coolify.md's tested claims name it.
+const IMAGE =
+  "ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67";
+const LABEL = "tempad-test=sqld";
+const PULL_TIMEOUT_MS = 300_000;
+const DOCKER_TIMEOUT_MS = 60_000;
+
+/** Why the suite cannot run here, or null when a daemon answers. */
+function dockerSkipReason(): string | null {
+  if (Bun.which("docker") === null) return "no `docker` CLI on PATH";
+  const probe = Bun.spawnSync({
+    cmd: ["docker", "info", "--format", "{{.ServerVersion}}"],
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 20_000,
+  });
+  if (probe.exitCode === 0) return null;
+  const detail = probe.stderr.toString().trim().split("\n")[0];
+  return `docker daemon unreachable (docker info: ${detail || (probe.exitCode === null ? "timed out" : `exit ${probe.exitCode}`)})`;
+}
+
+const skipReason = dockerSkipReason();
+if (skipReason !== null) console.warn(`sqld integration tests skipped: ${skipReason}`);
+
+/** Every container name this process may have started, removed on exit. */
+const started = new Set<string>();
+const tunnels = new Set<ReturnType<typeof Bun.spawn>>();
+process.on("exit", () => {
+  for (const tunnel of tunnels) tunnel.kill();
+  if (started.size > 0) {
+    Bun.spawnSync({
+      cmd: ["docker", "rm", "-f", "-v", ...started],
+      stdout: "ignore",
+      stderr: "ignore",
+      timeout: 30_000,
+    });
+  }
+});
 
 function base64url(input: Buffer | string): string {
   return Buffer.from(input).toString("base64url");
@@ -41,15 +82,45 @@ function mintJwt(privateKey: KeyObject, claims: Record<string, unknown> = {}): s
   return `${header}.${payload}.${base64url(signature)}`;
 }
 
-async function docker(args: string[]): Promise<string> {
+async function docker(args: string[], timeoutMs = DOCKER_TIMEOUT_MS): Promise<string> {
   const proc = Bun.spawn({ cmd: ["docker", ...args], stdout: "pipe", stderr: "pipe" });
-  const [code, stdout, stderr] = await Promise.all([
-    proc.exited,
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  if (code !== 0) throw new Error(`docker ${args[0]} failed: ${stderr.trim()}`);
-  return stdout.trim();
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  try {
+    const [code, stdout, stderr] = await Promise.all([
+      proc.exited,
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    if (code !== 0) {
+      throw new Error(
+        `docker ${args[0]} failed (exit ${code}): ${stderr.trim() || "killed after timeout"}`,
+      );
+    }
+    return stdout.trim();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function removeContainers(names: string[]): Promise<void> {
+  if (names.length === 0) return;
+  // `docker rm -f` of a name already gone (`--rm`) fails; that is fine.
+  await docker(["rm", "-f", "-v", ...names]).catch(() => {});
+  for (const name of names) started.delete(name);
+}
+
+/** Removes labelled containers a killed earlier run left behind. */
+async function sweepStaleContainers(): Promise<void> {
+  const ids = await docker(["ps", "-aq", "--filter", `label=${LABEL}`]);
+  if (ids !== "") await removeContainers(ids.split("\n"));
+}
+
+async function ensureImage(): Promise<void> {
+  const present = await docker(["image", "inspect", "--format", "{{.Id}}", IMAGE]).then(
+    () => true,
+    () => false,
+  );
+  if (!present) await docker(["pull", IMAGE], PULL_TIMEOUT_MS);
 }
 
 interface Server {
@@ -64,7 +135,10 @@ interface Server {
  * through an SSH tunnel to a local loopback port rather than exposing it.
  */
 async function dockerSshHost(): Promise<string | null> {
-  const endpoint = await docker(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]);
+  // DOCKER_HOST overrides the context, exactly as the docker CLI resolves it.
+  const endpoint =
+    process.env.DOCKER_HOST ||
+    (await docker(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]));
   return endpoint.startsWith("ssh://") ? endpoint.slice("ssh://".length) : null;
 }
 
@@ -77,19 +151,25 @@ function freeLocalPort(): number {
 
 async function startServer(publicKey: string): Promise<Server> {
   const name = `tempad-sqld-test-${randomBytes(4).toString("hex")}`;
-  await docker([
-    "run",
-    "-d",
-    "--name",
-    name,
-    "-p",
-    "127.0.0.1::8080",
-    "-e",
-    `SQLD_AUTH_JWT_KEY=${publicKey}`,
-    IMAGE,
-  ]);
+  // Recorded before `docker run`: a timeout or abort past this point still
+  // has a name for afterAll and the exit hook to remove.
+  started.add(name);
   const server: Server = { name, url: "" };
   try {
+    await docker([
+      "run",
+      "-d",
+      "--rm",
+      "--label",
+      LABEL,
+      "--name",
+      name,
+      "-p",
+      "127.0.0.1::8080",
+      "-e",
+      `SQLD_AUTH_JWT_KEY=${publicKey}`,
+      IMAGE,
+    ]);
     const mapped = (await docker(["port", name, "8080/tcp"])).split("\n")[0] ?? "";
     const sshHost = await dockerSshHost();
     if (sshHost === null) {
@@ -110,6 +190,7 @@ async function startServer(publicKey: string): Promise<Server> {
         stdout: "ignore",
         stderr: "ignore",
       });
+      tunnels.add(server.tunnel);
       server.url = `http://127.0.0.1:${localPort}`;
     }
     const deadline = Date.now() + 30_000;
@@ -131,11 +212,14 @@ async function startServer(publicKey: string): Promise<Server> {
 
 async function stopServer(server: Server | undefined): Promise<void> {
   if (server === undefined) return;
-  server.tunnel?.kill();
-  await docker(["rm", "-f", "-v", server.name]);
+  if (server.tunnel !== undefined) {
+    server.tunnel.kill();
+    tunnels.delete(server.tunnel);
+  }
+  await removeContainers([server.name]);
 }
 
-describe.skipIf(dockerPath === null)("push sync against sqld", () => {
+describe.skipIf(skipReason !== null)("push sync against sqld", () => {
   let server: Server | undefined;
   let token = "";
   let publicKey = "";
@@ -192,11 +276,17 @@ describe.skipIf(dockerPath === null)("push sync against sqld", () => {
     publicKey = pair.publicKey.export({ format: "jwk" }).x as string;
     token = mintJwt(privateKey);
     directory = temporaryDirectory("tempad-sqld-test-");
+    await sweepStaleContainers();
+    await ensureImage();
     server = await startServer(publicKey);
-  }, 60_000);
+  }, PULL_TIMEOUT_MS + 120_000);
 
   afterAll(async () => {
     await stopServer(server);
+    // Anything started but never handed back (beforeAll timed out mid-start).
+    for (const tunnel of tunnels) tunnel.kill();
+    tunnels.clear();
+    await removeContainers([...started]);
     if (directory) rmSync(directory, { recursive: true, force: true });
   }, 30_000);
 
