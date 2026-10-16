@@ -51,6 +51,7 @@ function baseConfig(home: string): Config {
     hostSlug: "test-host",
     tz: "America/Sao_Paulo",
     since: "2026-08-01",
+    syncToken: "unused",
     home,
   };
 }

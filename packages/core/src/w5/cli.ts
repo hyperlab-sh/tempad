@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
+import { childEnvironment } from "../config/child-env";
 import {
   anthropicApiKey,
   type Config,
@@ -124,7 +125,8 @@ function spawnDetachedRun(context: W5Context): void {
     cmd: [process.execPath, "--no-env-file", CLI_PATH, "w5", "run"],
     detached: true,
     stdio: ["ignore", logFd, logFd],
-    env: { ...process.env, TEMPAD_HOME: context.config.home },
+    // `w5 run` classifies; it never syncs or calls Monday/GitHub, so it gets no tempad secret.
+    env: { ...childEnvironment(), TEMPAD_HOME: context.config.home },
   });
 }
 

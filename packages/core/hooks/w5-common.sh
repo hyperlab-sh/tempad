@@ -5,6 +5,11 @@
 # with nothing on stdout or stderr, and diagnostics go to TEMPAD_HOME/logs/w5.log
 # only once the home exists (an unconfigured machine gets no ~/.tempad).
 
+# The hooks enqueue and read context; they never sync or call Monday/GitHub. Drop
+# every secret tempad reads (the `secret: true` rows of ENV_VARS in src/config/env.ts)
+# so the CLI they start, and what it spawns, never inherits a credential it has no use for.
+unset TEMPAD_SYNC_TOKEN MONDAY_API_TOKEN GH_TOKEN
+
 # TEMPAD_HOME with a leading `~` or `~/` expanded, exactly as tempadHome() does in
 # src/config/env.ts (Claude settings `env` values reach us unexpanded).
 case "${TEMPAD_HOME:-}" in

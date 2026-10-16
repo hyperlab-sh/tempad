@@ -2,7 +2,8 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, writeFileSy
 import { homedir as osHomedir, hostname as osHostname } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { ENV_VARS, type EnvVar, readDotEnv } from "../config/env.ts";
+import { childEnvironment } from "../config/child-env.ts";
+import { ENV_VARS, type EnvVar, readDotEnv, SETUP_VARS } from "../config/env.ts";
 import { hasTempadHooks, settingsPathFor } from "../w5/hooks.ts";
 import { flagNameFor, renderEnvFile } from "./env-file.ts";
 import {
@@ -50,7 +51,13 @@ export interface SetupDeps {
 
 /** Spawns a program with stdin closed; kills it at the time limit. Rejects when it cannot start. */
 export const spawnWithTimeout: SpawnFunction = async (command, { timeoutMs }) => {
-  const child = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+  const child = Bun.spawn(command, {
+    // `gh auth status` and `gh api user` honour GH_TOKEN; the other secrets are of no use to them.
+    env: childEnvironment(["GH_TOKEN"]),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+  });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -134,14 +141,14 @@ function parseOptions(args: string[], deps: SetupDeps): Options {
       force: { type: "boolean", default: false },
       "no-verify": { type: "boolean", default: false },
       ...Object.fromEntries(
-        ENV_VARS.map((variable) => [flagNameFor(variable), { type: "string" as const }]),
+        SETUP_VARS.map((variable) => [flagNameFor(variable), { type: "string" as const }]),
       ),
     },
     strict: true,
     allowPositionals: false,
   });
   const flagValues = new Map<string, string>();
-  for (const variable of ENV_VARS) {
+  for (const variable of SETUP_VARS) {
     const value = (values as Record<string, string | boolean | undefined>)[flagNameFor(variable)];
     if (typeof value === "string") flagValues.set(variable.name, value);
   }
@@ -174,7 +181,7 @@ function backUp(path: string, mode: number): void {
 interface Plan {
   home: string;
   values: Record<string, string>;
-  /** Variables of the existing `.env` that `ENV_VARS` does not list; kept on an in-place update. */
+  /** Variables of the existing `.env` that `SETUP_VARS` does not list; kept on an in-place update. */
   extras: Record<string, string>;
   replaceToml: boolean;
 }
@@ -239,7 +246,7 @@ export async function runSetup(
   if (!options.nonInteractive && !deps.isTTY) {
     errLine(
       "tempad setup: stdin is not a terminal, so it cannot ask questions. " +
-        `Rerun with --non-interactive and one flag per variable, e.g. ${ENV_VARS.filter(
+        `Rerun with --non-interactive and one flag per variable, e.g. ${SETUP_VARS.filter(
           (variable) => !variable.optional,
         )
           .slice(0, 2)
@@ -270,7 +277,7 @@ export async function runSetup(
 
     if (prompter === undefined) {
       const missing: string[] = [];
-      for (const variable of ENV_VARS) {
+      for (const variable of SETUP_VARS) {
         const raw = options.flagValues.get(variable.name) ?? deps.env[variable.name] ?? "";
         const value = normalizeValue(variable, raw);
         if (value === "" && !variable.optional) {
@@ -283,7 +290,7 @@ export async function runSetup(
         errLine("Pass each as a flag, or set it in the environment.");
         return 1;
       }
-      const invalid = validateFormat(ENV_VARS, values);
+      const invalid = validateFormat(SETUP_VARS, values);
       if (invalid.length > 0) {
         for (const finding of invalid) errLine(`tempad setup: ${finding.message}`);
         return 1;
@@ -307,7 +314,7 @@ export async function runSetup(
         timeoutMs: deps.detectTimeoutMs,
       });
 
-      for (const variable of ENV_VARS) {
+      for (const variable of SETUP_VARS) {
         const suggestion =
           options.flagValues.get(variable.name) ??
           existing[variable.name] ??
@@ -378,7 +385,7 @@ export async function runSetup(
       }
     }
 
-    const knownNames = new Set(ENV_VARS.map((variable) => variable.name));
+    const knownNames = new Set(SETUP_VARS.map((variable) => variable.name));
     const extras: Record<string, string> = {};
     // Lines tempad does not own (e.g. ANTHROPIC_API_KEY) survive every rewrite, --force included.
     for (const [name, value] of Object.entries(existing)) {
@@ -401,7 +408,7 @@ export async function runSetup(
     );
     outLine();
     outLine("Configuration:");
-    for (const variable of ENV_VARS) {
+    for (const variable of SETUP_VARS) {
       outLine(`  ${variable.name}=${describeValue(variable, values[variable.name])}`);
     }
 

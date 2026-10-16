@@ -23,7 +23,7 @@ function toml(text: string): void {
   writeFileSync(join(home, "tempad.toml"), text);
 }
 
-const TOKEN = { TEMPAD_SYNC_TOKEN: "jwt.token.value" };
+const TOKEN = "jwt.token.value";
 
 describe("loadSyncConfig", () => {
   test("no tempad.toml at all is disabled", () => {
@@ -39,7 +39,7 @@ describe("loadSyncConfig", () => {
 
   test("enabled = false is disabled and validates nothing else", () => {
     toml('[sync]\nenabled = false\nurl = "ftp://nope"\n');
-    expect(loadSyncConfig(home, {})).toBeNull();
+    expect(loadSyncConfig(home, undefined)).toBeNull();
     expect(isSyncEnabled(home)).toBe(false);
   });
 
@@ -228,25 +228,35 @@ describe("loadSyncConfig", () => {
 
   test("the token is required when enabled, and never defaulted", () => {
     toml('[sync]\nurl = "libsql://h.example"\n');
-    expect(() => loadSyncConfig(home, {})).toThrow(
-      "TEMPAD_SYNC_TOKEN is required when [sync] is enabled",
-    );
-    expect(() => loadSyncConfig(home, { TEMPAD_SYNC_TOKEN: "  " })).toThrow(
-      "TEMPAD_SYNC_TOKEN is required when [sync] is enabled",
-    );
+    for (const missing of [undefined, "", "  "]) {
+      expect(() => loadSyncConfig(home, missing)).toThrow(
+        "TEMPAD_SYNC_TOKEN is required when [sync] is enabled",
+      );
+    }
   });
 
-  test("the token falls back to TEMPAD_HOME/.env, and process env wins over it", () => {
+  test("the token is trimmed", () => {
     toml('[sync]\nurl = "libsql://h.example"\n');
-    writeFileSync(join(home, ".env"), 'HOST_SLUG=x\nTEMPAD_SYNC_TOKEN="from-dotenv"\n');
-    expect(loadSyncConfig(home, {})?.token).toBe("from-dotenv");
-    expect(loadSyncConfig(home, { TEMPAD_SYNC_TOKEN: "from-env" })?.token).toBe("from-env");
+    expect(loadSyncConfig(home, "  padded  ")?.token).toBe("padded");
+  });
+
+  test("the token is not read from the environment or .env: it is loadConfig's job", () => {
+    toml('[sync]\nurl = "libsql://h.example"\n');
+    writeFileSync(join(home, ".env"), "TEMPAD_SYNC_TOKEN=from-dotenv\n");
+    const before = process.env.TEMPAD_SYNC_TOKEN;
+    process.env.TEMPAD_SYNC_TOKEN = "from-env";
+    try {
+      expect(() => loadSyncConfig(home, undefined)).toThrow("TEMPAD_SYNC_TOKEN is required");
+    } finally {
+      if (before === undefined) delete process.env.TEMPAD_SYNC_TOKEN;
+      else process.env.TEMPAD_SYNC_TOKEN = before;
+    }
   });
 
   test("the token is not in any error message", () => {
     toml('[sync]\nurl = "http://sync.example.ts.net"\n');
     try {
-      loadSyncConfig(home, { TEMPAD_SYNC_TOKEN: "secret-jwt" });
+      loadSyncConfig(home, "secret-jwt");
       throw new Error("expected a throw");
     } catch (error) {
       expect(String(error)).not.toContain("secret-jwt");

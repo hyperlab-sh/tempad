@@ -263,6 +263,36 @@ describe("w5-stop.sh", () => {
     }
   });
 
+  test("the CLI it starts inherits none of tempad's secrets, but everything else", async () => {
+    const dir = configuredHome();
+    try {
+      const fakeTempad = join(dir, "tempad");
+      const envDump = join(dir, "env.dump");
+      writeFileSync(fakeTempad, `#!/bin/sh\nenv > "${envDump}"\n`);
+      chmodSync(fakeTempad, 0o755);
+      const result = await runScript(
+        "w5-stop.sh",
+        { session_id: "s1", hook_event_name: "Stop" },
+        hookEnv(dir, {
+          TEMPAD_BIN: fakeTempad,
+          TEMPAD_SYNC_TOKEN: "sync-secret-jwt",
+          MONDAY_API_TOKEN: "monday-secret",
+          GH_TOKEN: "github-secret",
+          ANTHROPIC_API_KEY: "sk-ant-passes-through",
+        }),
+      );
+      expect(result.exitCode).toBe(0);
+      const seen = readFileSync(envDump, "utf8");
+      expect(seen).not.toContain("sync-secret-jwt");
+      expect(seen).not.toContain("monday-secret");
+      expect(seen).not.toContain("github-secret");
+      expect(seen).toContain("ANTHROPIC_API_KEY=sk-ant-passes-through");
+      expect(seen).toContain(`TEMPAD_HOME=${dir}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("forwards SessionEnd as --kind session_end and Stop as --kind classify", async () => {
     const dir = configuredHome();
     try {

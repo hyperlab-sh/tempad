@@ -45,6 +45,7 @@ function makeConfig(): Config {
     hostSlug: "host",
     tz: "UTC",
     since: "2020-01-01",
+    syncToken: "unused",
     home: "/tmp",
   };
 }

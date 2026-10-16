@@ -27,7 +27,10 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-async function cli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+async function cli(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn({
     cmd: [process.execPath, "run", CLI, ...args],
     cwd: join(root, "cwd"),
@@ -35,6 +38,7 @@ async function cli(args: string[]): Promise<{ code: number; stdout: string; stde
       PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
       HOME: join(root, "home"),
       TEMPAD_HOME: home,
+      ...extraEnv,
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -101,4 +105,53 @@ describe("a malformed [sync] section", () => {
       });
     });
   }
+});
+
+// TEMPAD_SYNC_TOKEN goes through loadConfig like every other variable: a
+// command needs it exactly when [sync] is enabled.
+describe("TEMPAD_SYNC_TOKEN", () => {
+  const MESSAGE = "TEMPAD_SYNC_TOKEN is required when [sync] is enabled";
+
+  test("an enabled [sync] without a token fails before any collector runs, naming the variable", async () => {
+    writeFileSync(join(home, "tempad.toml"), '[sync]\nurl = "libsql://sync.example.ts.net"\n');
+    for (const args of [["sync", "--push"], ["sync", "claude"], ["sync"]]) {
+      const result = await cli(args);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(MESSAGE);
+      expect(result.stdout).not.toContain("inserted=");
+    }
+  });
+
+  test("a blank token counts as missing", async () => {
+    writeFileSync(join(home, "tempad.toml"), '[sync]\nurl = "libsql://sync.example.ts.net"\n');
+    const result = await cli(["sync", "--push"], { TEMPAD_SYNC_TOKEN: "   " });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(MESSAGE);
+  });
+
+  test("the token is read from TEMPAD_HOME/.env as well as the environment", async () => {
+    writeFileSync(join(home, "tempad.toml"), '[sync]\nurl = "ftp://not-allowed.example"\n');
+    writeFileSync(
+      join(home, ".env"),
+      `${await Bun.file(join(home, ".env")).text()}\nTEMPAD_SYNC_TOKEN=from-dotenv\n`,
+    );
+    // Past the token check, so the url is what fails now.
+    const result = await cli(["sync", "--push"]);
+    expect(result.stderr).not.toContain(MESSAGE);
+    expect(result.stderr).toContain("scheme ftp: is not supported");
+  });
+
+  test("without [sync], or with enabled = false, the token is never asked for", async () => {
+    const withoutSection = await cli(["sync", "--push"]);
+    expect(withoutSection.stderr).toContain("sync is not configured");
+    expect(withoutSection.stderr).not.toContain("TEMPAD_SYNC_TOKEN");
+
+    writeFileSync(
+      join(home, "tempad.toml"),
+      '[sync]\nenabled = false\nurl = "libsql://sync.example.ts.net"\n',
+    );
+    const disabled = await cli(["sync", "--push"]);
+    expect(disabled.stderr).toContain("sync is not configured");
+    expect(disabled.stderr).not.toContain("TEMPAD_SYNC_TOKEN");
+  });
 });

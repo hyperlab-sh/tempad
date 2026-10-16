@@ -13,6 +13,7 @@ import {
   parseDotEnv,
   readDotEnv,
   requireFields,
+  SETUP_VARS,
   tempadHome,
 } from "../src/config/env.ts";
 
@@ -61,6 +62,7 @@ const VALID_ENV: Record<string, string> = {
   HOST_SLUG: "laptop",
   TZ: "America/Sao_Paulo",
   SINCE: "2026-01-01",
+  TEMPAD_SYNC_TOKEN: "sync-jwt",
 };
 
 function writeValidEnvWithOverride(name: string, value: string): void {
@@ -86,7 +88,7 @@ describe("ENV_VARS", () => {
   test("lists each environment variable and Config key exactly once", () => {
     expect(new Set(ALL_ENV_NAMES).size).toBe(ALL_ENV_NAMES.length);
     expect(new Set(ALL_KEYS).size).toBe(ALL_KEYS.length);
-    expect(ENV_VARS).toHaveLength(11);
+    expect(ENV_VARS).toHaveLength(12);
   });
 
   test("every entry has a description and a known kind", () => {
@@ -98,7 +100,7 @@ describe("ENV_VARS", () => {
 
   test("marks the tokens secret and GH_TOKEN as the only optional variable", () => {
     const secrets = ENV_VARS.filter((variable) => variable.secret).map((variable) => variable.name);
-    expect(secrets).toEqual(["MONDAY_API_TOKEN", "GH_TOKEN"]);
+    expect(secrets).toEqual(["MONDAY_API_TOKEN", "GH_TOKEN", "TEMPAD_SYNC_TOKEN"]);
     expect(ENV_VARS.filter((variable) => variable.optional).map((v) => v.name)).toEqual([
       "GH_TOKEN",
     ]);
@@ -253,6 +255,7 @@ describe("loadConfig", () => {
         "HOST_SLUG=laptop",
         "TZ=America/Sao_Paulo",
         "SINCE=2026-01-01",
+        "TEMPAD_SYNC_TOKEN=sync-jwt",
       ].join("\n"),
     );
 
@@ -267,7 +270,50 @@ describe("loadConfig", () => {
       join(homedir(), ".claude-work"),
     ]);
     expect(config.ghToken).toBeUndefined();
+    expect(config.syncToken).toBe("sync-jwt");
     expect(config.home).toBe(tempHome);
+  });
+
+  describe("TEMPAD_SYNC_TOKEN (syncToken)", () => {
+    test("is required only by a command that asks for it, and never defaulted", () => {
+      writeEnvFile("TZ=UTC\n");
+      expect(loadConfig("tempad report daily", ["tz"]).home).toBe(tempHome);
+      expect(() => loadConfig("tempad sync", ["syncToken"])).toThrow(ConfigError);
+    });
+
+    test("the error keeps the sync wording and does not point at `tempad setup`", () => {
+      writeEnvFile("");
+      const error = configErrorFor("tempad sync", ["syncToken"]);
+      expect(error.variables).toEqual(["TEMPAD_SYNC_TOKEN"]);
+      expect(error.message).toBe(
+        `TEMPAD_SYNC_TOKEN is required when [sync] is enabled; set it in ${join(tempHome, ".env")} or the environment`,
+      );
+    });
+
+    test("combined with other missing variables, each keeps its own wording", () => {
+      writeEnvFile("");
+      const error = configErrorFor("tempad sync", ["hostSlug", "syncToken"]);
+      expect(error.variables).toEqual(["HOST_SLUG", "TEMPAD_SYNC_TOKEN"]);
+      expect(error.message).toContain("tempad sync needs HOST_SLUG;");
+      expect(error.message).toContain("TEMPAD_SYNC_TOKEN is required when [sync] is enabled");
+    });
+
+    test("blank counts as missing; process env wins over .env; the value never leaks into an error", () => {
+      process.env.TEMPAD_SYNC_TOKEN = "   ";
+      expect(() => loadConfig("tempad sync", ["syncToken"])).toThrow(
+        "TEMPAD_SYNC_TOKEN is required",
+      );
+      delete process.env.TEMPAD_SYNC_TOKEN;
+      writeEnvFile('TEMPAD_SYNC_TOKEN="from-dotenv"\n');
+      expect(loadConfig("tempad sync", ["syncToken"]).syncToken).toBe("from-dotenv");
+      process.env.TEMPAD_SYNC_TOKEN = "from-env";
+      expect(loadConfig("tempad sync", ["syncToken"]).syncToken).toBe("from-env");
+    });
+
+    test("is kept out of tempad setup", () => {
+      expect(SETUP_VARS.map((variable) => variable.name)).not.toContain("TEMPAD_SYNC_TOKEN");
+      expect(SETUP_VARS).toHaveLength(ENV_VARS.length - 1);
+    });
   });
 
   test("GH_INCLUDE_PERSONAL=false parses to false", () => {

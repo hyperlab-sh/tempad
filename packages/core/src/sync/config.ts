@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseDotEnv } from "../config/env";
 
 /**
  * Push-sync configuration (docs/specs/push-sync.md, "Configuration and
- * token"). Read only by the sync path, separately from `loadConfig`, so an
- * offline host never touches it beyond noticing the section is absent.
+ * token"): the `[sync]` section of `tempad.toml`. The token is not read
+ * here; it is the `syncToken` field of `loadConfig`, which a command asks
+ * for only when `isSyncEnabled`, so an offline host never touches it.
  */
 export interface SyncConfig {
   url: string;
@@ -135,26 +135,16 @@ function validateBatchSize(value: unknown): number {
 /**
  * Returns `null` when `[sync]` is absent or `enabled = false`. When enabled,
  * `url` is required (TLS schemes only, plain text on loopback only) and
- * `TEMPAD_SYNC_TOKEN` is required from `env`, else `home/.env`; neither has a
- * default.
+ * `token` (`loadConfig`'s `syncToken`, from `TEMPAD_SYNC_TOKEN`) must be
+ * non-blank; neither has a default.
  */
-export function loadSyncConfig(
-  home: string,
-  env: Record<string, string | undefined>,
-): SyncConfig | null {
+export function loadSyncConfig(home: string, token: string | undefined): SyncConfig | null {
   const section = readSection(home);
   if (section === null || !sectionEnabled(section)) return null;
 
   const url = validateSyncUrl(section.url);
   const batchSize = validateBatchSize(section.batch_size);
 
-  let token = env.TEMPAD_SYNC_TOKEN;
-  if (token === undefined || token.trim() === "") {
-    const envPath = join(home, ".env");
-    token = existsSync(envPath)
-      ? parseDotEnv(readFileSync(envPath, "utf8")).TEMPAD_SYNC_TOKEN
-      : undefined;
-  }
   if (token === undefined || token.trim() === "") {
     throw new SyncConfigError("TEMPAD_SYNC_TOKEN is required when [sync] is enabled");
   }

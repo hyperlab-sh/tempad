@@ -22,6 +22,7 @@ function makeConfig(home: string, claudeDirs: string[]): Config {
     hostSlug: "test-host",
     tz: "UTC",
     since: "2020-01-01T00:00:00Z",
+    syncToken: "unused",
     home,
   };
 }

@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ClassifierWindow } from "../../src/w5/classifier";
 import {
   ClaudeCliClassifier,
@@ -219,4 +222,62 @@ describe("ClaudeCliClassifier", () => {
     // test doesn't leave an orphaned process running after the suite exits.
     await new Promise((resolve) => setTimeout(resolve, 5_500));
   }, 10_000);
+});
+
+describe("the claude child process environment", () => {
+  const SECRETS = {
+    TEMPAD_SYNC_TOKEN: "sync-secret-jwt",
+    MONDAY_API_TOKEN: "monday-secret",
+    GH_TOKEN: "github-secret",
+  };
+  const PASSING = { ANTHROPIC_API_KEY: "sk-ant-passes-through", TEMPAD_TEST_OTHER: "other-value" };
+  const names = [...Object.keys(SECRETS), ...Object.keys(PASSING)];
+  let dir: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "tempad-classifier-env-"));
+    saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    Object.assign(process.env, SECRETS, PASSING);
+  });
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("ClaudeCliClassifier's real spawn hands `claude` no tempad secret, and the rest of the environment", async () => {
+    const dump = join(dir, "env.dump");
+    const fakeClaude = join(dir, "claude");
+    const reply = envelope(JSON.stringify(good));
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh\nenv > "${dump}"\ncat > /dev/null\nprintf '%s' '${reply.replaceAll("'", "'\\''")}'\n`,
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const classifier = new ClaudeCliClassifier({ model: "m", command: fakeClaude, cwd: dir });
+    const result = await classifier.classify(window);
+    expect(result.segments).toHaveLength(1);
+
+    // Compare whole lines by name (a bare substring would match G2I_GH_TOKEN), and assert on
+    // booleans so a failure never prints the machine's real environment.
+    const lines = readFileSync(dump, "utf8").split("\n");
+    const has = (line: string): boolean => lines.includes(line);
+    const named = (name: string): boolean => lines.some((line) => line.startsWith(`${name}=`));
+    for (const [name, value] of Object.entries(SECRETS)) {
+      expect({ name, present: named(name) }).toEqual({ name, present: false });
+      expect({ name, leaked: lines.some((line) => line.includes(value)) }).toEqual({
+        name,
+        leaked: false,
+      });
+    }
+    for (const [name, value] of Object.entries(PASSING)) {
+      expect({ name, passed: has(`${name}=${value}`) }).toEqual({ name, passed: true });
+    }
+    expect(named("PATH")).toBe(true);
+  });
 });

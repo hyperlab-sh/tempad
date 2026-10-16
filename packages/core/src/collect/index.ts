@@ -1,3 +1,4 @@
+import { childEnvironment } from "../config/child-env.ts";
 import { claudeCollector } from "./claude.ts";
 import type { CommandRunner } from "./github/request.ts";
 import { createGithubCollector } from "./github.ts";
@@ -6,7 +7,13 @@ import type { Collector } from "./types.ts";
 
 const defaultRunner: CommandRunner = {
   async run(argv, cwd) {
-    const proc = Bun.spawn(argv, { cwd, stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn(argv, {
+      cwd,
+      // git and gh: `gh` reads GH_TOKEN, nothing here needs the other secrets.
+      env: childEnvironment(["GH_TOKEN"]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
