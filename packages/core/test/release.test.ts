@@ -96,7 +96,8 @@ describe("release: files whitelist", () => {
   test("migrations, the skill and the hook scripts the runtime resolves are inside the shipped directories", () => {
     const runtimeFiles = [
       "src/db/migrations/0001_initial.sql",
-      "skills/tempad-quest/SKILL.md",
+      "skills/quest/SKILL.md",
+      "skills/setup/SKILL.md",
       "hooks/w5-stop.sh",
       "hooks/w5-prompt.sh",
       "hooks/w5-common.sh",

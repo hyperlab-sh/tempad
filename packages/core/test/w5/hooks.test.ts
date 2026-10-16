@@ -204,6 +204,17 @@ describe("buildDeclarationLine", () => {
     );
   });
 
+  test("names /tempad:quest when the hook runs from the plugin", () => {
+    expect(buildDeclarationLine([], "s1", "plugin")).toBe(
+      "tempad: session s1, active quests: none. Declare with /tempad:quest if this prompt starts a different outcome.",
+    );
+  });
+
+  test("any other source keeps the legacy tempad-quest name", () => {
+    expect(buildDeclarationLine([], "s1", undefined)).toContain("the tempad-quest skill");
+    expect(buildDeclarationLine([], "s1", "legacy")).toContain("the tempad-quest skill");
+  });
+
   test("renders every active quest bracket-tagged with its alias", () => {
     expect(
       buildDeclarationLine(
@@ -962,7 +973,7 @@ describe("plugin manifest and hooks.json", () => {
     expect(plugin.version).toBe(corePackage.version);
     expect(plugin.skills).toBe("./packages/core/skills/");
     expect(
-      existsSync(join(REPOSITORY_ROOT, "packages", "core", "skills", "tempad-quest", "SKILL.md")),
+      existsSync(join(REPOSITORY_ROOT, "packages", "core", "skills", "quest", "SKILL.md")),
     ).toBe(true);
     expect(existsSync(join(REPOSITORY_ROOT, ".claude-plugin", "marketplace.json"))).toBe(false);
   });

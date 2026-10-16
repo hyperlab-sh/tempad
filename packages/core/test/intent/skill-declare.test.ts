@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { QUEST_DECLARE_OPTIONS } from "../../src/intent/cli";
 
-const SKILL_PATH = join(import.meta.dir, "../../skills/tempad-quest/SKILL.md");
+const SKILL_PATH = join(import.meta.dir, "../../skills/quest/SKILL.md");
 
 function extractDeclareInvocations(markdown: string): string[] {
   const fences = [...markdown.matchAll(/```\n([\s\S]*?)```/g)].map((match) => match[1] ?? "");
@@ -51,4 +51,30 @@ describe("SKILL.md tempad quest declare invocations", () => {
       expect(() => parseArgs({ args, options: QUEST_DECLARE_OPTIONS, strict: true })).not.toThrow();
     });
   }
+});
+
+describe("skill names", () => {
+  test("quest and setup skills carry their directory name in the frontmatter", () => {
+    for (const name of ["quest", "setup"]) {
+      const text = readFileSync(join(import.meta.dir, "../../skills", name, "SKILL.md"), "utf8");
+      expect(text).toMatch(new RegExp(`^---\\nname: ${name}\\n`));
+    }
+  });
+
+  test("the setup skill only uses flags the setup command accepts", async () => {
+    const { ENV_VARS } = await import("../../src/config/env");
+    const { flagNameFor } = await import("../../src/setup/env-file");
+    const text = readFileSync(join(import.meta.dir, "../../skills/setup/SKILL.md"), "utf8");
+    const known = new Set([
+      "non-interactive",
+      "force",
+      "no-verify",
+      "home",
+      ...ENV_VARS.map(flagNameFor),
+    ]);
+    const used = [...text.matchAll(/`?--([a-z][a-z-]*)/g)].map((match) => match[1] as string);
+    expect(used.length).toBeGreaterThan(8);
+    for (const flag of used.filter((flag) => flag !== "version"))
+      expect(known.has(flag)).toBe(true);
+  });
 });
