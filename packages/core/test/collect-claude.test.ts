@@ -563,4 +563,43 @@ describe("claude collector", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("reresolveSessions normalizes each session path once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tempad-claude-"));
+    const home = join(root, "home");
+    const targetDir = join(root, "work", "mosaic", "coolify");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+
+    const tomlPath = join(home, "tempad.toml");
+    writeFileSync(
+      tomlPath,
+      `[[projects]]\npath = "${targetDir.replace(/\\/g, "\\\\")}"\nname = "Dev Server"\norg = "mosaic"\nproject = "coolify"\n`,
+    );
+
+    try {
+      const database = openDatabase(join(root, "tempad.db"));
+      database.exec(
+        `INSERT INTO claude_sessions (id, claude_dir, project_dir, file_path, cwd, org, project, path_meta, title, title_source, git_branch, started_at, ended_at, message_count, tool_call_count, models, host_slug, file_mtime)
+         VALUES ('sess-target', '~/.claude', 'p', '/tmp/sess-target.jsonl', '${targetDir}', 'x', 'y', NULL, NULL, NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 1, 0, '[]', 'test-host', '2026-01-01T00:00:00.000Z')`,
+      );
+
+      const rules = loadRules(tomlPath);
+
+      // The session's cwd is a leaf directory that exists, so one normalization
+      // is exactly one realpathSync of that path.
+      const realpathSpy = spyOn(fs, "realpathSync");
+      const moved = reresolveSessions(database, rules, targetDir);
+      const callsForTarget = realpathSpy.mock.calls.filter((call) => call[0] === targetDir).length;
+      realpathSpy.mockRestore();
+
+      expect(moved).toBe(1);
+      // One for the underPath, one for the session cwd.
+      expect(callsForTarget).toBe(2);
+
+      database.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
