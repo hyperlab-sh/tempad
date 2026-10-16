@@ -66,7 +66,7 @@ bunx tempad init                        # writes TEMPAD_HOME/.env and tempad.tom
 
 ## 4. `tempad init`
 
-- Prompts for every variable in `ENV_VARS` (secrets read without echo), with suggestions the user confirms: system time zone, hostname for `HOST_SLUG`, `git config user.email`, `~/.claude/projects` for `CLAUDE_DIRS`, `gh api user` for `GH_USER`. Suggestions are prompt text only; nothing becomes a runtime default.
+- Prompts for every variable in `ENV_VARS` (secrets read without echo), with suggestions the user confirms: system time zone, hostname for `HOST_SLUG`, `git config user.email`, `~/.claude` for `CLAUDE_DIRS` (the config directory, offered when its `projects/` exists; `$CLAUDE_CONFIG_DIR` when set), `gh api user` for `GH_USER`. Suggestions are prompt text only; nothing becomes a runtime default.
 - Flags for non-interactive use (`--non-interactive`, one flag per variable, `--home`, `--force`, `--no-verify`); a missing required value in non-interactive mode exits 1 naming it.
 - Validates cheaply unless `--no-verify`: Monday token (GraphQL `me`), GitHub (`GH_TOKEN` against `/user`, else `gh auth status`), `CLAUDE_DIRS` exist, `TZ` is a valid IANA zone, `SINCE` parses.
 - Writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`. An existing file is kept unless `--force`; existing values are offered as the prompt suggestions (secrets shown as "keep current").
