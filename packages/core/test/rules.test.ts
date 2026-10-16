@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadRules, resolveBoard, resolvePath, resolveRepository } from "../src/config/rules.ts";
@@ -122,92 +122,114 @@ name = "Dev Server"
     expect(() => loadRules(path)).toThrow(/requires "org" and "project"/);
   });
 
-  test("path rule matches the folder and a subfolder, not a sibling with the same prefix", () => {
-    const path = writeToml(`
+  // Fixtures live under a realpath'd temp dir so results never depend on what
+  // the developer's home directory holds (e.g. ~/work being a symlink).
+  function withTempRoot(run: (root: string) => void): void {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "tempad-rules-root-")));
+    try {
+      run(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  function pathRuleToml(folder: string): string {
+    return writeToml(`
 [[projects]]
-path = "~/work/mosaic/coolify"
+path = ${JSON.stringify(folder)}
 name = "Dev Server"
 org = "mosaic"
 project = "coolify"
 `);
-    const rules = loadRules(path);
-    const home = homedir();
+  }
 
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify`)).toEqual({
-      org: "mosaic",
-      project: "coolify",
-      meta: {},
-      name: "Dev Server",
-    });
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify/deploy/scripts`)).toEqual({
-      org: "mosaic",
-      project: "coolify",
-      meta: {},
-      name: "Dev Server",
-    });
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify2`)).toEqual({
-      org: "unassigned",
-      project: "unassigned",
-      meta: {},
-      name: null,
+  test("path rule matches the folder and a subfolder, not a sibling with the same prefix", () => {
+    withTempRoot((root) => {
+      mkdirSync(join(root, "coolify"));
+      mkdirSync(join(root, "coolify2"));
+      const rules = loadRules(pathRuleToml(join(root, "coolify")));
+
+      expect(resolvePath(rules, join(root, "coolify"))).toEqual({
+        org: "mosaic",
+        project: "coolify",
+        meta: {},
+        name: "Dev Server",
+      });
+      expect(resolvePath(rules, join(root, "coolify/deploy/scripts"))).toEqual({
+        org: "mosaic",
+        project: "coolify",
+        meta: {},
+        name: "Dev Server",
+      });
+      expect(resolvePath(rules, join(root, "coolify2"))).toEqual({
+        org: "unassigned",
+        project: "unassigned",
+        meta: {},
+        name: null,
+      });
     });
   });
 
   test("path rule normalizes a trailing slash on both the rule and the query path", () => {
-    const path = writeToml(`
-[[projects]]
-path = "~/work/mosaic/coolify/"
-name = "Dev Server"
-org = "mosaic"
-project = "coolify"
-`);
-    const rules = loadRules(path);
-    const home = homedir();
+    withTempRoot((root) => {
+      mkdirSync(join(root, "coolify"));
+      const rules = loadRules(pathRuleToml(`${join(root, "coolify")}/`));
 
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify`).name).toBe("Dev Server");
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify/`).name).toBe("Dev Server");
-    expect(resolvePath(rules, `${home}/work/mosaic/coolify/deploy/`).name).toBe("Dev Server");
+      expect(resolvePath(rules, join(root, "coolify")).name).toBe("Dev Server");
+      expect(resolvePath(rules, `${join(root, "coolify")}/`).name).toBe("Dev Server");
+      expect(resolvePath(rules, `${join(root, "coolify")}/deploy/`).name).toBe("Dev Server");
+    });
   });
 
   if (process.platform === "darwin") {
     test("path rule matches case-insensitively on darwin", () => {
-      const path = writeToml(`
-[[projects]]
-path = "~/Work/Mosaic/Coolify"
-name = "Dev Server"
-org = "mosaic"
-project = "coolify"
-`);
-      const rules = loadRules(path);
-      const home = homedir();
-      expect(resolvePath(rules, `${home}/work/mosaic/coolify`).name).toBe("Dev Server");
-      expect(resolvePath(rules, `${home}/work/mosaic/coolify/deploy`).name).toBe("Dev Server");
+      withTempRoot((root) => {
+        mkdirSync(join(root, "coolify"));
+        const rules = loadRules(pathRuleToml(join(root, "Coolify")));
+        expect(resolvePath(rules, join(root, "coolify")).name).toBe("Dev Server");
+        expect(resolvePath(rules, join(root, "coolify/deploy")).name).toBe("Dev Server");
+      });
     });
   }
 
-  test("path rule resolves symlinks so a linked cwd matches the real folder's rule", () => {
-    const root = mkdtempSync(join(tmpdir(), "tempad-rules-symlink-"));
-    const realDir = join(root, "real", "coolify");
-    const linkDir = join(root, "link");
-    mkdirSync(realDir, { recursive: true });
-    symlinkSync(realDir, linkDir);
+  test("a rule given through a symlinked folder matches a session under the real folder, and the reverse", () => {
+    withTempRoot((root) => {
+      const realDir = join(root, "real", "coolify");
+      const linkDir = join(root, "link");
+      mkdirSync(realDir, { recursive: true });
+      symlinkSync(join(root, "real"), linkDir);
+      const viaLink = join(linkDir, "coolify");
 
-    try {
-      const path = writeToml(`
-[[projects]]
-path = "${realDir.replace(/\\/g, "\\\\")}"
-name = "Dev Server"
-org = "mosaic"
-project = "coolify"
-`);
-      const rules = loadRules(path);
+      // Rule via the link, session under the real folder (exists and not yet created).
+      const linkRule = loadRules(pathRuleToml(viaLink));
+      expect(resolvePath(linkRule, realDir).name).toBe("Dev Server");
+      expect(resolvePath(linkRule, join(realDir, "deploy/scripts")).name).toBe("Dev Server");
+
+      // Rule via the real folder, session through the link, subpath that does not exist.
+      const realRule = loadRules(pathRuleToml(realDir));
+      expect(resolvePath(realRule, viaLink).name).toBe("Dev Server");
+      expect(resolvePath(realRule, join(viaLink, "deploy/scripts")).name).toBe("Dev Server");
+      expect(resolvePath(realRule, join(linkDir, "coolify2")).name).toBeNull();
+
+      // Rule registered through the link for a folder that does not exist yet.
+      const newRule = loadRules(pathRuleToml(join(linkDir, "newproj")));
+      expect(resolvePath(newRule, join(root, "real", "newproj", "x")).name).toBe("Dev Server");
+    });
+  });
+
+  test("path rule resolves symlinks so a linked cwd matches the real folder's rule", () => {
+    withTempRoot((root) => {
+      const realDir = join(root, "real", "coolify");
+      const linkDir = join(root, "link");
+      mkdirSync(realDir, { recursive: true });
+      symlinkSync(realDir, linkDir);
+
+      const rules = loadRules(pathRuleToml(realDir));
       expect(resolvePath(rules, linkDir).name).toBe("Dev Server");
 
       mkdirSync(join(realDir, "deploy"), { recursive: true });
       expect(resolvePath(rules, join(linkDir, "deploy")).name).toBe("Dev Server");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    });
   });
 
   test("path rules match before pattern rules when listed first", () => {
