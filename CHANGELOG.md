@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- The GitHub collector's reconcile step compared `gh_commits.authored_at` to the window start as text. Rows stored before commit dates were normalized to UTC keep the author's offset (`2026-09-07T23:00:00-03:00`), so one near the window boundary could be skipped and its orphaned sha (after a history rewrite) never deleted. It now compares instants.
+- The GitHub collector's reconcile step compared `gh_commits.authored_at` to the window start as text. Rows stored before commit dates were normalized to UTC keep the author's offset (`2026-09-07T23:00:00-03:00`), so one near the window boundary could be skipped and its orphaned sha (after a history rewrite) never deleted. It now compares against a UTC-normalized bound, which is valid because every stored value is UTC: migration 0021 rewrites the legacy rows, and a pull rewrites any offset-form `gh_commits` dates that older pushes left on the sync server.
 
 ### Migration
 
