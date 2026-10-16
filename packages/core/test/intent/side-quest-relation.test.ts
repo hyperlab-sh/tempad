@@ -737,3 +737,169 @@ describe("making a quest a side quest after the fact", () => {
     ]);
   });
 });
+
+describe("quest branch and declare arguments", () => {
+  const SESSION = "33333333-3333-4333-8333-333333333333";
+
+  function branchedAt(database: Database, id: string): string | null {
+    return (
+      database.query("SELECT branched_at FROM quests WHERE id = ?").get(id) as {
+        branched_at: string | null;
+      }
+    ).branched_at;
+  }
+
+  function eventAt(database: Database, kind: string): string[] {
+    return (
+      database.query("SELECT at FROM events WHERE kind = ? ORDER BY uid").all(kind) as {
+        at: string;
+      }[]
+    ).map((row) => row.at);
+  }
+
+  test("quest branch --at with a UTC offset is stored as UTC milliseconds", async () => {
+    const h = await harness();
+    const main = await addQuest(h, "Main");
+    const side = await addQuest(h, "Side");
+
+    expect(
+      await h.run([
+        "quest",
+        "branch",
+        side,
+        "--deviates-from",
+        main,
+        "--trigger",
+        "t",
+        "--at",
+        "2026-09-01T07:00:00-03:00",
+      ]),
+    ).toBe(0);
+
+    expect(eventAt(h.database, "quest.branched")).toEqual(["2026-09-01T10:00:00.000Z"]);
+    expect(branchedAt(h.database, side)).toBe("2026-09-01T10:00:00.000Z");
+    rebuildAll(h.database);
+    expect(branchedAt(h.database, side)).toBe("2026-09-01T10:00:00.000Z");
+  });
+
+  test("quest branch with an unparseable --at exits 2 and writes nothing", async () => {
+    const h = await harness();
+    const main = await addQuest(h, "Main");
+    const side = await addQuest(h, "Side");
+
+    expect(
+      await h.run([
+        "quest",
+        "branch",
+        side,
+        "--deviates-from",
+        main,
+        "--trigger",
+        "t",
+        "--at",
+        "yesterday-ish",
+      ]),
+    ).toBe(2);
+    expect(errors.join("\n")).toContain("--at must be an ISO date or timestamp, got yesterday-ish");
+    expect(eventAt(h.database, "quest.branched")).toEqual([]);
+  });
+
+  test("declare --at with a UTC offset records every event at the UTC instant", async () => {
+    const h = await harness();
+    const main = await addQuest(h, "Main");
+
+    expect(
+      await h.run([
+        "quest",
+        "declare",
+        "--session",
+        SESSION,
+        "--new",
+        "Side",
+        "--outcome",
+        "o",
+        "--by",
+        "hero",
+        "--deviates-from",
+        main,
+        "--trigger",
+        "t",
+        "--kind",
+        "curiosity",
+        "--at",
+        "2026-09-01T07:00:00-03:00",
+      ]),
+    ).toBe(0);
+
+    const side = questId(h.database, "Side");
+    expect(eventAt(h.database, "quest.created").at(-1)).toBe("2026-09-01T10:00:00.000Z");
+    expect(eventAt(h.database, "quest.branched")).toEqual(["2026-09-01T10:00:00.000Z"]);
+    expect(eventAt(h.database, "quest.declared")).toEqual(["2026-09-01T10:00:00.000Z"]);
+    expect(relation(h.database, side)).toMatchObject({ quest: main, branched: 1 });
+    expect(branchedAt(h.database, side)).toBe("2026-09-01T10:00:00.000Z");
+  });
+
+  test("declare with an unparseable --at exits 2 and writes nothing", async () => {
+    const h = await harness();
+    const before = (h.database.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+
+    expect(
+      await h.run([
+        "quest",
+        "declare",
+        "--session",
+        SESSION,
+        "--new",
+        "Side",
+        "--outcome",
+        "o",
+        "--by",
+        "hero",
+        "--at",
+        "not a date",
+      ]),
+    ).toBe(2);
+    expect(errors.join("\n")).toContain("--at must be an ISO date or timestamp, got not a date");
+    expect(h.database.query("SELECT COUNT(*) AS n FROM events").get()).toEqual({ n: before });
+  });
+
+  test("quest branch refuses a --deviates-from id that is neither a quest nor a stint", async () => {
+    const h = await harness();
+    const side = await addQuest(h, "Side");
+    const unknown = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    expect(
+      await h.run(["quest", "branch", side, "--deviates-from", unknown, "--trigger", "t"]),
+    ).toBe(1);
+    expect(errors.join("\n")).toContain(
+      `--deviates-from ${unknown} is neither a quest nor a stint`,
+    );
+    expect(eventAt(h.database, "quest.branched")).toEqual([]);
+    expect(relation(h.database, side)).toEqual(NO_RELATION);
+  });
+
+  test("quest branch refuses a retracted stint", async () => {
+    const h = await harness();
+    const main = await addQuest(h, "Main");
+    const side = await addQuest(h, "Side");
+    const stint = openStint(h.store, h.database, { actor: "hero", quest: main, outcome: "work" });
+    const opened = h.database
+      .query("SELECT id FROM events WHERE kind = 'stint.opened' AND subject = ?")
+      .get(stint) as { id: number };
+    applyIncremental(
+      h.database,
+      h.store.append({
+        actor: "hero",
+        kind: "retracted",
+        subject: stint,
+        payload: { retracts: opened.id, reason: "wrong" },
+      }),
+    );
+
+    expect(await h.run(["quest", "branch", side, "--deviates-from", stint, "--trigger", "t"])).toBe(
+      1,
+    );
+    expect(errors.join("\n")).toContain(`stint ${stint} is retracted`);
+    expect(eventAt(h.database, "quest.branched")).toEqual([]);
+  });
+});

@@ -406,6 +406,18 @@ function findQuest(
   } | null;
 }
 
+/**
+ * `--at` as the canonical UTC text every event timestamp uses
+ * (`toISOString()`), so an offset or date-only value compares correctly against
+ * stored timestamps. `undefined` when the flag was not given, `null` when it
+ * does not parse.
+ */
+function normalizeAt(at: string | undefined): string | undefined | null {
+  if (at === undefined) return undefined;
+  const time = Date.parse(at);
+  return Number.isNaN(time) ? null : new Date(time).toISOString();
+}
+
 function questExists(database: Database, id: string): boolean {
   return database.query("SELECT 1 FROM quests WHERE id = ?").get(id) !== null;
 }
@@ -861,7 +873,8 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       );
       return 2;
     }
-    if (values.at !== undefined && Number.isNaN(Date.parse(values.at))) {
+    const at = normalizeAt(values.at);
+    if (at === null) {
       console.error(`--at must be an ISO date or timestamp, got ${values.at}`);
       return 2;
     }
@@ -886,6 +899,18 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         console.error(`quest ${resolved} cannot deviate from itself`);
         return 1;
       }
+    } else {
+      const stint = context.database
+        .query("SELECT retracted_at FROM stints WHERE id = ?")
+        .get(from) as { retracted_at: string | null } | null;
+      if (!stint) {
+        console.error(`--deviates-from ${from} is neither a quest nor a stint`);
+        return 1;
+      }
+      if (stint.retracted_at !== null) {
+        console.error(`stint ${from} is retracted`);
+        return 1;
+      }
     }
     applyIncremental(
       context.database,
@@ -893,7 +918,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         actor: "hero",
         kind: "quest.branched",
         subject: resolved,
-        at: values.at,
+        at,
         payload: {
           ...(fromQuest ? { deviates_from_quest: fromQuest } : { deviates_from: from }),
           trigger: values.trigger,
@@ -1086,6 +1111,12 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       console.error(usage);
       return 2;
     }
+    const at = normalizeAt(values.at);
+    if (at === null) {
+      console.error(`--at must be an ISO date or timestamp, got ${values.at}`);
+      return 2;
+    }
+    values.at = at;
     // `--done` retires a declaration; it names an existing quest and nothing
     // else, so every flag that describes what is being declared is excluded.
     if (values.done) {
