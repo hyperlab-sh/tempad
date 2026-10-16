@@ -8,7 +8,7 @@
  */
 import type { Database, Statement } from "bun:sqlite";
 import { newUlid } from "../intent/ids";
-import { rebuildAll } from "../intent/projections";
+import { type RebuildOptions, rebuildAll } from "../intent/projections";
 import { registerAllProjections } from "../intent/projections/register";
 import { MIRROR_SYNC_COLUMNS, SYNCED_UPSERT_TABLES, type SyncedUpsertTable } from "./tables";
 
@@ -37,9 +37,13 @@ export interface SyncRunOptions {
   pull: boolean;
   /**
    * Rebuilds every projection; defaults to `registerAllProjections()` plus
-   * `rebuildAll`. Tests pass a failing one to prove the pending marker.
+   * `rebuildAll`. It must run `options.beforeCommit` inside the rebuild's
+   * transaction (as `rebuildAll` does), which is where the pending marker
+   * is cleared. Tests pass a failing one to prove the marker.
    */
-  rebuildProjections?: (database: Database) => void;
+  rebuildProjections?: (database: Database, options: RebuildOptions) => void;
+  /** Non-fatal problems (a failed first rebuild); defaults to stderr. */
+  warn?: (message: string) => void;
 }
 
 export interface SyncCounts {
@@ -76,22 +80,111 @@ const EVENT_NON_CONTENT = new Set(["id", "uid", "sync_host", "sync_dirty"]);
  * events page, and deleted only after a rebuild succeeds. A run that dies
  * between those two points (network error on a later page, a throw from
  * the rebuild, a crash) leaves it set, and the next run rebuilds first.
+ * Its value is a fresh token on every set, so a rebuild only clears the
+ * marker it saw: one set by a concurrent sync meanwhile survives.
  */
 const REBUILD_PENDING = "rebuild_pending";
+/**
+ * Set (to the server id) when the server is found unknown, in the same
+ * transaction that resets the pull cursors; cleared only with the
+ * `server_id` store after a re-seed push completes in full. While it is
+ * set every run treats the server as unknown: pulls start from 0 and
+ * pushes re-seed, so neither a pull-only run, an interrupted re-seed nor
+ * another host's writes can erase the decision.
+ */
+const RESEED_PENDING = "reseed_pending";
+/** The last event / mirror row or tombstone this host saw land on the server. */
+const PUSH_PROBE_EVENT = "push_probe_event";
+const PUSH_PROBE_ROW = "push_probe_row";
 
-function defaultRebuild(database: Database): void {
-  registerAllProjections();
-  rebuildAll(database);
+const META_UPSERT =
+  "INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
+
+function localMeta(database: Database, key: string): string | null {
+  return (
+    (
+      database.query("SELECT value FROM sync_meta WHERE key = ?").get(key) as {
+        value: string;
+      } | null
+    )?.value ?? null
+  );
 }
 
-/** Rebuilds the projections when a pulled page left them stale. */
-function rebuildIfPending(database: Database, rebuild: (database: Database) => void): boolean {
-  const pending = database.query("SELECT 1 FROM sync_meta WHERE key = ?").get(REBUILD_PENDING);
-  if (pending === null) return false;
-  rebuild(database);
-  database.query("DELETE FROM sync_meta WHERE key = ?").run(REBUILD_PENDING);
+function defaultRebuild(database: Database, options: RebuildOptions): void {
+  registerAllProjections();
+  rebuildAll(database, options);
+}
+
+function setRebuildMarker(database: Database): void {
+  database.query(META_UPSERT).run(REBUILD_PENDING, newUlid());
+}
+
+/**
+ * Compare-and-delete: clears the marker only if it still holds `token`, so
+ * a page pulled by a concurrent run after the rebuild read its events
+ * (which sets a fresh token) keeps the marker for the next rebuild.
+ */
+export function clearRebuildMarker(database: Database, token: string): void {
+  database.query("DELETE FROM sync_meta WHERE key = ? AND value = ?").run(REBUILD_PENDING, token);
+}
+
+/**
+ * Rebuilds the projections when a pulled page left them stale. The marker
+ * is cleared in `beforeCommit`, inside the rebuild's own transaction: a
+ * rebuild that rolls back leaves it set, one that commits takes it along.
+ */
+function rebuildIfPending(
+  database: Database,
+  rebuild: NonNullable<SyncRunOptions["rebuildProjections"]>,
+): boolean {
+  const token = localMeta(database, REBUILD_PENDING);
+  if (token === null) return false;
+  rebuild(database, { beforeCommit: (inside) => clearRebuildMarker(inside, token) });
   return true;
 }
+
+/**
+ * Whether the server lost a write this host saw it accept: the last pushed
+ * event's uid is gone, or the last pushed row is gone or older than what
+ * was sent. Unlike the clock, a restored server cannot pass this by other
+ * hosts moving its clock forward.
+ */
+async function pushProbeLost(database: Database, remote: SyncRemote): Promise<boolean> {
+  const event = localMeta(database, PUSH_PROBE_EVENT);
+  if (event !== null) {
+    const found = await remote.query("SELECT 1 AS found FROM sync_events WHERE uid = ?", [event]);
+    if (found.length === 0) return true;
+  }
+  const row = localMeta(database, PUSH_PROBE_ROW);
+  if (row !== null) {
+    const probe = JSON.parse(row) as { tbl: string; pk: string; stamp: string; host: string };
+    const found = await remote.query(
+      "SELECT 1 AS found FROM sync_rows WHERE tbl = ? AND pk = ? AND (sync_updated_at, sync_host) >= (?, ?)",
+      [probe.tbl, probe.pk, probe.stamp, probe.host],
+    );
+    if (found.length === 0) return true;
+  }
+  return false;
+}
+
+function storeRowProbe(database: Database, tbl: string, pk: string, stamp: string, host: string) {
+  database.query(META_UPSERT).run(PUSH_PROBE_ROW, JSON.stringify({ tbl, pk, stamp, host }));
+}
+
+/**
+ * Same event content on both sides, compared over the columns both carry
+ * (a newer schema may add one). Two different events under one uid must
+ * never be silently merged.
+ */
+function sameEventContent(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  for (const column of Object.keys(left)) {
+    if (!(column in right)) continue;
+    if ((left[column] ?? null) !== (right[column] ?? null)) return false;
+  }
+  return true;
+}
+
+export class EventCollisionError extends Error {}
 
 const CLOCK_BUMP = "UPDATE sync_clock SET seq = seq + 1 WHERE id = 1";
 const CURRENT_SEQ = "(SELECT seq FROM sync_clock WHERE id = 1)";
@@ -194,9 +287,20 @@ export async function runSyncEngine(
 ): Promise<SyncRunSummary> {
   const own = options.hostSlug;
   const rebuild = options.rebuildProjections ?? defaultRebuild;
+  const warn = options.warn ?? ((message: string) => console.error(message));
   // Before any network call: a previous run's pulled events must be
   // projected even when this run is push-only or cannot reach the server.
-  const rebuiltFirst = rebuildIfPending(database, rebuild);
+  // A failure here must not block push and pull (new local work would never
+  // be backed up, and a correcting event never pulled): keep the marker,
+  // warn, and retry at the end, where a second failure fails the run.
+  let rebuiltFirst = false;
+  try {
+    rebuiltFirst = rebuildIfPending(database, rebuild);
+  } catch (error) {
+    warn(
+      `sync: projection rebuild failed, retrying after push and pull: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const localVersion = (database.query("PRAGMA user_version").get() as { user_version: number })
     .user_version;
 
@@ -230,22 +334,45 @@ export async function runSyncEngine(
     // one with nothing dirty must still stop older hosts at the gate.
     await remote.write([{ sql: RAISE_SCHEMA_VERSION, args: [String(localVersion)] }]);
   }
-  const serverId = meta.get("server_id") ?? "";
+  let serverId = meta.get("server_id") ?? "";
   const clock = Number(
     (await remote.query("SELECT seq FROM sync_clock WHERE id = 1"))[0]?.seq ?? 0,
   );
 
-  const storedId = (
-    database.query("SELECT value FROM sync_meta WHERE key = 'server_id'").get() as {
-      value: string;
-    } | null
-  )?.value;
+  const storedId = localMeta(database, "server_id");
   const maxCursor = (
     database.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_cursors").get() as { seq: number }
   ).seq;
-  // Unknown server: a different id, or a clock behind what this host already
-  // pulled (restored from an older backup that kept its id).
-  let unknown = storedId !== serverId || clock < maxCursor;
+  // Unknown server: a re-seed still pending from an earlier run, a
+  // different id, a clock behind what this host already pulled, or a write
+  // this host saw accepted that is gone (restored from an older backup that
+  // kept its id).
+  const lost =
+    storedId === serverId && (clock < maxCursor || (await pushProbeLost(database, remote)));
+  let unknown = localMeta(database, RESEED_PENDING) !== null || storedId !== serverId || lost;
+  if (lost) {
+    // This server lost writes yet kept its id, so a host that never pushed
+    // since the backup would see nothing wrong (another host's re-seed can
+    // even put its probes back). Rotate the id so every host re-seeds and
+    // pulls from 0. Compare-and-set: when two hosts detect it at once,
+    // only one rotation lands and both adopt whatever id the server holds.
+    await remote.write([
+      {
+        sql: "UPDATE sync_meta SET value = ? WHERE key = 'server_id' AND value = ?",
+        args: [newUlid(), serverId],
+      },
+    ]);
+    const current = await remote.query("SELECT value FROM sync_meta WHERE key = 'server_id'");
+    serverId = String(current[0]?.value ?? "");
+  }
+  if (unknown) {
+    // Durable: every later run keeps re-seeding and pulling from 0 until a
+    // re-seed push completes, whatever runs in between.
+    database.transaction(() => {
+      database.query(META_UPSERT).run(RESEED_PENDING, serverId);
+      database.exec("DELETE FROM sync_cursors");
+    })();
+  }
 
   const shapes = mirrorShapes(database);
   const summary: SyncRunSummary = {
@@ -253,19 +380,6 @@ export async function runSyncEngine(
     pulled: { events: 0, rows: 0, tombstones: 0 },
     rebuilt: rebuiltFirst,
     reseeded: false,
-  };
-
-  const resetIdentity = (storeId: boolean) => {
-    database.transaction(() => {
-      database.exec("DELETE FROM sync_cursors");
-      if (storeId) {
-        database
-          .query(
-            "INSERT INTO sync_meta (key, value) VALUES ('server_id', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-          )
-          .run(serverId);
-      }
-    })();
   };
 
   if (options.push) {
@@ -281,16 +395,24 @@ export async function runSyncEngine(
     summary.pushed.events += await pushEvents(context);
     summary.pushed.tombstones += await pushTombstones(context);
     if (unknown) {
-      resetIdentity(true);
+      // The re-seed completed in full: trust this server from now on. The
+      // cursors were reset when the marker was set, so the pull below
+      // still starts from 0.
+      database.transaction(() => {
+        database.query(META_UPSERT).run("server_id", serverId);
+        database
+          .query("DELETE FROM sync_meta WHERE key = ? AND value = ?")
+          .run(RESEED_PENDING, serverId);
+      })();
       summary.reseeded = true;
       unknown = false;
     }
   }
 
   if (options.pull) {
-    // Pull-only against an unknown server: start from 0 but leave the id
-    // unstored, so the next push still re-seeds it.
-    if (unknown) resetIdentity(false);
+    // A pull-only run against an unknown server starts from 0 (the cursors
+    // were reset above) and leaves the marker and the id alone, so the next
+    // push still re-seeds.
     const pageSize = options.pageSize ?? options.batchSize;
     const rowCounts = await pullRows(database, remote, own, pageSize, shapes);
     summary.pulled.rows = rowCounts.rows;
@@ -343,15 +465,17 @@ async function pushMirror(context: PushContext, shape: MirrorShape): Promise<num
   const keys = shape.table.keyColumns.map(quoted).join(", ");
   const select = database.query(
     `SELECT rowid AS sync_rowid, json_array(${keys}) AS sync_pk, ${shape.content.map(quoted).join(", ")}, sync_host, sync_updated_at
-       FROM ${name} WHERE rowid > ? AND ${OUTBOX} ORDER BY rowid LIMIT ?`,
+       FROM ${name} WHERE (? IS NULL OR rowid > ?) AND ${OUTBOX} ORDER BY rowid LIMIT ?`,
   );
   const mark = database.query(
     `UPDATE ${name} SET sync_dirty = 0 WHERE rowid = ? AND sync_dirty = 1 AND sync_updated_at = ?`,
   );
-  let after = 0;
+  // No lower bound on the first page: an INTEGER PRIMARY KEY table's rowid
+  // is the id itself, and a source id of 0 or below is valid.
+  let after: number | null = null;
   let pushed = 0;
   for (;;) {
-    const rows = select.all(after, context.reseed ? 1 : 0, context.batchSize) as Record<
+    const rows = select.all(after, after, context.reseed ? 1 : 0, context.batchSize) as Record<
       string,
       unknown
     >[];
@@ -370,8 +494,16 @@ async function pushMirror(context: PushContext, shape: MirrorShape): Promise<num
       });
     }
     await context.remote.write(statements);
+    const probe = rows.at(-1) as Record<string, unknown>;
     database.transaction(() => {
       for (const row of rows) mark.run(row.sync_rowid as number, row.sync_updated_at as string);
+      storeRowProbe(
+        database,
+        name,
+        probe.sync_pk as string,
+        probe.sync_updated_at as string,
+        probe.sync_host as string,
+      );
     })();
     pushed += rows.length;
     after = rows.at(-1)?.sync_rowid as number;
@@ -402,11 +534,46 @@ async function pushEvents(context: PushContext): Promise<number> {
       });
     }
     await context.remote.write(statements);
+    await verifyPushedEvents(context.remote, rows, content);
     database.transaction(() => {
       for (const row of rows) mark.run(row.uid as string);
+      database.query(META_UPSERT).run(PUSH_PROBE_EVENT, rows.at(-1)?.uid as string);
     })();
     pushed += rows.length;
     after = rows.at(-1)?.uid as string;
+  }
+}
+
+/**
+ * After an events batch commits: the server must hold exactly what was
+ * sent under each uid. A different event already there under the same uid
+ * (a cross-host uid collision) would otherwise be dropped by
+ * `ON CONFLICT (uid) DO NOTHING` and marked pushed, losing it for good.
+ * Throwing leaves the batch dirty, so every later run fails loudly too.
+ */
+async function verifyPushedEvents(
+  remote: SyncRemote,
+  rows: Record<string, unknown>[],
+  content: string[],
+): Promise<void> {
+  const uids = rows.map((row) => row.uid as string);
+  const stored = new Map(
+    (
+      await remote.query(
+        `SELECT uid, data FROM sync_events WHERE uid IN (${uids.map(() => "?").join(", ")})`,
+        uids,
+      )
+    ).map((row) => [String(row.uid), String(row.data)]),
+  );
+  for (const row of rows) {
+    const uid = row.uid as string;
+    const data = stored.get(uid);
+    const sent = JSON.parse(toJson(row, content, "events")) as Record<string, unknown>;
+    if (data === undefined || !sameEventContent(sent, JSON.parse(data))) {
+      throw new EventCollisionError(
+        `event uid ${uid} is held by the server with different content; a different host minted the same uid. Not marking it pushed`,
+      );
+    }
   }
 }
 
@@ -438,8 +605,10 @@ async function pushTombstones(context: PushContext): Promise<number> {
       });
     }
     await context.remote.write(statements);
+    const probe = rows.at(-1) as (typeof rows)[number];
     database.transaction(() => {
       for (const row of rows) mark.run(row.sync_rowid, row.deleted_at);
+      storeRowProbe(database, probe.tbl, probe.pk, probe.deleted_at, probe.sync_host);
     })();
     pushed += rows.length;
     after = rows.at(-1)?.sync_rowid as number;
@@ -713,6 +882,9 @@ async function pullEvents(
   );
   const sql = pageQuery("sync_events", "uid, data, sync_host", "uid");
   const statements = new Map<string, Statement>();
+  const localByUid = database.query(
+    `SELECT ${[...content].map(quoted).join(", ")} FROM events WHERE uid = ?`,
+  );
   let inserted = 0;
   for (;;) {
     const cursor = readCursor(database, "events");
@@ -744,16 +916,21 @@ async function pullEvents(
           event.sync_host,
           ...columns.map((column) => data[column] ?? null),
         );
+        if (result.changes === 0) {
+          // Same uid already here: it must be the same event. A different
+          // one is a uid collision; throwing rolls the page back and holds
+          // the cursor instead of silently keeping only one of them.
+          const local = localByUid.get(event.uid) as Record<string, unknown> | null;
+          if (local !== null && !sameEventContent(data, local)) {
+            throw new EventCollisionError(
+              `pulled event uid ${event.uid} collides with a different local event; a different host minted the same uid`,
+            );
+          }
+        }
         inserted += result.changes;
         pageInserted += result.changes;
       }
-      if (pageInserted > 0) {
-        database
-          .query(
-            "INSERT INTO sync_meta (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-          )
-          .run(REBUILD_PENDING);
-      }
+      if (pageInserted > 0) setRebuildMarker(database);
       writeCursor(database, "events", last);
     })();
   }

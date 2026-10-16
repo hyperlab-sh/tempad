@@ -1,7 +1,15 @@
-import type { Database } from "bun:sqlite";
+import { Database as BunDatabase, type Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { isNewer, runSyncEngine, SchemaGateError, type SyncRemote } from "../../src/sync/engine";
+import { type RebuildOptions, rebuildAll } from "../../src/intent/projections";
+import { registerAllProjections } from "../../src/intent/projections/register";
+import {
+  EventCollisionError,
+  isNewer,
+  runSyncEngine,
+  SchemaGateError,
+  type SyncRemote,
+} from "../../src/sync/engine";
 import {
   addCommit,
   addMondayItem,
@@ -9,6 +17,7 @@ import {
   addRepository,
   addSession,
   FakeRemote,
+  failingOnWrite,
   intent,
   openHost,
   projectionSnapshot,
@@ -633,5 +642,406 @@ describe("re-seed from a surviving host", () => {
       c.close();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+/** The server as it was at `backup`: same `server_id`, older clock and data. */
+function restore(backup: Uint8Array): FakeRemote {
+  const restored = new FakeRemote();
+  (restored as { database: Database }).database = BunDatabase.deserialize(backup);
+  return restored;
+}
+
+function count(database: Database, sql: string): number {
+  return (database.query(sql).get() as { n: number }).n;
+}
+
+describe("a server restored from a backup that kept its id", () => {
+  let root: string;
+  let server: FakeRemote;
+  let a: Database;
+  let b: Database;
+  let c: Database;
+  const one = (database: Database, remote: SyncRemote, hostSlug: string, extra: object = {}) =>
+    runSyncEngine(database, remote, { hostSlug, batchSize: 1, ...both, ...extra });
+
+  beforeEach(() => {
+    root = temporaryDirectory();
+    server = new FakeRemote();
+    a = openHost(root, "host-a");
+    b = openHost(root, "host-b");
+    c = openHost(root, "host-c");
+  });
+
+  afterEach(() => {
+    a.close();
+    b.close();
+    c.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A and B write after the backup; returns the restored server. */
+  async function backupThenWrite(): Promise<FakeRemote> {
+    addRepository(a, "acme/web");
+    await intent(a, ["hero", "init", "Saulo"]);
+    await one(a, server, "host-a");
+    const backup = server.database.serialize();
+    for (let index = 0; index < 6; index++) addCommit(a, `c${index}`, "acme/web", `s${index}`);
+    await intent(a, ["party", "add", "acme", "Acme"]);
+    for (let index = 0; index < 10; index++) addMondayItem(b, index, `m${index}`);
+    await one(a, server, "host-a");
+    await one(b, server, "host-b");
+    await one(a, server, "host-a");
+    return restore(backup);
+  }
+
+  /** Everyone settles, then a fresh host must hold exactly what A holds. */
+  async function expectFourthHostConverges(restored: FakeRemote, hosts: [Database, string][]) {
+    for (let round = 0; round < 2; round++) {
+      for (const [host, slug] of hosts) await one(host, restored, slug);
+    }
+    const d = openHost(root, "host-d");
+    try {
+      await one(d, restored, "host-d");
+      for (const [host] of hosts) expect(sourceSnapshot(host)).toEqual(sourceSnapshot(a));
+      expect(sourceSnapshot(d)).toEqual(sourceSnapshot(a));
+      expect(projectionSnapshot(d)).toEqual(projectionSnapshot(a));
+    } finally {
+      d.close();
+    }
+  }
+
+  test("P1: a pull-only run first does not cancel the re-seed", async () => {
+    const restored = await backupThenWrite();
+    const pullOnly = await one(a, restored, "host-a", { push: false });
+    expect(pullOnly.reseeded).toBe(false);
+    expect(
+      a.query("SELECT value FROM sync_meta WHERE key = 'reseed_pending'").get(),
+    ).not.toBeNull();
+    // Again pull-only: still pending, still not trusting the cursors.
+    await one(a, restored, "host-a", { push: false });
+    const next = await one(a, restored, "host-a");
+    expect(next.reseeded).toBe(true);
+    expect(
+      count(restored.database, "SELECT COUNT(*) AS n FROM sync_rows WHERE tbl = 'gh_commits'"),
+    ).toBe(6);
+    expect(a.query("SELECT value FROM sync_meta WHERE key = 'reseed_pending'").get()).toBeNull();
+    await expectFourthHostConverges(restored, [
+      [a, "host-a"],
+      [b, "host-b"],
+    ]);
+  });
+
+  test("P2: a re-seed interrupted part-way resumes in full on the next run", async () => {
+    const restored = await backupThenWrite();
+    await expect(one(a, failingOnWrite(restored, 6), "host-a")).rejects.toThrow(
+      "injected remote failure",
+    );
+    expect(
+      a.query("SELECT value FROM sync_meta WHERE key = 'reseed_pending'").get(),
+    ).not.toBeNull();
+    const next = await one(a, restored, "host-a");
+    expect(next.reseeded).toBe(true);
+    // A holds B's monday rows too, so A alone restores them.
+    expect(
+      count(restored.database, "SELECT COUNT(*) AS n FROM sync_rows WHERE tbl = 'monday_items'"),
+    ).toBe(10);
+    await expectFourthHostConverges(restored, [
+      [a, "host-a"],
+      [b, "host-b"],
+    ]);
+  });
+
+  test("P4: another host writing first after the restore does not hide it", async () => {
+    const restored = await backupThenWrite();
+    const cursor = count(a, "SELECT MAX(seq) AS n FROM sync_cursors");
+    for (let index = 200; index < 200 + cursor + 2; index++) addMondayItem(c, index, `c${index}`);
+    await one(c, restored, "host-c");
+    expect(restored.clock()).toBeGreaterThan(cursor);
+
+    const reseedA = await one(a, restored, "host-a");
+    expect(reseedA.reseeded).toBe(true);
+    const reseedB = await one(b, restored, "host-b");
+    expect(reseedB.reseeded).toBe(true);
+    expect(count(a, "SELECT COUNT(*) AS n FROM monday_items WHERE id >= 200")).toBe(cursor + 2);
+    await expectFourthHostConverges(restored, [
+      [a, "host-a"],
+      [b, "host-b"],
+      [c, "host-c"],
+    ]);
+  });
+
+  test("detection rotates the server id once and every host settles", async () => {
+    const restored = await backupThenWrite();
+    const before = restored.database
+      .query("SELECT value FROM sync_meta WHERE key = 'server_id'")
+      .get() as { value: string };
+    // A and B both see the loss (each one's last push is gone).
+    expect((await one(a, restored, "host-a", { push: false })).reseeded).toBe(false);
+    expect((await one(b, restored, "host-b", { push: false })).reseeded).toBe(false);
+    const after = restored.database
+      .query("SELECT value FROM sync_meta WHERE key = 'server_id'")
+      .get() as { value: string };
+    expect(after.value).not.toBe(before.value);
+    expect((await one(a, restored, "host-a")).reseeded).toBe(true);
+    expect((await one(b, restored, "host-b")).reseeded).toBe(true);
+    expect((await one(c, restored, "host-c")).reseeded).toBe(true);
+    for (const [host, slug] of [
+      [a, "host-a"],
+      [b, "host-b"],
+      [c, "host-c"],
+    ] as const) {
+      expect((await one(host, restored, slug)).reseeded).toBe(false);
+    }
+    expect(
+      (
+        restored.database.query("SELECT value FROM sync_meta WHERE key = 'server_id'").get() as {
+          value: string;
+        }
+      ).value,
+    ).toBe(after.value);
+    expect(sourceSnapshot(b)).toEqual(sourceSnapshot(a));
+    expect(sourceSnapshot(c)).toEqual(sourceSnapshot(a));
+  });
+
+  test("a lost event is detected even when the clock moved past every cursor", async () => {
+    await intent(a, ["hero", "init", "Saulo"]);
+    await one(a, server, "host-a");
+    const backup = server.database.serialize();
+    await intent(a, ["party", "add", "acme", "Acme"]);
+    await one(a, server, "host-a");
+    const restored = restore(backup);
+    // Push the restored clock far ahead from another host.
+    for (let index = 0; index < 20; index++) addMondayItem(c, index, `c${index}`);
+    await one(c, restored, "host-c");
+    const next = await one(a, restored, "host-a");
+    expect(next.reseeded).toBe(true);
+    expect(count(restored.database, "SELECT COUNT(*) AS n FROM sync_events")).toBe(
+      count(a, "SELECT COUNT(*) AS n FROM events"),
+    );
+  });
+});
+
+test("a mirror row whose rowid is 0 or negative is pushed", async () => {
+  const root = temporaryDirectory();
+  const server = new FakeRemote();
+  const source = openHost(root, "host-a");
+  const target = openHost(root, "host-b");
+  try {
+    addMondayItem(source, 0, "zero");
+    addMondayItem(source, -5, "negative");
+    addMondayItem(source, 3, "positive");
+    await runSyncEngine(source, server, { hostSlug: "host-a", batchSize: 1, ...both });
+    await runSyncEngine(target, server, { hostSlug: "host-b", batchSize: 1, ...both });
+    expect(count(source, "SELECT COUNT(*) AS n FROM monday_items WHERE sync_dirty = 1")).toBe(0);
+    expect(sourceSnapshot(target).monday_items).toHaveLength(3);
+  } finally {
+    source.close();
+    target.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+describe("rebuild failures and markers", () => {
+  beforeEach(() => {
+    directory = temporaryDirectory();
+    remote = new FakeRemote();
+    hostA = openHost(directory, "host-a");
+    hostB = openHost(directory, "host-b");
+  });
+
+  afterEach(() => {
+    hostA.close();
+    hostB.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  test("P9: a rebuild that keeps failing still lets push and pull run, then fails the run", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await sync(hostA, remote, "host-a");
+    const boom = () => {
+      throw new Error("reducer boom");
+    };
+    await expect(sync(hostB, remote, "host-b", { rebuildProjections: boom })).rejects.toThrow(
+      "reducer boom",
+    );
+    addMondayItem(hostB, 7, "new local work");
+    const warnings: string[] = [];
+    await expect(
+      sync(hostB, remote, "host-b", {
+        rebuildProjections: boom,
+        pull: false,
+        warn: (message: string) => warnings.push(message),
+      }),
+    ).rejects.toThrow("reducer boom");
+    expect(warnings).toEqual([
+      "sync: projection rebuild failed, retrying after push and pull: reducer boom",
+    ]);
+    expect(
+      count(remote.database, "SELECT COUNT(*) AS n FROM sync_rows WHERE tbl = 'monday_items'"),
+    ).toBe(1);
+    expect(
+      hostB.query("SELECT 1 FROM sync_meta WHERE key = 'rebuild_pending'").get(),
+    ).not.toBeNull();
+    const healed = await sync(hostB, remote, "host-b");
+    expect(healed.rebuilt).toBe(true);
+    expect(projectionSnapshot(hostB)).toEqual(projectionSnapshot(hostA));
+  });
+
+  test("a marker set again during a rebuild survives that rebuild's clear", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await sync(hostA, remote, "host-a");
+    await expect(
+      sync(hostB, remote, "host-b", {
+        rebuildProjections: () => {
+          throw new Error("first rebuild fails");
+        },
+      }),
+    ).rejects.toThrow("first rebuild fails");
+    const before = hostB.query("SELECT value FROM sync_meta WHERE key = 'rebuild_pending'").get();
+    let calls = 0;
+    const summary = await sync(hostB, remote, "host-b", {
+      pull: false,
+      rebuildProjections: (database: Database, options: RebuildOptions) => {
+        // A concurrent sync pulls a page and sets a fresh marker meanwhile.
+        calls += 1;
+        database
+          .query("UPDATE sync_meta SET value = ? WHERE key = 'rebuild_pending'")
+          .run(`concurrent-${calls}`);
+        options.beforeCommit?.(database);
+      },
+    });
+    // The first rebuild's clear misses (token changed), so the end-of-run
+    // rebuild runs again, and its clear misses the next renewal too.
+    const renewed = `concurrent-${calls}`;
+    expect(calls).toBe(2);
+    expect(summary.rebuilt).toBe(true);
+    expect(before).not.toBeNull();
+    expect(hostB.query("SELECT value FROM sync_meta WHERE key = 'rebuild_pending'").get()).toEqual({
+      value: renewed,
+    });
+  });
+
+  test("the marker is cleared inside the rebuild's transaction, so a rollback keeps it", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await sync(hostA, remote, "host-a");
+    const failAtCommit = (database: Database, options: RebuildOptions) => {
+      registerAllProjections();
+      rebuildAll(database, {
+        beforeCommit: (inside) => {
+          options.beforeCommit?.(inside);
+          // The marker is gone inside the transaction...
+          expect(
+            inside.query("SELECT 1 FROM sync_meta WHERE key = 'rebuild_pending'").get(),
+          ).toBeNull();
+          throw new Error("commit fails");
+        },
+      });
+    };
+    await expect(
+      sync(hostB, remote, "host-b", { rebuildProjections: failAtCommit }),
+    ).rejects.toThrow("commit fails");
+    // ...and back after the rollback, with the projections still stale.
+    expect(
+      hostB.query("SELECT 1 FROM sync_meta WHERE key = 'rebuild_pending'").get(),
+    ).not.toBeNull();
+    expect(projectionSnapshot(hostB)).not.toEqual(projectionSnapshot(hostA));
+    expect((await sync(hostB, remote, "host-b")).rebuilt).toBe(true);
+    expect(hostB.query("SELECT 1 FROM sync_meta WHERE key = 'rebuild_pending'").get()).toBeNull();
+    expect(projectionSnapshot(hostB)).toEqual(projectionSnapshot(hostA));
+  });
+
+  test("each pulled page sets a fresh marker token", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await sync(hostA, remote, "host-a");
+    const tokens = new Set<string>();
+    for (let round = 0; round < 2; round++) {
+      await intent(hostA, ["party", "add", `p${round}`, `P${round}`]);
+      await sync(hostA, remote, "host-a");
+      await expect(
+        sync(hostB, remote, "host-b", {
+          rebuildProjections: () => {
+            throw new Error("keep the marker");
+          },
+        }),
+      ).rejects.toThrow();
+      const row = hostB
+        .query("SELECT value FROM sync_meta WHERE key = 'rebuild_pending'")
+        .get() as {
+        value: string;
+      };
+      tokens.add(row.value);
+    }
+    expect(tokens.size).toBe(2);
+  });
+});
+
+describe("event uid collisions are loud", () => {
+  beforeEach(() => {
+    directory = temporaryDirectory();
+    remote = new FakeRemote();
+    hostA = openHost(directory, "host-a");
+    hostB = openHost(directory, "host-b");
+  });
+
+  afterEach(() => {
+    hostA.close();
+    hostB.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  function firstUid(database: Database): string {
+    return (database.query("SELECT uid FROM events ORDER BY uid LIMIT 1").get() as { uid: string })
+      .uid;
+  }
+
+  function plantRemoteEvent(uid: string, subject: string): void {
+    const seq = remote.clock() + 1;
+    remote.database.query("UPDATE sync_clock SET seq = ?").run(seq);
+    remote.database
+      .query("INSERT INTO sync_events (uid, data, sync_host, seq) VALUES (?, ?, 'host-z', ?)")
+      .run(
+        uid,
+        JSON.stringify({
+          at: "2026-10-01T00:00:00.000Z",
+          recorded_at: "2026-10-01T00:00:00.000Z",
+          actor: "hero",
+          session_id: null,
+          kind: "hero.created",
+          subject,
+          payload: "{}",
+        }),
+        seq,
+      );
+  }
+
+  test("a push whose uid the server holds with other content throws and stays dirty", async () => {
+    await sync(hostA, remote, "host-a");
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    plantRemoteEvent(firstUid(hostA), "someone-else");
+    await expect(sync(hostA, remote, "host-a")).rejects.toThrow(EventCollisionError);
+    expect(count(hostA, "SELECT COUNT(*) AS n FROM events WHERE sync_dirty = 1")).toBe(1);
+    await expect(sync(hostA, remote, "host-a")).rejects.toThrow("different content");
+  });
+
+  test("a pulled uid that exists locally with other content throws and holds the cursor", async () => {
+    await sync(hostB, remote, "host-b");
+    await intent(hostB, ["hero", "init", "Saulo"]);
+    plantRemoteEvent(firstUid(hostB), "someone-else");
+    const pullOnly = { hostSlug: "host-b", batchSize: 500, push: false, pull: true };
+    await expect(runSyncEngine(hostB, remote, pullOnly)).rejects.toThrow(EventCollisionError);
+    expect(hostB.query("SELECT seq FROM sync_cursors WHERE stream = 'events'").get()).toBeNull();
+    expect(count(hostB, "SELECT COUNT(*) AS n FROM events")).toBe(1);
+  });
+
+  test("the same event arriving under its own uid is not a collision", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await sync(hostA, remote, "host-a");
+    await sync(hostB, remote, "host-b");
+    // A full re-download and a full re-push both meet identical events.
+    const fresh = new FakeRemote();
+    await sync(hostA, fresh, "host-a");
+    await sync(hostB, fresh, "host-b");
+    expect(sourceSnapshot(hostA).events).toEqual(sourceSnapshot(hostB).events);
   });
 });
