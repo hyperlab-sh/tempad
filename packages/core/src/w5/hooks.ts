@@ -77,12 +77,13 @@ const CLI_PATH = join(PACKAGE_ROOT, "src", "cli.ts");
 
 /**
  * Message `tempad w5 hook install` prints when it runs from a throwaway location. `bunx`
- * unpacks a package into `$TMPDIR/bunx-<uid>-<name>@<version>/` (bun 1.3), and the global
+ * unpacks a package into `$TMPDIR/bunx-<uid>-<name>@<version>/` (bun 1.3; a scoped name nests as
+ * `bunx-<uid>-@scope/<name>@<version>/`), and the global
  * install cache lives under `~/.bun/install/cache/`; settings.json entries pointing there
  * stop working as soon as bun clears them.
  */
 export const UNSTABLE_INSTALL_MESSAGE =
-  "tempad w5 hook install: this copy of tempad lives in a temporary location (bunx or a cache), and the hooks it would write into settings.json would break once that is cleared. The supported route for bunx users is the plugin: claude plugin install tempad@hyperlab. `w5 hook install` is for a checkout or a global install (bun add -g tempad).";
+  "tempad w5 hook install: this copy of tempad lives in a temporary location (bunx or a cache), and the hooks it would write into settings.json would break once that is cleared. The supported route for bunx users is the plugin: claude plugin install tempad@hyperlab. `w5 hook install` is for a checkout or a global install (bun add -g @hyperlab.sh/tempad).";
 
 function pathVariants(path: string): string[] {
   try {

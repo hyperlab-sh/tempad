@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The npm package is published as `@hyperlab.sh/tempad` (npm rejected `tempad` as too similar to `temp`/`tempy`); run it with `bunx @hyperlab.sh/tempad`. The `tempad` bin and the Claude Code plugin name are unchanged.
 - Configuration is per command: each command validates only the variables it needs (`tempad sync monday` no longer requires `TZ`), and a missing one names the command and every missing variable.
 - `tempad --help`, `-h` and `help` print every command and exit 0; an unknown command still exits 2.
 - The w5 hook scripts exit silently, creating nothing, when tempad is not configured.

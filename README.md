@@ -69,27 +69,27 @@ Requires [Bun](https://bun.sh) 1.3.14 or newer and [Claude Code](https://claude.
 2. **Configure tempad.** This creates `~/.tempad/.env` and `tempad.toml`:
 
    ```sh
-   bunx tempad init
+   bunx @hyperlab.sh/tempad init
    ```
 
 3. **Sync and report:**
 
    ```sh
-   bunx tempad hero init "Your Name"
-   bunx tempad sync
-   bunx tempad report daily --from 2026-08-18 --to 2026-08-28
+   bunx @hyperlab.sh/tempad hero init "Your Name"
+   bunx @hyperlab.sh/tempad sync
+   bunx @hyperlab.sh/tempad report daily --from 2026-08-18 --to 2026-08-28
    ```
 
    Reports are printed and written to `~/.tempad/reports/`.
 
-The CLI is published to npm as [`tempad`](https://www.npmjs.com/package/tempad); `bunx tempad` runs it without a global install. `bun add -g tempad` installs a `tempad` command if you prefer one on your `PATH`, and the plugin's hooks and skill use it when present.
+The CLI is published to npm as [`@hyperlab.sh/tempad`](https://www.npmjs.com/package/@hyperlab.sh/tempad); `bunx @hyperlab.sh/tempad` runs it without a global install. `bun add -g @hyperlab.sh/tempad` installs a `tempad` command if you prefer one on your `PATH`, and the plugin's hooks and skill use it when present.
 
 ### What the plugin installs
 
 - The **`tempad-quest` skill**, which has the session declare which quest it is pursuing (`tempad quest declare`) so work is tracked under the right outcome instead of guessed.
 - **Hooks** on `Stop`, `PreCompact`, `SessionEnd` and `UserPromptSubmit` that enqueue classification jobs and hand open doubts back to the session. They never block a session and are **silent until tempad is configured**: with no `~/.tempad/.env` or `tempad.db` they exit 0 with no output and create nothing.
 
-The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx tempad`.
+The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx @hyperlab.sh/tempad`.
 
 ### `tempad init`
 
@@ -104,7 +104,7 @@ The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx temp
 | `--no-verify`                  | Skip the network and filesystem checks (Monday token, GitHub credentials, `CLAUDE_DIRS` exist); format checks (booleans, lists, `TZ`, `SINCE`) always run |
 
 ```sh
-bunx tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
+bunx @hyperlab.sh/tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
   --gh-user octocat --gh-orgs my-org --gh-include-personal false \
   --git-author-emails me@example.com --claude-dirs ~/.claude --host-slug laptop \
   --tz Europe/Berlin --since 2026-01-01
@@ -115,7 +115,7 @@ bunx tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 123
 If you installed the hooks with `tempad w5 hook install` (they live in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` if you set that variable, marked `"tempad": true`), switch to the plugin without a gap:
 
 1. `claude plugin install tempad@hyperlab`. The legacy hooks keep running and the plugin's hooks stand down while they exist, so a session never gets two enqueues or two context lines.
-2. `bunx tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration, uses the same settings file the hooks were installed into (`$CLAUDE_CONFIG_DIR` when set, else `~/.claude`), prints which file it changed, and removes only the entries it marked. The plugin's hooks take over on the next event.
+2. `bunx @hyperlab.sh/tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration, uses the same settings file the hooks were installed into (`$CLAUDE_CONFIG_DIR` when set, else `~/.claude`), prints which file it changed, and removes only the entries it marked. The plugin's hooks take over on the next event.
 3. Remove the old skill copy if you copied it by hand: `rm -r ~/.claude/skills/tempad-quest` (under `$CLAUDE_CONFIG_DIR/skills/` if you set that variable). The plugin provides it.
 
 `tempad w5 hook install` still exists for checkout users; it prints that the plugin is the recommended route.
@@ -126,7 +126,7 @@ If you installed the hooks with `tempad w5 hook install` (they live in `~/.claud
 
 Settings are read from the real environment first, then `TEMPAD_HOME/.env`. A `.env` in the current directory is ignored on purpose: hooks run with your project as the working directory, and a project's `TZ` must not override yours.
 
-Each command checks only the variables it needs and fails naming the command and every missing variable, for example `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx tempad init`. Required variables have no defaults.
+Each command checks only the variables it needs and fails naming the command and every missing variable, for example `tempad sync monday needs MONDAY_API_TOKEN, MONDAY_USER; set them in ~/.tempad/.env or run: bunx @hyperlab.sh/tempad init`. Required variables have no defaults.
 
 | Variable              | Meaning                                                                   | Needed by                    |
 | --------------------- | ------------------------------------------------------------------------- | ---------------------------- |
@@ -142,7 +142,7 @@ Each command checks only the variables it needs and fails naming the command and
 | `TZ`                  | IANA time zone that places work on days, e.g. `Europe/Berlin`             | `report *`, `w5 eval`        |
 | `SINCE`               | Earliest date to sync, `YYYY-MM-DD`                                       | `sync github`, `sync claude` |
 
-`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx tempad init`.
+`sync` with no source needs the union of the three. The intent commands (`hero`, `party`, `client`, `saga`, `quest`, `stint`, `trace`, `answer`, `rebuild`, `impact`, `project`), `quiet`, `review` and most `w5` subcommands need no variables. `--help`, `init`, `skill install` and `w5 hook install|uninstall` need no configuration at all and never open the database. Any command that opens the database on an unconfigured home exits 1 with `tempad is not set up yet; run: bunx @hyperlab.sh/tempad init`.
 
 `ANTHROPIC_API_KEY` is only required when `[w5].backend = "api"`; like the other settings it is read from the real environment, then from `TEMPAD_HOME/.env`, and `tempad init --force` keeps that line when it rewrites the file.
 

@@ -5,9 +5,9 @@ Reconstructs your work history, hour by hour, from git, Monday.com and Claude Co
 Runs on [Bun](https://bun.sh) 1.3.14 or newer.
 
 ```sh
-bunx tempad init      # writes ~/.tempad/.env and tempad.toml
-bunx tempad sync
-bunx tempad report daily --from 2026-01-01 --to 2026-01-07
+bunx @hyperlab.sh/tempad init      # writes ~/.tempad/.env and tempad.toml
+bunx @hyperlab.sh/tempad sync
+bunx @hyperlab.sh/tempad report daily --from 2026-01-01 --to 2026-01-07
 ```
 
 To have Claude Code declare each session's quest and feed the w5 hook, install the plugin too:

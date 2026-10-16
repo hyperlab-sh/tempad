@@ -94,7 +94,7 @@ w5_gate() {
   elif command -v tempad >/dev/null 2>&1; then
     _bin=(tempad)
   elif command -v bun >/dev/null 2>&1; then
-    _bin=(bun x tempad)
+    _bin=(bun x @hyperlab.sh/tempad)
   else
     w5_log "$script: no tempad CLI found (TEMPAD_BIN unset, no tempad or bun on PATH), skipping session $session_id"
     exit 0

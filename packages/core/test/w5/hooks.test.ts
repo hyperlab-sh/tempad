@@ -756,7 +756,7 @@ describe("hook scripts: CLI resolution", () => {
     }
   });
 
-  test("falls back to bunx tempad when only bun is on PATH", async () => {
+  test("falls back to bunx @hyperlab.sh/tempad when only bun is on PATH", async () => {
     const dir = configuredHome();
     try {
       const binDirectory = join(dir, "bin");
@@ -771,7 +771,7 @@ describe("hook scripts: CLI resolution", () => {
       );
 
       expect(readFileSync(argvLog, "utf8").trim()).toBe(
-        "x tempad w5 enqueue --session s1 --forced --kind session_end",
+        "x @hyperlab.sh/tempad w5 enqueue --session s1 --forced --kind session_end",
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });

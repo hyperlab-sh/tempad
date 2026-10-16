@@ -26,12 +26,12 @@ stint, checking on someone is a maneuver of the stint that handed off).
 ## Resolve the CLI
 
 Before your first tempad call in this session, find the CLI once: `tempad` if `command -v tempad`
-succeeds, else `bunx tempad` if `command -v bun` succeeds. Use that form wherever a command below
+succeeds, else `bunx @hyperlab.sh/tempad` if `command -v bun` succeeds. Use that form wherever a command below
 says `tempad`.
 
-- Neither exists: tell the user exactly "Install bun (https://bun.sh), then run `bunx tempad init`"
+- Neither exists: tell the user exactly "Install bun (https://bun.sh), then run `bunx @hyperlab.sh/tempad init`"
   and stop. Do not declare anything.
-- The CLI answers `tempad is not set up yet`: tell the user to run `bunx tempad init` and stop.
+- The CLI answers `tempad is not set up yet`: tell the user to run `bunx @hyperlab.sh/tempad init` and stop.
 
 ## Declare
 

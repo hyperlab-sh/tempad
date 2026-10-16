@@ -655,6 +655,21 @@ describe("w5 hook install", () => {
     }
   });
 
+  test("refuses to write hooks that point into the scoped bunx directory", () => {
+    const { code, err, settingsPath } = runHookCommand([
+      "install",
+      "--bin",
+      "/home/me/cache/bunx-501-@hyperlab.sh/tempad@0.1.0/node_modules/@hyperlab.sh/tempad/src/cli.ts",
+    ]);
+    try {
+      expect(code).toBe(1);
+      expect(err).toContain(UNSTABLE_INSTALL_MESSAGE);
+      expect(existsSync(settingsPath)).toBe(false);
+    } finally {
+      rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
+    }
+  });
+
   test("refuses to write hooks that point into bunx's temporary directory", () => {
     const { code, out, err, settingsPath } = runHookCommand([
       "install",
@@ -665,7 +680,7 @@ describe("w5 hook install", () => {
       expect(code).toBe(1);
       expect(err).toContain(UNSTABLE_INSTALL_MESSAGE);
       expect(UNSTABLE_INSTALL_MESSAGE).toContain("claude plugin install tempad@hyperlab");
-      expect(UNSTABLE_INSTALL_MESSAGE).toContain("bun add -g tempad");
+      expect(UNSTABLE_INSTALL_MESSAGE).toContain("bun add -g @hyperlab.sh/tempad");
       expect(out).not.toContain(PLUGIN_RECOMMENDATION_MESSAGE);
       expect(existsSync(settingsPath)).toBe(false);
     } finally {
@@ -685,10 +700,26 @@ describe("w5 hook install", () => {
 });
 
 describe("isUnstableInstallPath", () => {
+  test("recognises the scoped bunx layout outside any temp root", () => {
+    for (const path of [
+      "/home/me/cache/bunx-1000-@hyperlab.sh/tempad@0.1.0/node_modules/@hyperlab.sh/tempad/src/cli.ts",
+      "/home/me/cache/bunx-501-@hyperlab.sh/tempad@latest/node_modules/@hyperlab.sh/tempad/hooks/w5-stop.sh",
+    ]) {
+      expect(isUnstableInstallPath(path)).toBe(true);
+    }
+    expect(
+      isUnstableInstallPath(
+        "/home/me/.bun/install/global/node_modules/@hyperlab.sh/tempad/src/cli.ts",
+      ),
+    ).toBe(false);
+  });
+
   test("recognises bunx directories, bun's cache and temp directories", () => {
     for (const path of [
       "/tmp/bunx-1000-tempad@latest/node_modules/tempad/src/cli.ts",
       "/var/folders/ab/xyz/T/bunx-501-tempad@0.1.0/node_modules/tempad/hooks/w5-stop.sh",
+      "/tmp/bunx-501-@hyperlab.sh/tempad@latest/node_modules/@hyperlab.sh/tempad/src/cli.ts",
+      "/var/folders/ab/xyz/T/bunx-501-@hyperlab.sh/tempad@0.1.0/node_modules/@hyperlab.sh/tempad/hooks/w5-stop.sh",
       "/Users/me/.bun/install/cache/tempad@0.1.0@@@1/src/cli.ts",
       "/private/var/folders/ab/T/anything/cli.ts",
       "/tmp/checkout/cli.ts",
