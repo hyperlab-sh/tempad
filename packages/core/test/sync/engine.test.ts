@@ -1,6 +1,6 @@
 import { Database as BunDatabase, type Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { copyFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { type RebuildOptions, rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
@@ -9,6 +9,7 @@ import {
   isNewer,
   runSyncEngine,
   SchemaGateError,
+  type SqlValue,
   type SyncRemote,
 } from "../../src/sync/engine";
 import {
@@ -1148,6 +1149,222 @@ describe("a host reinstalled under the same HOST_SLUG", () => {
       expect(count(fresh, "SELECT COUNT(*) AS n FROM monday_items")).toBe(6);
     } finally {
       fresh.close();
+    }
+  });
+});
+
+/** Records the host each pull page skipped (null = own rows included). */
+function recordingSkippedHosts(remote: SyncRemote, skipped: (SqlValue | undefined)[]): SyncRemote {
+  return {
+    async query(sql, args) {
+      if (sql.includes("sync_host IS NOT ?") && sql.includes("seq > ?")) skipped.push(args?.[1]);
+      return remote.query(sql, args);
+    },
+    write: (statements) => remote.write(statements),
+    close: () => remote.close(),
+  };
+}
+
+describe("a tempad.db restored from an older backup", () => {
+  let root: string;
+  let server: FakeRemote;
+
+  beforeEach(() => {
+    root = temporaryDirectory();
+    server = new FakeRemote();
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const marker = (database: Database) =>
+    database.query("SELECT value FROM sync_meta WHERE key = 'pull_own_pending'").get();
+
+  /** Checkpoints and copies the laptop's db file as the backup. */
+  function backup(database: Database): void {
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    copyFileSync(join(root, "laptop.db"), join(root, "backup.db"));
+  }
+
+  /** The disk dies; the older copy comes back as tempad.db. */
+  function restore(database: Database): Database {
+    database.close();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      rmSync(join(root, `laptop.db${suffix}`), { force: true });
+    }
+    copyFileSync(join(root, "backup.db"), join(root, "laptop.db"));
+    return openHost(root, "laptop");
+  }
+
+  test("gets back the own rows and events it pushed after the backup", async () => {
+    const laptop = openHost(root, "laptop");
+    addRepository(laptop, "acme/web");
+    addCommit(laptop, "c0", "acme/web", "before backup");
+    await intent(laptop, ["hero", "init", "Saulo"]);
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+    backup(laptop);
+
+    addCommit(laptop, "c1", "acme/web", "after backup");
+    await intent(laptop, ["party", "add", "acme", "Acme"]);
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+    const truth = { source: sourceSnapshot(laptop), projections: projectionSnapshot(laptop) };
+
+    const restored = restore(laptop);
+    const other = openHost(root, "desktop");
+    try {
+      expect(count(restored, "SELECT COUNT(*) AS n FROM gh_commits")).toBe(1);
+      const summary = await runSyncEngine(restored, server, {
+        hostSlug: "laptop",
+        batchSize: 50,
+        ...both,
+      });
+      // A known server: nothing is re-seeded, the pull alone repairs it.
+      expect(summary.reseeded).toBe(false);
+      expect(summary.pushed).toEqual({ events: 0, rows: 0, tombstones: 0 });
+      expect(summary.rebuilt).toBe(true);
+      expect(count(restored, "SELECT COUNT(*) AS n FROM gh_commits")).toBe(2);
+      expect(count(restored, "SELECT COUNT(*) AS n FROM events")).toBe(
+        truth.source.events?.length ?? -1,
+      );
+      expect(count(restored, "SELECT COUNT(*) AS n FROM parties")).toBe(1);
+      expect(sourceSnapshot(restored)).toEqual(truth.source);
+      expect(projectionSnapshot(restored)).toEqual(truth.projections);
+      await runSyncEngine(other, server, { hostSlug: "desktop", batchSize: 50, ...both });
+      expect(sourceSnapshot(restored)).toEqual(sourceSnapshot(other));
+      expect(projectionSnapshot(restored)).toEqual(projectionSnapshot(other));
+      expect(marker(restored)).toBeNull();
+
+      // Repaired: the next run skips own rows again and moves nothing.
+      const skipped: (SqlValue | undefined)[] = [];
+      const again = await runSyncEngine(restored, recordingSkippedHosts(server, skipped), {
+        hostSlug: "laptop",
+        batchSize: 50,
+        ...both,
+      });
+      expect(again.pulled).toEqual({ events: 0, rows: 0, tombstones: 0 });
+      expect(again.pushed).toEqual({ events: 0, rows: 0, tombstones: 0 });
+      expect(skipped.length).toBeGreaterThan(0);
+      expect(skipped.every((host) => host === "laptop")).toBe(true);
+    } finally {
+      restored.close();
+      other.close();
+    }
+  });
+
+  for (const [label, change] of [
+    [
+      "an edit",
+      (database: Database) => addCommit(database, "c0", "acme/web", "edited after backup"),
+    ],
+    [
+      "a delete",
+      (database: Database) => database.query("DELETE FROM gh_commits WHERE sha = 'c1'").run(),
+    ],
+  ] as const) {
+    test(`a mirror-only change after the backup comes back: ${label}`, async () => {
+      const laptop = openHost(root, "laptop");
+      addRepository(laptop, "acme/web");
+      addCommit(laptop, "c0", "acme/web", "before backup");
+      addCommit(laptop, "c1", "acme/web", "before backup");
+      await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+      backup(laptop);
+
+      // No event after the backup: only the newest own row can tell.
+      change(laptop);
+      await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+      const truth = sourceSnapshot(laptop);
+
+      const restored = restore(laptop);
+      try {
+        expect(sourceSnapshot(restored)).not.toEqual(truth);
+        await runSyncEngine(restored, server, { hostSlug: "laptop", batchSize: 50, ...both });
+        expect(sourceSnapshot(restored)).toEqual(truth);
+        expect(marker(restored)).toBeNull();
+      } finally {
+        restored.close();
+      }
+    });
+  }
+
+  test("a push-only run keeps the decision for the next pull", async () => {
+    const laptop = openHost(root, "laptop");
+    addRepository(laptop, "acme/web");
+    addCommit(laptop, "c0", "acme/web", "before backup");
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+    backup(laptop);
+    await intent(laptop, ["hero", "init", "Saulo"]);
+    addCommit(laptop, "c1", "acme/web", "after backup");
+    await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 50, ...both });
+
+    const restored = restore(laptop);
+    try {
+      await runSyncEngine(restored, server, {
+        hostSlug: "laptop",
+        batchSize: 50,
+        push: true,
+        pull: false,
+      });
+      expect(marker(restored)).not.toBeNull();
+      expect(count(restored, "SELECT COUNT(*) AS n FROM sync_cursors")).toBe(0);
+      await runSyncEngine(restored, server, {
+        hostSlug: "laptop",
+        batchSize: 50,
+        push: false,
+        pull: true,
+      });
+      expect(count(restored, "SELECT COUNT(*) AS n FROM gh_commits")).toBe(2);
+      expect(count(restored, "SELECT COUNT(*) AS n FROM heroes")).toBe(1);
+      expect(marker(restored)).toBeNull();
+    } finally {
+      restored.close();
+    }
+  });
+
+  test("normal syncs never take own rows: no false positive", async () => {
+    const laptop = openHost(root, "laptop");
+    const desktop = openHost(root, "desktop");
+    const skipped: (SqlValue | undefined)[] = [];
+    const spy = recordingSkippedHosts(server, skipped);
+    const syncLaptop = async (options: { push: boolean; pull: boolean } = both) => {
+      await runSyncEngine(laptop, spy, { hostSlug: "laptop", batchSize: 2, ...options });
+      expect(marker(laptop)).toBeNull();
+    };
+    try {
+      addRepository(laptop, "acme/web");
+      addCommit(laptop, "c0", "acme/web", "one");
+      addCommit(laptop, "c1", "acme/web", "two");
+      await intent(laptop, ["hero", "init", "Saulo"]);
+      // The first sync of a brand-new host meets an unknown server and
+      // legitimately pulls everything; only what follows must not.
+      await runSyncEngine(laptop, server, { hostSlug: "laptop", batchSize: 2, ...both });
+      await syncLaptop();
+      await runSyncEngine(desktop, server, { hostSlug: "desktop", batchSize: 2, ...both });
+      await syncLaptop();
+
+      // Another host overwrites a row this host pushed last.
+      addCommit(laptop, "c1", "acme/web", "laptop edit");
+      await syncLaptop();
+      restamp(desktop, "gh_commits", "sha = ?", ["c1"], "2099-01-01T00:00:00.000Z");
+      addCommit(desktop, "c1", "acme/web", "desktop edit");
+      await runSyncEngine(desktop, server, { hostSlug: "desktop", batchSize: 2, ...both });
+      await syncLaptop();
+
+      // A local edit and a local delete not pushed yet (the check runs
+      // before the push), then a push-only and a pull-only run.
+      addCommit(laptop, "c0", "acme/web", "edited, unpushed");
+      laptop.query("DELETE FROM gh_commits WHERE sha = 'c1'").run();
+      await syncLaptop({ push: false, pull: true });
+      await syncLaptop({ push: true, pull: false });
+      await syncLaptop({ push: false, pull: true });
+      await intent(laptop, ["party", "add", "acme", "Acme"]);
+      await syncLaptop();
+
+      expect(skipped.length).toBeGreaterThan(0);
+      expect(skipped.every((host) => host === "laptop")).toBe(true);
+    } finally {
+      laptop.close();
+      desktop.close();
     }
   });
 });
