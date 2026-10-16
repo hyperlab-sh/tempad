@@ -93,15 +93,15 @@ The hooks find the CLI as `TEMPAD_BIN`, then `tempad` on `PATH`, then `bunx temp
 
 ### `tempad init`
 
-`tempad init` prompts for every variable below (secrets are read without echo), suggesting a value where it can: the system time zone, the hostname, `git config user.email`, `~/.claude/projects`, `gh api user`. It then validates what it can cheaply, writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`, and prints the next steps. An existing file is kept unless `--force`; existing values become the prompt suggestions. It never prints a secret.
+`tempad init` prompts for every variable below (secrets are read without echo), suggesting a value where it can: the system time zone, the hostname, `git config user.email`, `~/.claude` for `CLAUDE_DIRS` (the Claude config directory, not its `projects/` subfolder; `$CLAUDE_CONFIG_DIR` when that is set and has `projects/`), `gh api user`. It then validates what it can cheaply, writes `TEMPAD_HOME/.env` (mode 600) and a minimal commented `tempad.toml`, and prints the next steps. An existing `.env` is only updated after you confirm (non-interactive runs refuse unless `--force`), its values become the prompt suggestions, and an existing `tempad.toml` is kept. With `--force` both files are replaced without asking, and the old ones are left beside them as `.env.bak` and `tempad.toml.bak`. It never prints a secret.
 
-| Flag                           | Effect                                                                                                |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `--non-interactive`            | No prompts; a missing required value exits 1 naming it                                                |
-| `--<variable>` (see the table) | Sets one variable, e.g. `--monday-api-token`, `--gh-orgs`, `--tz`; the flag is the name in kebab case |
-| `--home <path>`                | Use this directory as `TEMPAD_HOME` for this run                                                      |
-| `--force`                      | Overwrite an existing `.env` and `tempad.toml`                                                        |
-| `--no-verify`                  | Skip the checks (Monday token, GitHub credentials, `CLAUDE_DIRS` exist, `TZ` valid, `SINCE` parses)   |
+| Flag                           | Effect                                                                                                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--non-interactive`            | No prompts; a missing required value exits 1 naming it                                                                                                    |
+| `--<variable>` (see the table) | Sets one variable, e.g. `--monday-api-token`, `--gh-orgs`, `--tz`; the flag is the name in kebab case                                                     |
+| `--home <path>`                | Use this directory as `TEMPAD_HOME` for this run                                                                                                          |
+| `--force`                      | Overwrite an existing `.env` and `tempad.toml`, keeping `.env.bak` and `tempad.toml.bak`                                                                  |
+| `--no-verify`                  | Skip the network and filesystem checks (Monday token, GitHub credentials, `CLAUDE_DIRS` exist); format checks (booleans, lists, `TZ`, `SINCE`) always run |
 
 ```sh
 bunx tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
@@ -112,10 +112,10 @@ bunx tempad init --non-interactive --monday-api-token "$TOKEN" --monday-user 123
 
 ### Migrating from settings.json hooks
 
-If you installed the hooks with `tempad w5 hook install` (they live in `~/.claude/settings.json`, marked `"tempad": true`), switch to the plugin without a gap:
+If you installed the hooks with `tempad w5 hook install` (they live in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` if you set that variable, marked `"tempad": true`), switch to the plugin without a gap:
 
 1. `claude plugin install tempad@hyperlab`. The legacy hooks keep running and the plugin's hooks stand down while they exist, so a session never gets two enqueues or two context lines.
-2. `bunx tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration and removes only the entries it marked. The plugin's hooks take over on the next event.
+2. `bunx tempad w5 hook uninstall` (or run it from your checkout). It needs no configuration, uses the same settings file the hooks were installed into (`$CLAUDE_CONFIG_DIR` when set, else `~/.claude`), prints which file it changed, and removes only the entries it marked. The plugin's hooks take over on the next event.
 3. Remove the old skill copy if you copied it by hand: `rm -r ~/.claude/skills/tempad-quest`. The plugin provides it.
 
 `tempad w5 hook install` still exists for checkout users; it prints that the plugin is the recommended route.
