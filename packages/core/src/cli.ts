@@ -251,7 +251,10 @@ async function runSyncCommand(args: string[]): Promise<number> {
       console.log(formatSyncSummary(summary));
     }
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
+    // SyncRunError already reads `sync: push failed: <reason>`. The collector
+    // summaries printed above stay, and the exit code is non-zero whatever they did.
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(error instanceof SyncConfigError ? `sync: ${message}` : message);
     return 1;
   }
 

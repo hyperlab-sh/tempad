@@ -40,8 +40,26 @@ export class SyncNotConfiguredError extends Error {
 }
 
 /**
+ * A failure while loading the network module or talking to the remote
+ * (network, auth, sqld down, schema gate, collision). The message is the whole
+ * stderr line, `sync: push failed: <reason>` (`pull` for a `--pull`-only run),
+ * already scrubbed of the token.
+ */
+export class SyncRunError extends Error {
+  constructor(
+    readonly direction: "push" | "pull",
+    reason: string,
+  ) {
+    super(`sync: ${direction} failed: ${reason}`);
+    this.name = "SyncRunError";
+  }
+}
+
+/**
  * Runs one push/pull against the configured remote. Returns `null` when sync
- * is disabled. Throws `Error`s whose messages are already safe to print.
+ * is disabled. Throws `SyncConfigError` for a bad `[sync]` section and
+ * `SyncRunError` for everything that goes wrong after that; both messages are
+ * already safe to print.
  */
 export async function runPushSync(
   request: PushSyncRequest,
@@ -49,9 +67,10 @@ export async function runPushSync(
 ): Promise<SyncRunSummary | null> {
   const config = loadSyncConfig(request.home, request.syncToken);
   if (config === null) return null;
-  const open = openRemote ?? (await import("./remote")).openRemote;
+  const direction = request.push ? "push" : "pull";
   let remote: SyncRemote | undefined;
   try {
+    const open = openRemote ?? (await import("./remote")).openRemote;
     remote = open(config);
     return await runSyncEngine(request.database, remote, {
       hostSlug: request.hostSlug,
@@ -60,7 +79,7 @@ export async function runPushSync(
       pull: request.pull,
     });
   } catch (error) {
-    throw new Error(safeErrorMessage(error, config.token));
+    throw new SyncRunError(direction, safeErrorMessage(error, config.token));
   } finally {
     remote?.close();
   }

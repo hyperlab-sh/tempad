@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Commit dates with a UTC offset of +-15:00 or more (never emitted by git, only by imported history) were left in offset form by migration 0021, because SQLite's `strftime` returns NULL for them, while a host that pulled the same row stored UTC. Migration 0023 now rewrites them to the same UTC text, once, atomically with the version bump, without restamping or re-dirtying the row, so every host holds one text per instant and later opens pay nothing.
+- `tempad sync` reports a failed push or pull the same way every time: the exit code is 1 and stderr gets one `sync: push failed: <reason>` line (`sync: pull failed: <reason>` for `--pull` alone). It covers a missing `@libsql/client` package, an unreachable server, a rejected token and any server error. The collectors' results are kept, and the token is scrubbed from the reason.
 
 ## [0.2.0] - 2026-10-16
 
