@@ -373,7 +373,7 @@ describe("classification jobs", () => {
       const report = await run([["same", collectedAt]]);
       expect(recommendationIds(report)).not.toContain("w5-unknown-session");
       expect(checkOf(report, "w5-queue").details.join("\n")).toContain(
-        "1 session named by failed jobs has no transcript in the database even after the last claude collection",
+        "1 session named by failed jobs has no transcript found on disk by the last claude collection",
       );
     });
 
@@ -403,6 +403,16 @@ describe("classification jobs", () => {
         "1 session named by failed jobs has no transcript",
       );
     });
+  });
+
+  test("a claude collector that never ran has looked for nothing: the missing session is not written off", async () => {
+    const home = track(await makeHealthyHome());
+    home.database.query("DELETE FROM sync_state WHERE source = 'claude'").run();
+    insertFailedJob(home.database, "unknown claude session: gone", ago(3 * DAY), "gone");
+    const { report } = scryJson(home);
+    // The full collect covers it (and replaces the claude-only command), and no detail claims the transcript is absent.
+    expect(recommendationIds(report)).toContain("collect");
+    expect(checkOf(report, "w5-queue").details.join("\n")).not.toContain("found on disk");
   });
 
   test("a recommended full collect replaces the claude-only one", async () => {

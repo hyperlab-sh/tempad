@@ -1271,14 +1271,51 @@ describe("w5 backfill --from", () => {
     expect(result.output).toContain("failed=1");
   });
 
-  for (const bad of ["yesterday", "", "2026-13-45", "not a date"]) {
+  for (const bad of [
+    "yesterday",
+    "",
+    "2026-13-45",
+    "2026-02-30",
+    "not a date",
+    "1",
+    "Oct 1",
+    "2026-10",
+    "2026-10-01 10:00",
+    "2026-10-01 10:00:00",
+    "2026-10-01T10:00:00",
+    "2026-10-01T10:00:00+0300",
+    "20261001",
+  ]) {
     test(`--from ${JSON.stringify(bad)} is a usage error (exit 2)`, async () => {
       const result = await run(["--from", bad]);
       expect(result.code).toBe(2);
       expect(result.output).toContain("usage: tempad w5 backfill");
-      expect(result.output).toContain("--from is not a valid date");
+      expect(result.output).toContain("--from needs an ISO 8601 date or datetime");
     });
   }
+
+  for (const good of [
+    "2026-10-01",
+    "2026-10-01T10:00:00Z",
+    "2026-10-01T10:00:00.123Z",
+    "2026-10-01T10:00:00-03:00",
+    "2026-10-01T10:00:00.5+05:30",
+  ]) {
+    test(`--from ${good} is accepted`, async () => {
+      const result = await run(["--from", good]);
+      expect(result.code).toBe(0);
+    });
+  }
+
+  test("a date-only --from names midnight UTC of that day", async () => {
+    const day = new Date(Date.now() - 2 * DAY).toISOString().slice(0, 10);
+    const endedAt = `${day}T00:00:00.000Z`;
+    const included = await run(["--from", day], (database) => seedSession(database, endedAt));
+    expect(included.output).toContain("failed=1");
+    const next = new Date(Date.parse(endedAt) + DAY).toISOString().slice(0, 10);
+    const excluded = await run(["--from", next], (database) => seedSession(database, endedAt));
+    expect(excluded.output).not.toContain("failed=1");
+  });
 
   test("--from with --days is a usage error (exit 2), whichever order", async () => {
     for (const args of [

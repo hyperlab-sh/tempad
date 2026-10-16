@@ -466,7 +466,7 @@ function queueCheck(database: Database, now: Date, home: string): QueueResult {
     }
     if (unknown.uncollectable > 0) {
       details.push(
-        `${plural(unknown.uncollectable, "session")} named by failed jobs ${unknown.uncollectable === 1 ? "has" : "have"} no transcript in the database even after the last claude collection (not under CLAUDE_DIRS, or deleted): nothing to collect`,
+        `${plural(unknown.uncollectable, "session")} named by failed jobs ${unknown.uncollectable === 1 ? "has" : "have"} no transcript found on disk by the last claude collection (not under CLAUDE_DIRS, or deleted): nothing to collect`,
       );
     }
     if (unknown.total > 0 && unknown.collectable === 0 && unknown.uncollectable === 0) {

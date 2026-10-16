@@ -549,6 +549,20 @@ function applyHookAction(
   return 2;
 }
 
+/** `YYYY-MM-DD`, or a datetime with `T`, optional fractional seconds and `Z` or `+-HH:MM`. `Date.parse` alone reads `1` as 2001-01-01. */
+const ISO_8601 = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/;
+
+/** The instant `value` names, or null when it is not strict ISO 8601 or not a real date (`2026-02-30`). */
+function parseIsoInstant(value: string): number | null {
+  if (!ISO_8601.test(value)) return null;
+  const milliseconds = Date.parse(value);
+  if (Number.isNaN(milliseconds)) return null;
+  if (!value.includes("T") && new Date(milliseconds).toISOString().slice(0, 10) !== value) {
+    return null;
+  }
+  return milliseconds;
+}
+
 const BACKFILL_USAGE =
   "usage: tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]";
 
@@ -571,9 +585,11 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
   // An explicit lower bound, normalized to the form `claude_sessions.ended_at` is compared in.
   let from: string | undefined;
   if (values.from !== undefined) {
-    const fromMs = Date.parse(values.from);
-    if (values.from.trim() === "" || Number.isNaN(fromMs)) {
-      context.stdout(`${BACKFILL_USAGE}\n--from is not a valid date: ${values.from}`);
+    const fromMs = parseIsoInstant(values.from);
+    if (fromMs === null) {
+      context.stdout(
+        `${BACKFILL_USAGE}\n--from needs an ISO 8601 date or datetime (2026-10-01, 2026-10-01T10:00:00Z, 2026-10-01T10:00:00-03:00), got "${values.from}"`,
+      );
       return 2;
     }
     from = new Date(fromMs).toISOString();
