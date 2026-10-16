@@ -12,6 +12,9 @@ import type { Collector, SyncOptions, SyncSummary } from "./types.ts";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Incremental window: re-scan from 7 days before the last sync. Reconcile only
+// checks stored shas authored inside it, so an orphaned (rewritten-away) commit
+// authored before the window is never deleted by a normal sync.
 function lowerBound(since: string, lastSyncAt: string | undefined): string {
   if (!lastSyncAt) return since;
   return new Date(new Date(lastSyncAt).getTime() - SEVEN_DAYS_MS).toISOString();

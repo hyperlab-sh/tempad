@@ -12,6 +12,22 @@ import {
   buildRepository,
 } from "./fixtures/git/build-repository.ts";
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * An ISO timestamp `days` before now. A non-zero `offsetHours` renders it as
+ * wall-clock time with that UTC offset (e.g. -3 -> `...-03:00`), the way git
+ * stores an author date, so mixed-offset `authored_at` handling stays covered.
+ */
+function daysAgo(days: number, offsetHours = 0): string {
+  const instant = Date.now() - days * DAY_MS;
+  if (offsetHours === 0) return new Date(instant).toISOString();
+  const sign = offsetHours < 0 ? "-" : "+";
+  const hours = String(Math.abs(offsetHours)).padStart(2, "0");
+  const wallClock = new Date(instant + offsetHours * 60 * 60 * 1000).toISOString();
+  return `${wallClock.slice(0, -1)}${sign}${hours}:00`;
+}
+
 const FIXTURES_DIR = join(import.meta.dir, "fixtures/github");
 
 function loadFixture(name: string): unknown {
@@ -381,19 +397,23 @@ describe("github collector", () => {
 
   test("reconcile deletes rows for shas no longer reachable after history rewrite", async () => {
     const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
+    // Reconcile only inspects shas authored inside the incremental window
+    // (`lastSyncAt` minus 7 days), so dates must be relative to now: the old
+    // absolute 2026-09-03T13:00Z date fell out of the window once now - 7d
+    // passed it (2026-09-10T13:00Z).
     const sourceDirectory = await buildRepository([
       {
         message: "keep me",
         authorName: "Saulo Vallory",
         authorEmail: "me@saulo.engineer",
-        date: "2026-09-02T10:00:00-03:00",
+        date: daysAgo(3),
         files: { "a.md": "a" },
       },
       {
         message: "will be rewritten",
         authorName: "Saulo Vallory",
         authorEmail: "me@saulo.engineer",
-        date: "2026-09-03T10:00:00-03:00",
+        date: daysAgo(2, -3),
         files: { "b.md": "b" },
       },
     ]);
@@ -418,7 +438,7 @@ describe("github collector", () => {
         message: "replacement commit",
         authorName: "Saulo Vallory",
         authorEmail: "me@saulo.engineer",
-        date: "2026-09-04T10:00:00-03:00",
+        date: daysAgo(1),
         files: { "c.md": "c" },
       });
 
@@ -429,6 +449,47 @@ describe("github collector", () => {
         .query("SELECT sha FROM gh_commits WHERE repo = ?")
         .all("Mosaicstg/LiUNA-Campaigns") as { sha: string }[];
       expect(after.length).toBe(2);
+
+      database.close();
+    } finally {
+      rmSync(homeDirectory, { recursive: true, force: true });
+      rmSync(sourceDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("reconcile leaves rows authored before the incremental window alone after a history rewrite", async () => {
+    const homeDirectory = mkdtempSync(join(tmpdir(), "tempad-home-"));
+    const author = { authorName: "Saulo Vallory", authorEmail: "me@saulo.engineer" };
+    const sourceDirectory = await buildRepository([
+      { ...author, message: "keep me", date: daysAgo(31), files: { "a.md": "a" } },
+      { ...author, message: "old, will be rewritten", date: daysAgo(30), files: { "b.md": "b" } },
+    ]);
+
+    try {
+      const database = openDatabase(join(homeDirectory, "tempad.db"));
+      const config = baseConfig(homeDirectory);
+      const runner = makeRunner({ source: sourceDirectory });
+      const collector = createGithubCollector({ fetch: makeFetch(), runner });
+
+      await collector.sync(database, config, {});
+
+      await runner.run(["git", "reset", "--hard", "HEAD~1"], sourceDirectory);
+      await addCommit(sourceDirectory, {
+        ...author,
+        message: "replacement commit",
+        date: daysAgo(1),
+        files: { "c.md": "c" },
+      });
+
+      // The second sync's window starts 7 days before the first sync, so the
+      // 30-day-old orphan is never re-checked: see `lowerBound` in collect/github.ts.
+      const summary = await collector.sync(database, config, {});
+      expect(summary.deleted).toBe(0);
+
+      const count = database
+        .query("SELECT COUNT(*) AS n FROM gh_commits WHERE repo = ?")
+        .get("Mosaicstg/LiUNA-Campaigns") as { n: number };
+      expect(count.n).toBe(3);
 
       database.close();
     } finally {
