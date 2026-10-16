@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { decodeTime } from "ulid";
 import { syncOneSessionFile } from "../src/collect/claude.ts";
 import type { Config } from "../src/config/env.ts";
-import { openDatabase } from "../src/db/database.ts";
+import { legacyEventUid, openDatabase } from "../src/db/database.ts";
 import { MIRROR_SYNC_COLUMNS, SYNCED_UPSERT_TABLES } from "../src/sync/tables.ts";
 
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -252,6 +252,109 @@ describe("event uid backfill", () => {
   });
 });
 
+describe("legacy uids are deterministic", () => {
+  const BENT = [
+    "2026-09-01T10:00:00.000Z",
+    "2026-09-01T10:00:00.000Z", // same millisecond
+    "2026-09-01T09:59:00.000Z", // clock regression
+    "2026-09-01T10:00:00.000Z",
+    "2026-09-01T10:00:00.500Z",
+  ];
+
+  /** A pre-0019 database at `path` with the BENT rows plus `extra`, migrated to head. */
+  function migratedCopy(path: string, extra: { subject: string; recordedAt: string }[]) {
+    const old = openDatabase(path, { upToVersion: 18 });
+    BENT.forEach((recordedAt, index) => {
+      insertRawEvent(old, { at: recordedAt, recordedAt, subject: `H${index}` });
+    });
+    for (const row of extra) {
+      insertRawEvent(old, { at: row.recordedAt, recordedAt: row.recordedAt, subject: row.subject });
+    }
+    old.close();
+    const database = openDatabase(path);
+    const rows = eventUids(database);
+    database.close();
+    return rows;
+  }
+
+  test("two copies of one fixture backfill to identical uids", () => {
+    const directory = temporaryDirectory();
+    try {
+      const first = migratedCopy(join(directory, "a.db"), []);
+      const second = migratedCopy(join(directory, "b.db"), []);
+      expect(second).toEqual(first);
+      expect(new Set(first.map((row) => row.uid)).size).toBe(BENT.length);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("databases sharing ids 1..N agree on those uids and differ at N+1", () => {
+    const directory = temporaryDirectory();
+    try {
+      const recordedAt = "2026-09-01T10:00:00.000Z";
+      const first = migratedCopy(join(directory, "a.db"), [{ subject: "only-a", recordedAt }]);
+      const second = migratedCopy(join(directory, "b.db"), [{ subject: "only-b", recordedAt }]);
+      expect(second.slice(0, BENT.length)).toEqual(first.slice(0, BENT.length));
+      const lastFirst = first[BENT.length] as { id: number; uid: string };
+      const lastSecond = second[BENT.length] as { id: number; uid: string };
+      expect(lastFirst.id).toBe(lastSecond.id);
+      expect(lastFirst.uid).not.toBe(lastSecond.uid);
+      // Same id and clamped time: only the content hash (low 40 bits) differs.
+      expect(lastFirst.uid.slice(0, 18)).toBe(lastSecond.uid.slice(0, 18));
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("uid order is id order through clock regression and same-millisecond rows", () => {
+    const directory = temporaryDirectory();
+    try {
+      const rows = migratedCopy(join(directory, "a.db"), [
+        { subject: "late-but-earlier", recordedAt: "2026-08-01T00:00:00.000Z" },
+      ]);
+      const sorted = [...rows].sort((a, b) => (a.uid < b.uid ? -1 : 1));
+      expect(sorted.map((row) => row.id)).toEqual(rows.map((row) => row.id));
+      // The clamp: a backwards recorded_at reuses the previous time.
+      expect(decodeTime((rows[2] as { uid: string }).uid)).toBe(Date.parse(BENT[0] as string));
+      expect(decodeTime((rows.at(-1) as { uid: string }).uid)).toBe(
+        Date.parse("2026-09-01T10:00:00.500Z"),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("the uid layout: time, then the id big-endian in 40 bits, then 40 hash bits", () => {
+    const row = {
+      id: 3,
+      recorded_at: "2026-09-01T10:00:00.000Z",
+      kind: "hero.created",
+      subject: "H",
+      payload: "{}",
+    };
+    const uid = legacyEventUid(row, Date.parse(row.recorded_at));
+    expect(decodeTime(uid)).toBe(Date.parse(row.recorded_at));
+    // 40 bits of id = 8 base32 characters right after the 10 time characters.
+    expect(uid.slice(10, 18)).toBe("00000003");
+    expect(legacyEventUid({ ...row, payload: '{"x":1}' }, Date.parse(row.recorded_at))).not.toBe(
+      uid,
+    );
+  });
+
+  test("an id past the 40-bit ceiling is an explicit error", () => {
+    const row = {
+      id: 2 ** 40,
+      recorded_at: "2026-09-01T10:00:00.000Z",
+      kind: "k",
+      subject: "s",
+      payload: "{}",
+    };
+    expect(() => legacyEventUid(row, 0)).toThrow("40-bit id ceiling");
+    expect(() => legacyEventUid({ ...row, id: 2 ** 40 - 1 }, 0)).not.toThrow();
+  });
+});
+
 describe("mirror sync triggers", () => {
   test("an insert without a stamp is stamped, tagged with the local host and dirty", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
@@ -302,7 +405,7 @@ describe("mirror sync triggers", () => {
       });
     }
 
-    database.exec("UPDATE gh_repos SET mirrored_at = '2026-10-01T00:00:00Z'");
+    database.exec("UPDATE gh_repos SET default_branch = 'trunk'");
     database.exec("UPDATE gh_commits SET subject = 'fix it properly'");
     database.exec("UPDATE gh_pull_requests SET state = 'merged'");
     database.exec("UPDATE monday_items SET status = 'Done'");
@@ -594,7 +697,7 @@ describe("mirror sync triggers", () => {
     expect(tombstones[0]?.sync_dirty).toBe(1);
   });
 
-  test("each mirror's update trigger names every content column (fails when a column is added)", () => {
+  test("each mirror's update trigger names every content column and no local one (fails when a column is added)", () => {
     const database = openDatabase(":memory:");
     for (const table of SYNCED_UPSERT_TABLES) {
       const triggers = database
@@ -612,14 +715,114 @@ describe("mirror sync triggers", () => {
         }[]
       ).map((column) => column.name);
       for (const column of MIRROR_SYNC_COLUMNS) expect(columns).toContain(column);
-      for (const column of columns.filter((name) => !MIRROR_SYNC_COLUMNS.includes(name))) {
+      // Every column is exactly one of: sync-owned, host-local, or content.
+      for (const column of table.localColumns) {
+        expect(columns).toContain(column);
+        expect(MIRROR_SYNC_COLUMNS).not.toContain(column);
+        expect(table.keyColumns).not.toContain(column);
+        expect(update?.sql).not.toContain(`NEW.${column} IS NOT OLD.${column}`);
+      }
+      const content = columns.filter(
+        (name) => !MIRROR_SYNC_COLUMNS.includes(name) && !table.localColumns.includes(name),
+      );
+      for (const column of content) {
         expect(update?.sql).toContain(`NEW.${column} IS NOT OLD.${column}`);
       }
+      // No trigger compares a column the table lacks.
+      const compared = [...(update?.sql ?? "").matchAll(/NEW\.(\w+) IS NOT OLD\./g)].map(
+        (match) => match[1],
+      );
+      expect(compared.sort()).toEqual([...content].sort());
       const remove = triggers.find((trigger) => trigger.name === `${table.name}_sync_delete`);
       expect(remove?.sql).toContain(
         `json_array(${table.keyColumns.map((key) => `OLD.${key}`).join(", ")})`,
       );
     }
+  });
+});
+
+const FUTURE_STAMP = "2999-01-01T00:00:00.000Z";
+
+describe("per-key stamps are strictly increasing on one host", () => {
+  test("a host-local column (gh_repos.mirrored_at) is not content: no restamp, no re-dirty", () => {
+    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    seedMirrors(database);
+    database.exec(
+      `UPDATE gh_repos SET sync_updated_at = '${OLD_STAMP}', sync_host = 'host-b', sync_dirty = 0`,
+    );
+    database.exec("UPDATE gh_repos SET mirrored_at = '2026-10-01T00:00:00Z'");
+    expect(syncColumns(database, "gh_repos", MIRROR_KEYS.gh_repos as string)).toEqual({
+      sync_host: "host-b",
+      sync_updated_at: OLD_STAMP,
+      sync_dirty: 0,
+    });
+  });
+
+  test("1000 content updates in the same millisecond each step exactly +1 ms (no rounding drift)", () => {
+    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    seedMirrors(database);
+    // A stamp far ahead of the wall clock: every update lands in "the same
+    // millisecond" as far as MAX(now, previous + 1 ms) is concerned.
+    database.exec(`UPDATE gh_commits SET sync_updated_at = '${FUTURE_STAMP}'`);
+    const update = database.query("UPDATE gh_commits SET insertions = ? WHERE sha = 'abc123'");
+    const read = database.query("SELECT sync_updated_at FROM gh_commits WHERE sha = 'abc123'");
+    let previous = FUTURE_STAMP;
+    for (let index = 1; index <= 1000; index += 1) {
+      update.run(1000 + index);
+      const stamp = (read.get() as { sync_updated_at: string }).sync_updated_at;
+      expect(stamp).toMatch(STAMP);
+      expect(Date.parse(stamp) - Date.parse(previous)).toBe(1);
+      previous = stamp;
+    }
+    expect(previous).toBe("2999-01-01T00:00:01.000Z");
+  });
+
+  test("1000 back-to-back content updates at the real clock never repeat a stamp", () => {
+    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    seedMirrors(database);
+    const update = database.query("UPDATE claude_messages SET tokens_in = ? WHERE uuid = 'm1'");
+    const read = database.query("SELECT sync_updated_at FROM claude_messages WHERE uuid = 'm1'");
+    let previous = (read.get() as { sync_updated_at: string }).sync_updated_at;
+    for (let index = 1; index <= 1000; index += 1) {
+      update.run(index);
+      const stamp = (read.get() as { sync_updated_at: string }).sync_updated_at;
+      expect(stamp > previous).toBe(true);
+      previous = stamp;
+    }
+  });
+
+  test("a delete's tombstone is stamped after the deleted version", () => {
+    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    seedMirrors(database);
+    database.exec(`UPDATE gh_pull_requests SET sync_updated_at = '${FUTURE_STAMP}'`);
+    database.exec("DELETE FROM gh_pull_requests");
+    expect(
+      database
+        .query("SELECT pk, deleted_at FROM sync_tombstones WHERE tbl = 'gh_pull_requests'")
+        .get(),
+    ).toEqual({ pk: '["acme/widgets",44]', deleted_at: "2999-01-01T00:00:00.001Z" });
+  });
+
+  test("a re-insert is stamped after the key's tombstone, which stays and loses by stamp", () => {
+    const database = openDatabase(":memory:", { hostSlug: "host-a" });
+    seedMirrors(database);
+    database.exec(`UPDATE claude_messages SET sync_updated_at = '${FUTURE_STAMP}'`);
+    database.exec("DELETE FROM claude_messages");
+    database.exec(
+      "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, origin_kind) VALUES ('m1', 's1', '2026-01-01T00:00:00Z', 'user', 0, 'human')",
+    );
+    expect(syncColumns(database, "claude_messages", MIRROR_KEYS.claude_messages as string)).toEqual(
+      { sync_host: "host-a", sync_updated_at: "2999-01-01T00:00:00.002Z", sync_dirty: 1 },
+    );
+    expect(
+      database.query("SELECT deleted_at FROM sync_tombstones WHERE tbl = 'claude_messages'").get(),
+    ).toEqual({ deleted_at: "2999-01-01T00:00:00.001Z" });
+    // A different key's tombstone does not bump an unrelated insert.
+    database.exec(
+      "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, origin_kind) VALUES ('m2', 's1', '2026-01-01T00:00:00Z', 'user', 0, 'human')",
+    );
+    const other = syncColumns(database, "claude_messages", "uuid = 'm2'").sync_updated_at as string;
+    expect(other < FUTURE_STAMP).toBe(true);
   });
 });
 

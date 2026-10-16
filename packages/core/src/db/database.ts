@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { monotonicFactory } from "ulid";
+import { encodeTime } from "ulid";
 import { ulidAfter } from "../intent/ids";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
@@ -81,47 +82,103 @@ function hasColumn(database: Database, table: string, column: string): boolean {
   );
 }
 
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const FORTY_BITS = (1n << 40n) - 1n;
+
+/** The 80-bit random half of a ULID as 16 Crockford base32 characters. */
+function encodeRandom80(value: bigint): string {
+  let out = "";
+  let rest = value;
+  for (let index = 0; index < 16; index += 1) {
+    out = CROCKFORD[Number(rest & 31n)] + out;
+    rest >>= 5n;
+  }
+  return out;
+}
+
+/**
+ * The deterministic uid of a legacy (pre-0019) event row: the same row gets
+ * the same uid on every copy of the database, so two hosts that started from
+ * one copied `tempad.db` never ship the same old event twice under two uids.
+ *
+ * - time (48 bits): `timeMs`, the row's `recorded_at` clamped by the caller to
+ *   be non-decreasing in id order;
+ * - random high 40 bits: the row `id`, big-endian, so rows sharing a
+ *   (clamped) millisecond sort by id;
+ * - random low 40 bits: the first 40 bits of SHA-256 over
+ *   `recorded_at|kind|subject|payload` (the stored column values), so two
+ *   databases whose rows share an id but not a content get different uids.
+ *
+ * Exported for tests.
+ */
+export function legacyEventUid(row: LegacyEventRow, timeMs: number): string {
+  if (!Number.isSafeInteger(row.id) || row.id < 0 || BigInt(row.id) > FORTY_BITS) {
+    throw new Error(
+      `events row ${row.id} is beyond the 40-bit id ceiling of the legacy uid backfill`,
+    );
+  }
+  const digest = createHash("sha256")
+    .update(`${row.recorded_at}|${row.kind}|${row.subject}|${row.payload}`)
+    .digest();
+  const hash = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`);
+  return encodeTime(timeMs, 10) + encodeRandom80((BigInt(row.id) << 40n) | hash);
+}
+
+export interface LegacyEventRow {
+  id: number;
+  recorded_at: string;
+  kind: string;
+  subject: string;
+  payload: string;
+}
+
 /**
  * Gives every event without a `uid` one, once: rows written before migration
  * 0019 (or inserted by hand, outside `EventStore`, since). Rows are walked in
- * `id` order through a single monotonic ULID factory seeded with each row's
- * `recorded_at`. The factory never goes backwards -- a seed at or before the
- * last one reuses the last time and increments the random half -- so the
- * uids sort exactly like the ids, even where `recorded_at` is not monotonic in
- * `id`, and replaying `ORDER BY uid` reproduces the old `ORDER BY id`.
+ * `id` order; each gets `legacyEventUid` with its time clamped to
+ * `max(recorded_at ms, previous row's time)`. With the clamp the time part
+ * never decreases, and within one millisecond the id in the random half
+ * breaks the tie, so the uids sort exactly like the ids even where
+ * `recorded_at` goes backwards or repeats, and replaying `ORDER BY uid`
+ * reproduces the old `ORDER BY id`. Every input is the row's own stored data
+ * (and its predecessors'), so every copy of a database backfills identical
+ * uids.
  *
- * Seeding from `recorded_at` keeps legacy uids below every uid appended later
- * (`EventStore.append` also refuses to go below the current maximum), so the
- * single-host order stays insertion order across the upgrade.
+ * The successor guard (`ulidAfter`) only matters when some event already
+ * carries a uid at or above a row's deterministic one -- a NULL-uid row
+ * inserted by hand after the migration, never a plain pre-0019 database. It
+ * keeps id order there at the cost of determinism for that row.
  *
  * `uid IS NULL` is answered from the `events_uid` index, so this is a cheap
  * no-op on every open after the first.
  */
 function backfillEventUids(database: Database): void {
   const rows = database
-    .query("SELECT id, recorded_at FROM events WHERE uid IS NULL ORDER BY id")
-    .all() as { id: number; recorded_at: string }[];
+    .query(
+      "SELECT id, recorded_at, kind, subject, payload FROM events WHERE uid IS NULL ORDER BY id",
+    )
+    .all() as LegacyEventRow[];
   if (rows.length === 0) return;
 
-  // Never start below an existing uid: a row inserted by hand after the
-  // migration must still sort after the events already carrying one.
   const maximum = (
     database.query("SELECT MAX(uid) AS uid FROM events").get() as {
       uid: string | null;
     }
   ).uid;
-  const nextUid = monotonicFactory();
   const update = database.query("UPDATE events SET uid = ? WHERE id = ?");
   const run = database.transaction(() => {
     let previous = maximum;
+    let previousTime = 0;
     for (const row of rows) {
-      const seed = Date.parse(row.recorded_at);
-      if (Number.isNaN(seed)) {
+      const recorded = Date.parse(row.recorded_at);
+      if (Number.isNaN(recorded)) {
         throw new Error(`events row ${row.id} has an unparseable recorded_at: ${row.recorded_at}`);
       }
-      const uid = ulidAfter(nextUid(seed), previous);
+      const time = Math.max(recorded, previousTime);
+      const uid = ulidAfter(legacyEventUid(row, time), previous);
       update.run(uid, row.id);
       previous = uid;
+      previousTime = time;
     }
   });
   run();
