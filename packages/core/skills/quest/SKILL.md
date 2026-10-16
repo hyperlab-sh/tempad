@@ -66,3 +66,19 @@ work while a quest is active, `--advances <quest id>` (contributes to it) or `--
 - Right: `"Refactor the window builder and ship it as a PR"` — one stint, one outcome.
 
 Re-declaring an active quest with a new `--plan` amends it.
+
+## A quest created by mistake
+
+If you declared a quest that should never have existed (wrong title, a duplicate, a typo'd
+`--new`), **retract** it. Do not abandon it: abandon means the work was started and then dropped,
+and it stays in the reports. Retracting makes the quest disappear from lists, reports and the
+classifier.
+
+```
+tempad quest retract <quest id> --reason "<why it was a mistake>"
+```
+
+It refuses when the quest already has stints, traces or child quests, or was merged into another
+quest (the work happened, so abandon or merge it instead). `--force` retracts those too; use it
+only when all of that work was also a mistake. Retracting a quest that is already retracted is a
+no-op. `tempad quest delete` is an alias.

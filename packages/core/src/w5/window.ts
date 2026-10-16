@@ -67,7 +67,7 @@ const ACTIVITY_SLICE_SELECT = `
            SELECT traces.id FROM traces
             WHERE traces.stint_id = stints.id AND traces.retracted_at IS NULL
             ORDER BY traces.ended_at DESC LIMIT 1)
-    LEFT JOIN quests ON quests.id = stints.quest_id
+    LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
    WHERE stints.retracted_at IS NULL
      AND stints.dismissed_at IS NULL`;
 
@@ -172,6 +172,7 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
          FROM quests
         WHERE quests.state IN ('started', 'resumed')
           AND quests.merged_into IS NULL
+          AND quests.retracted_at IS NULL
           AND (
             quests.owner_kind = 'hero'
             OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)

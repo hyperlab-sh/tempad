@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../../src/db/database";
@@ -1332,6 +1332,74 @@ describe("w5 eval", () => {
 
     expect(metrics.declarationsSkipped).toBe(1);
     expect(lines.some((line) => line.includes("does-not-exist"))).toBe(true);
+  });
+
+  test("the sampled stints do not carry the title of a retracted quest", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-eval-retracted-"));
+    const sourcePath = join(dir, "source.db");
+    seedSourceDb(sourcePath);
+    const declareFile = join(dir, "declare.json");
+    writeFileSync(
+      declareFile,
+      JSON.stringify([
+        {
+          session_id: "s1",
+          at: "2026-09-01T09:00:00.000Z",
+          new: { title: "Mistaken quest", outcome: "oops", commitment: "personal" },
+        },
+      ]),
+    );
+
+    // The classifier runs against the eval copy, so retracting the declared
+    // quest from inside it leaves the stint the segment opens pointing at a
+    // retracted quest: exactly what the sample query must not name.
+    class RetractingClassifier extends FakeClassifier {
+      override async classify(window: ClassifierWindow): Promise<ClassifierResult> {
+        const result = await super.classify(window);
+        const copyName = readdirSync(dir).find(
+          (name) => name.startsWith("eval-") && name.endsWith(".db"),
+        );
+        const copy = openDatabase(join(dir, copyName as string));
+        const quest = copy.query("SELECT id FROM quests WHERE title = 'Mistaken quest'").get() as {
+          id: string;
+        };
+        applyIncremental(
+          copy,
+          new EventStore(copy).append({
+            actor: "hero",
+            kind: "retracted",
+            subject: quest.id,
+            payload: { retracts: quest.id, reason: "mistake" },
+          }),
+        );
+        copy.close();
+        return result;
+      }
+    }
+
+    const metrics = await runEval({
+      from: "2026-09-01",
+      to: "2026-09-02",
+      sourceDbPath: sourcePath,
+      scratchDir: dir,
+      now: "2026-09-02T00:00:00.000Z",
+      classifier: new RetractingClassifier(),
+      log: () => {},
+      declareFile,
+    });
+
+    const copied = openDatabase(metrics.copiedDbPath);
+    const stint = copied.query("SELECT quest_id AS questId FROM stints").get() as {
+      questId: string | null;
+    };
+    const retractedQuest = copied
+      .query("SELECT retracted_at AS at FROM quests WHERE id = ?")
+      .get(stint.questId) as { at: string | null };
+    copied.close();
+    // Control: the stint really does sit on the retracted quest.
+    expect(retractedQuest.at).not.toBeNull();
+    expect(metrics.sample.length).toBe(1);
+    expect(metrics.sample[0]?.questTitle).toBeNull();
   });
 
   test("attributeNonClaudeEvidence's tie rule ('latest declaration wins') applies through --declare when two sessions overlap", async () => {

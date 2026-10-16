@@ -553,7 +553,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
                  WHERE traces.stint_id = stints.id AND traces.retracted_at IS NULL
                  ORDER BY traces.started_at ASC LIMIT 1) as sessionTitle
          FROM stints
-         LEFT JOIN quests ON quests.id = stints.quest_id
+         LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
         WHERE stints.retracted_at IS NULL
           AND stints.opened_at >= ? AND stints.opened_at < ?
         ORDER BY RANDOM() LIMIT 20`,
