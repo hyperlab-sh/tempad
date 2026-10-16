@@ -86,11 +86,20 @@ export const questProjection: Projection = {
       case "quest.confirmed":
         database.query("UPDATE quests SET confirmed = 1 WHERE id = ?").run(event.subject);
         return;
-      case "quest.merged":
-        database
-          .query("UPDATE quests SET merged_into = ? WHERE id = ?")
-          .run(String(payload.into), event.subject);
+      case "quest.merged": {
+        // Two hosts can merge the same pair in opposite directions before
+        // either sees the other (A: Q1 into Q2, B: Q2 into Q1). Replaying both
+        // would close a loop that hides both quests and makes `resolveQuest`
+        // throw on every CLI path. Replay order is uid order on every host, so
+        // dropping the merge that would close the loop (the later one) keeps
+        // the first and converges. A single host's CLI never emits such a
+        // merge (it resolves both ids to their roots and refuses a self-merge),
+        // so a single-host log is unchanged.
+        const into = String(payload.into);
+        if (mergeWouldCycle(database, event.subject, into)) return;
+        database.query("UPDATE quests SET merged_into = ? WHERE id = ?").run(into, event.subject);
         return;
+      }
       case "quest.lifecycle":
         database
           .query("UPDATE quests SET state = ?, state_reason = ? WHERE id = ?")
@@ -128,6 +137,27 @@ export const questProjection: Projection = {
     }
   },
 };
+
+/**
+ * True when pointing `source` at `target` would make `source` reachable from
+ * `target` by following `merged_into` (or `source` is `target`). A merge into a
+ * quest that is itself merged away is fine: it chains, and `resolveQuest`
+ * follows the chain.
+ */
+export function mergeWouldCycle(database: Database, source: string, target: string): boolean {
+  let current = target;
+  const visited = new Set<string>();
+  while (!visited.has(current)) {
+    if (current === source) return true;
+    visited.add(current);
+    const row = database.query("SELECT merged_into FROM quests WHERE id = ?").get(current) as {
+      merged_into: string | null;
+    } | null;
+    if (!row?.merged_into) return false;
+    current = row.merged_into;
+  }
+  return false;
+}
 
 export function resolveQuest(database: Database, id: string): string {
   let current = id;

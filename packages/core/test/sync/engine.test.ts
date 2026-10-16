@@ -21,6 +21,7 @@ import {
   FakeRemote,
   failingOnWrite,
   intent,
+  intentLines,
   openHost,
   projectionSnapshot,
   restamp,
@@ -1366,5 +1367,48 @@ describe("a tempad.db restored from an older backup", () => {
       laptop.close();
       desktop.close();
     }
+  });
+});
+
+describe("intent edits made concurrently on two hosts", () => {
+  /** Syncs both hosts until neither has anything left to learn. */
+  async function settle(): Promise<void> {
+    for (let round = 0; round < 2; round += 1) {
+      await sync(hostA, remote, "host-a");
+      await sync(hostB, remote, "host-b");
+    }
+  }
+
+  function questIds(database: Database): string[] {
+    return (database.query("SELECT id FROM quests ORDER BY title").all() as { id: string }[]).map(
+      (row) => row.id,
+    );
+  }
+
+  test("opposite quest merges converge: the earlier merge wins and nothing throws", async () => {
+    await intent(hostA, ["hero", "init", "Saulo"]);
+    await intent(hostA, ["quest", "add", "--owner", "hero", "Q one"]);
+    await intent(hostA, ["quest", "add", "--owner", "hero", "Q two"]);
+    await settle();
+    const [first, second] = questIds(hostA);
+    expect(questIds(hostB)).toEqual([first, second] as string[]);
+
+    // Neither host has seen the other's merge.
+    await intent(hostA, ["quest", "merge", first as string, "--into", second as string]);
+    await Bun.sleep(5);
+    await intent(hostB, ["quest", "merge", second as string, "--into", first as string]);
+    await settle();
+
+    for (const host of [hostA, hostB]) {
+      expect(host.query("SELECT id, merged_into FROM quests ORDER BY title").all()).toEqual([
+        { id: first, merged_into: second },
+        { id: second, merged_into: null },
+      ]);
+      // Every CLI path that resolves a quest works, not only the listing.
+      expect(await intentLines(host, ["quest", "list"])).toEqual([`${second}  Q two  (started)`]);
+      await intent(host, ["quest", "done", first as string]);
+    }
+    await settle();
+    expect(projectionSnapshot(hostA)).toEqual(projectionSnapshot(hostB));
   });
 });
