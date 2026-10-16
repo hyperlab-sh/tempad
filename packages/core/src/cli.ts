@@ -186,19 +186,19 @@ function runForgetCommand(syncEnabled: boolean, force: boolean): number {
 function runRejoinCommand(serverId: string): number {
   const { database } = prepareCommand("tempad sync --rejoin", []);
   try {
-    console.log(
-      rejoinServer(database, serverId)
-        ? `sync: rejoin allowed for server ${serverId}`
-        : `sync: server ${serverId} was not forgotten; nothing to do`,
-    );
+    if (!rejoinServer(database, serverId)) {
+      console.error(`sync: --rejoin: server ${serverId} was not forgotten; nothing to rejoin`);
+      return 1;
+    }
+    console.log(`sync: rejoin allowed for server ${serverId}`);
   } finally {
     database.close();
   }
   return 0;
 }
 
-async function runSyncCommand(args: string[]): Promise<number> {
-  const { values, positionals } = parseArgs({
+function parseSyncArguments(args: string[]) {
+  return parseArgs({
     args,
     options: {
       full: { type: "boolean", default: false },
@@ -211,6 +211,31 @@ async function runSyncCommand(args: string[]): Promise<number> {
     strict: true,
     allowPositionals: true,
   });
+}
+
+/** `node:util` parseArgs failures (unknown flag, flag missing its value) carry an `ERR_PARSE_ARGS_*` code. */
+function isParseArgsError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const { code } = error as Error & { code?: unknown };
+  return typeof code === "string" && code.startsWith("ERR_PARSE_ARGS_");
+}
+
+async function runSyncCommand(args: string[]): Promise<number> {
+  let parsed: ReturnType<typeof parseSyncArguments>;
+  try {
+    parsed = parseSyncArguments(args);
+  } catch (error) {
+    if (!isParseArgsError(error)) throw error;
+    // One line naming the problem, then the usage, never the library's stack.
+    console.error(`sync: ${error.message.split("\n")[0]}`);
+    printUsage();
+    return 2;
+  }
+  const { values, positionals } = parsed;
+  if (values.rejoin !== undefined && values.rejoin.trim() === "") {
+    console.error("sync: --rejoin needs a server id");
+    return 1;
+  }
   const source = positionals[0];
   // --push/--pull run only those directions and skip the collectors, so they
   // take no source and no --full.
