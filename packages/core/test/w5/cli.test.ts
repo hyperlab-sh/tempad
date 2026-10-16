@@ -11,7 +11,13 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import type { SpawnFn } from "../../src/w5/cli";
-import { planW5Command, runReviewCommand, runW5Command, runW5HookCommand } from "../../src/w5/cli";
+import {
+  planW5Command,
+  runReviewCommand,
+  runW5Command,
+  runW5HookCommand,
+  settingsPathFor,
+} from "../../src/w5/cli";
 import {
   isUnstableInstallPath,
   PLUGIN_RECOMMENDATION_MESSAGE,
@@ -587,30 +593,41 @@ describe("w5 run / eval without the fields they need", () => {
   });
 });
 
-/** Runs `tempad w5 hook ...` with HOME pointing at a fresh directory; captures console output. */
-function runHookCommand(args: string[]): {
+/**
+ * Runs `tempad w5 hook ...` with HOME pointing at a fresh directory (and CLAUDE_CONFIG_DIR
+ * unset, or set to `configDir`); captures console output.
+ */
+function runHookCommand(
+  args: string[],
+  options: { configDir?: string; home?: string } = {},
+): {
   code: number;
   out: string[];
   err: string[];
+  home: string;
   settingsPath: string;
 } {
-  const home = mkdtempSync(join(tmpdir(), "tempad-hook-cli-"));
+  const home = options.home ?? mkdtempSync(join(tmpdir(), "tempad-hook-cli-"));
   const settingsPath = join(home, ".claude", "settings.json");
-  const savedHome = process.env.HOME;
+  const saved = { HOME: process.env.HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
   const savedLog = console.log;
   const savedError = console.error;
   const out: string[] = [];
   const err: string[] = [];
   process.env.HOME = home;
+  if (options.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = options.configDir;
   console.log = (...parts: unknown[]) => out.push(parts.join(" "));
   console.error = (...parts: unknown[]) => err.push(parts.join(" "));
   try {
-    return { code: runW5HookCommand(args), out, err, settingsPath };
+    return { code: runW5HookCommand(args), out, err, home, settingsPath };
   } finally {
     console.log = savedLog;
     console.error = savedError;
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 }
 
@@ -682,5 +699,89 @@ describe("isUnstableInstallPath", () => {
     ]) {
       expect(isUnstableInstallPath(path)).toBe(false);
     }
+  });
+});
+
+describe("w5 hook settings location", () => {
+  const BIN = "/opt/tempad/src/cli.ts";
+
+  function hasMarker(path: string): boolean {
+    return existsSync(path) && /"tempad"\s*:\s*true/.test(readFileSync(path, "utf8"));
+  }
+
+  test("user scope follows CLAUDE_CONFIG_DIR when it is set", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "tempad-config-dir-"));
+    const { code, out, home, settingsPath } = runHookCommand(["install", "--bin", BIN], {
+      configDir,
+    });
+    try {
+      expect(code).toBe(0);
+      expect(hasMarker(join(configDir, "settings.json"))).toBe(true);
+      expect(existsSync(settingsPath)).toBe(false);
+      expect(out).toContain(`installed tempad hooks in ${join(configDir, "settings.json")}`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("uninstall finds and removes the hooks under CLAUDE_CONFIG_DIR", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "tempad-config-dir-"));
+    const installed = runHookCommand(["install", "--bin", BIN], { configDir });
+    try {
+      expect(hasMarker(join(configDir, "settings.json"))).toBe(true);
+      const removed = runHookCommand(["uninstall"], { configDir, home: installed.home });
+      expect(removed.code).toBe(0);
+      expect(hasMarker(join(configDir, "settings.json"))).toBe(false);
+      expect(removed.out).toContain(
+        `removed tempad hooks from ${join(configDir, "settings.json")}`,
+      );
+
+      const again = runHookCommand(["uninstall"], { configDir, home: installed.home });
+      expect(again.out).toEqual([
+        `no tempad hooks in ${join(configDir, "settings.json")}; nothing changed`,
+      ]);
+    } finally {
+      rmSync(installed.home, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("without CLAUDE_CONFIG_DIR, or with it empty, user scope is $HOME/.claude", () => {
+    for (const configDir of [undefined, ""]) {
+      const { code, out, home, settingsPath } = runHookCommand(["install", "--bin", BIN], {
+        configDir,
+      });
+      try {
+        expect(code).toBe(0);
+        expect(hasMarker(settingsPath)).toBe(true);
+        expect(out).toContain(`installed tempad hooks in ${settingsPath}`);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("hooks installed in HOME are not touched when CLAUDE_CONFIG_DIR points elsewhere", () => {
+    const configDir = mkdtempSync(join(tmpdir(), "tempad-config-dir-"));
+    const installed = runHookCommand(["install", "--bin", BIN]);
+    try {
+      const removed = runHookCommand(["uninstall"], { configDir, home: installed.home });
+      expect(removed.out[0]).toContain("nothing changed");
+      expect(hasMarker(installed.settingsPath)).toBe(true);
+    } finally {
+      rmSync(installed.home, { recursive: true, force: true });
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("project scope ignores CLAUDE_CONFIG_DIR", () => {
+    expect(settingsPathFor("project", { CLAUDE_CONFIG_DIR: "/somewhere", HOME: "/home/x" })).toBe(
+      join(process.cwd(), ".claude", "settings.json"),
+    );
+    expect(settingsPathFor("user", { CLAUDE_CONFIG_DIR: "/somewhere", HOME: "/home/x" })).toBe(
+      "/somewhere/settings.json",
+    );
+    expect(settingsPathFor("user", { HOME: "/home/x" })).toBe("/home/x/.claude/settings.json");
   });
 });

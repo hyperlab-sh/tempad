@@ -15,6 +15,7 @@ import {
   buildBelongsHandback,
   buildDeclarationLine,
   buildDeclareHandback,
+  hasTempadHooks,
   hasUnstableInstall,
   installHooks,
   PLUGIN_RECOMMENDATION_MESSAGE,
@@ -443,10 +444,20 @@ export function planW5Command(
   };
 }
 
-function settingsPathFor(scope: string): string {
-  const home = process.env.HOME ?? "";
+/**
+ * The settings.json `w5 hook install|uninstall` edits. User scope follows Claude Code's own
+ * rule, `$CLAUDE_CONFIG_DIR/settings.json` when that is set and non-empty, else
+ * `$HOME/.claude/settings.json`: the same two places the hook scripts' stand-down check
+ * and `tempad init`'s legacy-hook detection read.
+ */
+export function settingsPathFor(
+  scope: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): string {
   if (scope === "project") return join(process.cwd(), ".claude", "settings.json");
-  return join(home, ".claude", "settings.json");
+  const configured = environment.CLAUDE_CONFIG_DIR;
+  if (configured) return join(configured, "settings.json");
+  return join(environment.HOME ?? "", ".claude", "settings.json");
 }
 
 function runHook(args: string[]): number {
@@ -472,11 +483,18 @@ function runHook(args: string[]): number {
     } else {
       installHooks(settingsPath);
     }
+    console.log(`installed tempad hooks in ${settingsPath}`);
     console.log(PLUGIN_RECOMMENDATION_MESSAGE);
     return 0;
   }
   if (action === "uninstall") {
+    const hadHooks = hasTempadHooks(settingsPath);
     uninstallHooks(settingsPath);
+    console.log(
+      hadHooks
+        ? `removed tempad hooks from ${settingsPath}`
+        : `no tempad hooks in ${settingsPath}; nothing changed`,
+    );
     return 0;
   }
   return 2;
