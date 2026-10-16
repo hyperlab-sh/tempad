@@ -9,8 +9,8 @@ import { reresolveSessions as reresolveClaudeSessions } from "./collect/claude.t
 import { collectors } from "./collect/index.ts";
 import type { Collector, SyncSummary } from "./collect/types.ts";
 import {
-  ConfigError,
   type Config,
+  ConfigError,
   type ConfigKey,
   ignoreWorkingDirectoryEnvFiles,
   isConfigured,
