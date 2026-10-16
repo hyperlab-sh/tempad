@@ -8,10 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The push-sync triggers on the six mirror tables ran on every host, including hosts that never configured `[sync]`: every collected row was stamped and every deleted row left a tombstone that nothing would ever read, tripling the cost of a 20000-row insert (124 ms against 41 ms) and growing the database. The triggers now exist only once sync has run (`sync_meta('mirror_sync_enabled')`). The first `tempad sync` stamps the rows written before it and installs them; with sync off, inserts, updates and deletes cost what they did before push sync, and report output is unchanged.
+
 - The GitHub collector's reconcile step compared `gh_commits.authored_at` to the window start as text. Rows stored before commit dates were normalized to UTC keep the author's offset (`2026-09-07T23:00:00-03:00`), so one near the window boundary could be skipped and its orphaned sha (after a history rewrite) never deleted. It now compares against a UTC-normalized bound, which is valid because every stored value is UTC: migration 0021 rewrites the legacy rows, and a pull rewrites any offset-form `gh_commits` dates that older pushes left on the sync server.
 
 ### Migration
 
+- `0022_sync_trigger_gate.sql` drops the mirror sync triggers and, on a database that never synced, deletes its tombstones. A database that has synced (non-empty `sync_meta`, a pull cursor, or anything marked pushed) keeps its triggers and every pending row, event and tombstone.
 - `0021_normalize_commit_dates.sql` rewrites legacy offset-form `gh_commits.authored_at` and `committed_at` to UTC (`2026-09-08T02:00:00.000Z`), the form the collector writes today. Rows already in UTC are untouched, a second run changes nothing, and push-sync state (`sync_updated_at`, `sync_host`, `sync_dirty`) is left as it was.
 
 ## [0.1.1] - 2026-10-16

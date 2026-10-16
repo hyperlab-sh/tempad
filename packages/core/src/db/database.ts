@@ -4,8 +4,18 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { encodeTime } from "ulid";
 import { ulidAfter } from "../intent/ids";
+import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
 
 const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
+
+/**
+ * From this version on, the push-sync mirror triggers exist only while
+ * `sync_meta.mirror_sync_enabled` is set (src/sync/triggers.ts). Every
+ * migration from here runs `reconcileMirrorTriggers` inside its own
+ * transaction, so a migration that drops a trigger to change it has it back,
+ * from `mirror-triggers.sql`, before any other connection can write.
+ */
+const TRIGGER_GATE_VERSION = 22;
 
 function loadMigrations(): { version: number; sql: string }[] {
   const files = readdirSync(MIGRATIONS_DIR)
@@ -68,6 +78,14 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
   }
 
   if (hasColumn(database, "events", "uid")) backfillEventUids(database);
+  if (userVersion(database) >= TRIGGER_GATE_VERSION) {
+    try {
+      ensureMirrorTriggers(database);
+    } catch (error) {
+      database.close();
+      throw error;
+    }
+  }
   if (options.hostSlug !== undefined && hasTable(database, "sync_local")) {
     try {
       recordHostSlug(database, options.hostSlug);
@@ -105,6 +123,10 @@ function recordHostSlug(database: Database, hostSlug: string): void {
       `cannot record host slug "${hostSlug}" in sync_local (another process may hold the database write lock): ${message}`,
     );
   }
+}
+
+function userVersion(database: Database): number {
+  return (database.query("PRAGMA user_version;").get() as { user_version: number }).user_version;
 }
 
 function hasTable(database: Database, table: string): boolean {
@@ -263,6 +285,7 @@ function applyMigration(database: Database, migration: { version: number; sql: s
       return;
     }
     runMigration(database, migration.sql);
+    if (migration.version >= TRIGGER_GATE_VERSION) reconcileMirrorTriggers(database);
     database.exec(`PRAGMA user_version = ${migration.version};`);
     database.exec("COMMIT");
   } catch (error) {
