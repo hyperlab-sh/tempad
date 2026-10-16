@@ -28,10 +28,14 @@ w5_log() {
 }
 
 # A legacy settings.json hook (marked "tempad": true by `tempad w5 hook install`)
-# is still installed in the user or project settings.
+# is still installed in the user settings (~/.claude, or CLAUDE_CONFIG_DIR when
+# Claude Code runs with one) or the project settings.
 w5_legacy_hook_installed() {
   local settings
-  for settings in "$HOME/.claude/settings.json" "${CLAUDE_PROJECT_DIR:+$CLAUDE_PROJECT_DIR/.claude/settings.json}"; do
+  for settings in \
+    "$HOME/.claude/settings.json" \
+    "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/settings.json}" \
+    "${CLAUDE_PROJECT_DIR:+$CLAUDE_PROJECT_DIR/.claude/settings.json}"; do
     [ -n "$settings" ] && [ -f "$settings" ] || continue
     if grep -Eq '"tempad"[[:space:]]*:[[:space:]]*true' "$settings" 2>/dev/null; then
       return 0
