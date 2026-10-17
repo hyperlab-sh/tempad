@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../../src/db/database";
@@ -49,8 +49,8 @@ class FakeClassifier implements Classifier {
   }
 }
 
-function seedSourceDb(path: string): void {
-  const database = openDatabase(path);
+function seedSourceDb(path: string, upToVersion?: number): void {
+  const database = openDatabase(path, { upToVersion });
   ensureTables(database);
   const store = new EventStore(database);
   applyIncremental(
@@ -103,6 +103,8 @@ function snapshotContent(path: string): string {
       .all() as { type: string; name: string; sql: string | null }[];
     const hasher = new Bun.CryptoHasher("sha256");
     hasher.update(JSON.stringify(objects));
+    // Not in sqlite_master: the schema version `openDatabase` stamps after migrating.
+    hasher.update(JSON.stringify(database.query("PRAGMA user_version").get()));
     for (const object of objects) {
       if (object.type !== "table") continue;
       const rows = database
@@ -116,7 +118,36 @@ function snapshotContent(path: string): string {
   }
 }
 
+/**
+ * A source one migration behind the head. `openDatabase` on a current database writes nothing,
+ * so only a source that still has migrations to apply shows whether eval opened it read-write.
+ */
+const BEHIND_SCHEMA_VERSION = 24;
+
+function sourceUserVersion(path: string): number {
+  const database = new Database(path, { readonly: true });
+  try {
+    return (database.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+  } finally {
+    database.close();
+  }
+}
+
 describe("snapshotContent", () => {
+  test("changes when only PRAGMA user_version changes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-eval-snapshot-"));
+    const sourcePath = join(dir, "source.db");
+    seedSourceDb(sourcePath);
+    const before = snapshotContent(sourcePath);
+    const writer = new Database(sourcePath);
+    try {
+      writer.exec("PRAGMA user_version = 999");
+    } finally {
+      writer.close();
+    }
+    expect(snapshotContent(sourcePath)).not.toBe(before);
+  });
+
   test("changes when a row is written, and not when SQLite only checkpoints the WAL", () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-eval-snapshot-"));
     const sourcePath = join(dir, "source.db");
@@ -202,6 +233,57 @@ describe("w5 eval", () => {
     });
     expect(metrics.copiedDbPath).not.toBe(sourcePath);
 
+    expect(snapshotContent(sourcePath)).toBe(sourceBefore);
+  });
+
+  test("runs against a source file that cannot be written (0444 in a 0555 directory)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-eval-readonly-"));
+    const sourceDirectory = join(dir, "source");
+    const scratchDirectory = join(dir, "scratch");
+    mkdirSync(sourceDirectory);
+    mkdirSync(scratchDirectory);
+    const sourcePath = join(sourceDirectory, "source.db");
+    seedSourceDb(sourcePath);
+    const sourceBefore = snapshotContent(sourcePath);
+    chmodSync(sourcePath, 0o444);
+    chmodSync(sourceDirectory, 0o555);
+    try {
+      const metrics = await runEval({
+        from: "2026-09-01",
+        to: "2026-09-02",
+        sourceDbPath: sourcePath,
+        scratchDir: scratchDirectory,
+        now: "2026-09-02T00:00:00.000Z",
+        classifier: new FakeClassifier(),
+        log: () => {},
+      });
+      expect(metrics.traces).toBe(1);
+      expect(snapshotContent(sourcePath)).toBe(sourceBefore);
+    } finally {
+      chmodSync(sourceDirectory, 0o755);
+      chmodSync(sourcePath, 0o644);
+    }
+  });
+
+  test("does not migrate a source that is behind the schema (it works on the copy)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-eval-behind-"));
+    const sourcePath = join(dir, "source.db");
+    seedSourceDb(sourcePath, BEHIND_SCHEMA_VERSION);
+    const sourceBefore = snapshotContent(sourcePath);
+    expect(sourceUserVersion(sourcePath)).toBe(BEHIND_SCHEMA_VERSION);
+
+    const metrics = await runEval({
+      from: "2026-09-01",
+      to: "2026-09-02",
+      sourceDbPath: sourcePath,
+      scratchDir: dir,
+      now: "2026-09-02T00:00:00.000Z",
+      classifier: new FakeClassifier(),
+      log: () => {},
+    });
+
+    expect(metrics.traces).toBe(1);
+    expect(sourceUserVersion(sourcePath)).toBe(BEHIND_SCHEMA_VERSION);
     expect(snapshotContent(sourcePath)).toBe(sourceBefore);
   });
 
