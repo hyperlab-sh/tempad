@@ -16,6 +16,7 @@ import {
   planBackfillWindows,
   selectBackfillSessions,
 } from "../../src/w5/backfill";
+import { RESPONSE_EXCERPT_MARKER } from "../../src/w5/classifier-shared";
 import {
   ago,
   classifyAll,
@@ -317,6 +318,31 @@ describe("classification jobs", () => {
     expect(report.recommendations.find((entry) => entry.id === "w5-unknown-session")?.command).toBe(
       "tempad sync claude",
     );
+  });
+
+  test("failures that kept the start of a rejected response still group by their message", async () => {
+    const home = track(await makeHealthyHome());
+    const message = "classifier result invalid:\nsegments[0].quest: expected an active quest alias";
+    for (const [index, raw] of [
+      '{"segments": [{"what": "a"',
+      '{"segments": [{"what": "b"',
+      "no json",
+    ].entries()) {
+      insertFailedJob(
+        home.database,
+        `${message}${RESPONSE_EXCERPT_MARKER}${raw}`,
+        ago((20 + index) * 60_000),
+      );
+    }
+    insertFailedJob(home.database, "claude cli exited with code 1", ago(3 * DAY));
+
+    const { report } = scryJson(home);
+    const queue = checkOf(report, "w5-queue");
+    expect(queue.summary).toBe("4 failed in the last 7 days, 0 stuck running");
+    expect(queue.details[0]).toBe(
+      "3 x classifier result invalid: segments[0].quest: expected an active quest alias",
+    );
+    expect(queue.details.join("\n")).not.toContain("no json");
   });
 
   test("unknown-session failures for sessions now in the database do not recommend collecting", async () => {

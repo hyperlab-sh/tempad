@@ -10,6 +10,11 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
+import {
+  ClassifierResponseError,
+  RESPONSE_EXCERPT_LENGTH,
+  RESPONSE_EXCERPT_MARKER,
+} from "../../src/w5/classifier-shared";
 import { buildBelongsHandback } from "../../src/w5/hooks";
 import { enqueueJob } from "../../src/w5/jobs";
 import { runOnce } from "../../src/w5/runner";
@@ -313,6 +318,67 @@ describe("runOnce", () => {
       };
       expect(job.state).toBe("failed");
       expect(job.error).toContain("boom");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a rejected response is kept, bounded, after the error message on the failed job", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      const rawResponse = `{"segments": [${"x".repeat(2000)}`;
+      const classifier = new FakeClassifier(async () => {
+        throw new ClassifierResponseError(
+          "classifier result invalid:\nsegments[0].what: bad",
+          rawResponse,
+        );
+      });
+      const logs: string[] = [];
+      await runOnce(database, makeConfig(dir), config, classifier, {
+        now: "2026-09-04T15:21:00.000Z",
+        log: (line) => logs.push(line),
+      });
+
+      const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+        state: string;
+        error: string;
+      };
+      expect(job.state).toBe("failed");
+      expect(job.error.startsWith("classifier result invalid:\nsegments[0].what: bad")).toBe(true);
+      const [message, excerpt] = job.error.split(RESPONSE_EXCERPT_MARKER);
+      expect(message).toBe("classifier result invalid:\nsegments[0].what: bad");
+      expect(excerpt).toBe(rawResponse.slice(0, RESPONSE_EXCERPT_LENGTH));
+      expect(excerpt?.length).toBe(RESPONSE_EXCERPT_LENGTH);
+      // The log line stays the message alone.
+      expect(logs.join("\n")).not.toContain("xxxx");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty rejected response adds no marker to the failed job", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      const classifier = new FakeClassifier(async () => {
+        throw new ClassifierResponseError("classifier result invalid: empty", "");
+      });
+      await runOnce(database, makeConfig(dir), config, classifier, {
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+      });
+
+      const job = database.query("SELECT error FROM w5_jobs").get() as { error: string };
+      expect(job.error).toBe("classifier result invalid: empty");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
