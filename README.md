@@ -128,6 +128,24 @@ tempad setup --non-interactive --monday-api-token "$TOKEN" --monday-user 12345 \
   --tz Europe/Berlin --since 2026-01-01
 ```
 
+### `tempad schedule`
+
+Monday and GitHub only update when `tempad sync` runs. `tempad schedule install` sets up an hourly, per-user job that runs it for you (and once right away): a LaunchAgent (`sh.hyperlab.tempad.sync`, loaded with `launchctl bootstrap gui/<uid>`) on macOS, a systemd user service and timer (`tempad-sync.service`/`.timer`, enabled with `systemctl --user enable --now`) on Linux. Other platforms get an error.
+
+```sh
+tempad schedule install   # write the job and load it; running it again rewrites and reloads
+tempad schedule status    # installed? loaded? last run and its exit code; --json for scripts
+tempad schedule remove    # unload and delete it; fine when nothing is installed
+```
+
+- The job runs the tempad you ran `install` with: the same Bun binary and the real path of its entry script (a symlinked `~/.local/bin/tempad` is followed to its `cli.ts`), with an absolute `PATH` that finds Bun, `git` and `gh`. It carries `TEMPAD_HOME` when you had it set. Credentials stay in `TEMPAD_HOME/.env`; nothing secret goes into the job definition. If you move or delete the checkout, run `install` again (`status` says when the entry is gone).
+- `install` refuses a copy that lives in the `bunx` cache or a temp directory, and a home that `tempad setup` has not set up. Install tempad first (`bun add -g @hyperlab.sh/tempad`).
+- Output of every run is appended to `TEMPAD_HOME/logs/sync.log`.
+- A scheduled run that starts while another `tempad sync` is still running skips (`sync: another sync is already running; skipping`), so overlapping runs never fight over the same git mirrors.
+- `status` exits 0 only when the job is installed, loaded and its last run exited 0.
+- On Linux a user timer only runs while you are logged in; `loginctl enable-linger` keeps it running after logout.
+- `tempad scry` warns, and recommends `tempad schedule install`, when a collector is stale and no schedule is installed. Fresh collectors keep it quiet.
+
 ### Migrating from settings.json hooks
 
 If you installed the hooks with `tempad w5 hook install` (they live in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` if you set that variable, marked `"tempad": true`), switch to the plugin without a gap:
