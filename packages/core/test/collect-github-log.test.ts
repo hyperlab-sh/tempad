@@ -6,7 +6,7 @@ import { buildRepository } from "./fixtures/git/build-repository.ts";
 function runner() {
   return {
     async run(argv: string[], cwd?: string) {
-      const proc = Bun.spawn(argv, { cwd, stdout: "pipe", stderr: "pipe" });
+      const proc = Bun.spawn(argv, { cwd, env: process.env, stdout: "pipe", stderr: "pipe" });
       const [stdout, stderr] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),

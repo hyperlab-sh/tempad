@@ -106,6 +106,7 @@ function makeRunner(mirrorRoot: { source: string | undefined }): CommandRunner {
         if (!source) return { code: 1, stdout: "", stderr: "no source configured" };
         const dest = args[3] as string;
         const proc = Bun.spawn(["git", "clone", "--mirror", source, dest], {
+          env: process.env,
           stdout: "pipe",
           stderr: "pipe",
         });
@@ -117,7 +118,12 @@ function makeRunner(mirrorRoot: { source: string | undefined }): CommandRunner {
         };
       }
 
-      const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+      const proc = Bun.spawn(["git", ...args], {
+        cwd,
+        env: process.env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
       const [stdout, stderr] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
