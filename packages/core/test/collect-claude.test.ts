@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeCollector, reresolveSessions } from "../src/collect/claude.ts";
+import {
+  claudeCollector,
+  findSessionTranscript,
+  reresolveSessions,
+} from "../src/collect/claude.ts";
 import type { Config } from "../src/config/env.ts";
 import { loadRules } from "../src/config/rules.ts";
 import { openDatabase } from "../src/db/database.ts";
@@ -600,6 +604,72 @@ describe("claude collector", () => {
       database.close();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("findSessionTranscript", () => {
+  function transcriptIn(dir: string, project: string, name: string): string {
+    mkdirSync(join(dir, "projects", project), { recursive: true });
+    const filePath = join(dir, "projects", project, name);
+    writeFileSync(filePath, "{}\n");
+    return filePath;
+  }
+
+  test("finds <dir>/projects/<project>/<id>.jsonl in any of the config directories", () => {
+    const first = mkdtempSync(join(tmpdir(), "tempad-find-"));
+    const second = mkdtempSync(join(tmpdir(), "tempad-find-"));
+    try {
+      transcriptIn(first, "-a", "other.jsonl");
+      const expected = transcriptIn(second, "-b", "abc-123.jsonl");
+      expect(findSessionTranscript([first, second], "abc-123")).toBe(expected);
+    } finally {
+      rmSync(first, { recursive: true, force: true });
+      rmSync(second, { recursive: true, force: true });
+    }
+  });
+
+  test("returns null when no directory holds the session", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-find-"));
+    try {
+      transcriptIn(dir, "-a", "other.jsonl");
+      expect(findSessionTranscript([dir], "abc-123")).toBeNull();
+      expect(findSessionTranscript([join(dir, "does-not-exist")], "abc-123")).toBeNull();
+      expect(findSessionTranscript([], "abc-123")).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("only matches the collector's layout: not a nested file, not a prefix", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-find-"));
+    try {
+      transcriptIn(dir, "-a/nested", "abc-123.jsonl");
+      transcriptIn(dir, "-a", "abc-123-extra.jsonl");
+      transcriptIn(dir, "-a", "xabc-123.jsonl");
+      expect(findSessionTranscript([dir], "abc-123")).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an id with glob or path characters never matches anything", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-find-"));
+    try {
+      transcriptIn(dir, "-a", "abc-123.jsonl");
+      for (const id of [
+        "*",
+        "abc-*",
+        "../projects/-a/abc-123",
+        "a/b",
+        "",
+        "abc-12?",
+        "{abc-123}",
+      ]) {
+        expect(findSessionTranscript([dir], id)).toBeNull();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

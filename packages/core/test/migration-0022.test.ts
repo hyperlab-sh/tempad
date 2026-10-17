@@ -26,6 +26,11 @@ import { addCommit, addRepository, FakeRemote, restamp } from "./sync/helpers.ts
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const PUSHED_STAMP = "2026-01-01T00:00:00.000Z";
 
+/** The real chain up to 0022: tests that stand in for later migrations append their own after it. */
+function chainThrough22() {
+  return migrationFiles.loadMigrations().filter((migration) => migration.version <= 22);
+}
+
 function temporaryDirectory(): string {
   return mkdtempSync(join(tmpdir(), "tempad-migration-0022-"));
 }
@@ -164,7 +169,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
 
   test("a fresh database has no mirror triggers: no stamps, no tombstones", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
-    expect(userVersion(database)).toBe(24);
+    expect(userVersion(database)).toBe(25);
     expect(isMirrorSyncEnabled(database)).toBe(false);
     expect(installedTriggers(database)).toEqual({});
 
@@ -194,7 +199,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
       old.close();
 
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(24);
+      expect(userVersion(database)).toBe(25);
       expect(isMirrorSyncEnabled(database)).toBe(false);
       expect(installedTriggers(database)).toEqual({});
       expect(syncState(database)).toEqual({ ...before, tombstones: [] });
@@ -247,7 +252,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
         old.close();
 
         const database = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(database)).toBe(24);
+        expect(userVersion(database)).toBe(25);
         expect(isMirrorSyncEnabled(database)).toBe(true);
         expect(installedTriggers(database)).toEqual(triggers);
         expect(syncState(database)).toEqual(before);
@@ -609,7 +614,7 @@ describe("reconcile runs once per upgrade", () => {
 
       // Two future migrations past 22; the one at 23 updates a mirror.
       const chain = [
-        ...migrationFiles.loadMigrations(),
+        ...chainThrough22(),
         { version: 23, sql: "UPDATE gh_commits SET subject = subject || ' (23)';" },
         { version: 24, sql: "SELECT 1;" },
       ];
@@ -706,7 +711,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       const observations: Observation[] = [];
       const chain = [
-        ...migrationFiles.loadMigrations(),
+        ...chainThrough22(),
         observedMigration(24, "UPDATE gh_commits SET subject = subject || ' (23)';", () =>
           observations.push(observeFromAnotherConnection(path)),
         ),
@@ -747,10 +752,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       const before = syncState(old);
       old.close();
 
-      const chain = [
-        ...migrationFiles.loadMigrations(),
-        { version: 24, sql: "UPDATE no_such_table SET x = 1;" },
-      ];
+      const chain = [...chainThrough22(), { version: 24, sql: "UPDATE no_such_table SET x = 1;" }];
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
       try {
         expect(() => openDatabase(path, { hostSlug: "host-a" })).toThrow(/no such table/);
@@ -767,7 +769,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       // The real chain still upgrades it afterwards.
       const upgraded = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(upgraded)).toBe(24);
+      expect(userVersion(upgraded)).toBe(25);
       expect(isMirrorSyncEnabled(upgraded)).toBe(true);
       expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
       upgraded.close();
@@ -779,10 +781,7 @@ describe("migrations from 22 on apply as one transaction", () => {
     withDirectory((path) => {
       openDatabase(path, { upToVersion: 18 }).close();
 
-      const chain = [
-        ...migrationFiles.loadMigrations(),
-        { version: 24, sql: "UPDATE no_such_table SET x = 1;" },
-      ];
+      const chain = [...chainThrough22(), { version: 24, sql: "UPDATE no_such_table SET x = 1;" }];
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => chain);
       try {
         expect(() => openDatabase(path)).toThrow(/no such table/);
@@ -806,15 +805,15 @@ describe("migrations from 22 on apply as one transaction", () => {
       old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
       old.close();
 
-      // 23 fails if it runs twice, so re-running what the other process
+      // 24 fails if it runs twice, so re-running what the other process
       // already applied would throw (CREATE TABLE, not ADD COLUMN, which
       // runMigration tolerates as a duplicate).
       const chain = [
-        ...migrationFiles.loadMigrations(),
+        ...chainThrough22(),
         { version: 24, sql: "CREATE TABLE t23 (x);" },
         { version: 25, sql: "CREATE TABLE t24 (x);" },
       ];
-      // Another process got 22 and 23 in after this one read user_version 21.
+      // Another process got 22 through 24 in after this one read user_version 21.
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => {
         load.mockImplementation(() => chain);
         openDatabase(path, { hostSlug: "host-a", upToVersion: 24 }).close();
@@ -827,7 +826,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       try {
         const upgraded = openDatabase(path, { hostSlug: "host-a" });
         expect(userVersion(upgraded)).toBe(25);
-        // Once at the end of the other process's 22..23, once here after 24.
+        // Once at the end of the other process's 22..24, once here after 25.
         expect(reconcile).toHaveBeenCalledTimes(2);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
         expect(

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config/env";
@@ -16,7 +16,13 @@ import {
   RESPONSE_EXCERPT_MARKER,
 } from "../../src/w5/classifier-shared";
 import { buildBelongsHandback } from "../../src/w5/hooks";
-import { enqueueJob } from "../../src/w5/jobs";
+import {
+  claimNextJob,
+  enqueueJob,
+  JOB_LEASE_MINUTES,
+  JOB_MAX_ATTEMPTS,
+  reapStaleJobs,
+} from "../../src/w5/jobs";
 import { runOnce } from "../../src/w5/runner";
 
 registerAllProjections();
@@ -665,5 +671,400 @@ describe("runOnce drives a belongs question to the user", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/** The transcript of `s1` on disk, where Claude Code writes it: `<dir>/projects/<project>/<id>.jsonl`. */
+function writeTranscript(dir: string): string {
+  const projectDirectory = join(dir, "projects", "-w-marko-ui");
+  mkdirSync(projectDirectory, { recursive: true });
+  const filePath = join(projectDirectory, "s1.jsonl");
+  writeFileSync(
+    filePath,
+    `${[
+      ["m1", "2026-09-04T15:00:00.000Z", "fix walk order"],
+      ["m2", "2026-09-04T15:20:00.000Z", "done"],
+    ]
+      .map(([uuid, ts, text]) =>
+        JSON.stringify({
+          type: "user",
+          uuid,
+          sessionId: "s1",
+          timestamp: ts,
+          cwd: "/w/marko-ui",
+          gitBranch: "main",
+          message: { role: "user", content: text },
+        }),
+      )
+      .join("\n")}\n`,
+  );
+  return filePath;
+}
+
+describe("runOnce when the session has not been collected yet", () => {
+  test("collects the session's transcript first, then classifies (tempad-fyl)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      writeTranscript(dir);
+      expect(database.query("SELECT 1 FROM claude_sessions WHERE id = 's1'").get()).toBeNull();
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      const result = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+      });
+
+      expect(result.summary?.traces).toBe(1);
+      const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+        state: string;
+        error: string | null;
+      };
+      expect(job).toEqual({ state: "done", error: null });
+      expect(database.query("SELECT 1 FROM claude_sessions WHERE id = 's1'").get()).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a session with no transcript under CLAUDE_DIRS fails once, saying so", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+      });
+
+      const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+        state: string;
+        error: string;
+      };
+      expect(job.state).toBe("failed");
+      expect(job.error).toStartWith("unknown claude session: s1");
+      expect(job.error).toContain("no transcript");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runOnce reaps jobs a crashed runner left running (tempad-0xk)", () => {
+  test("a job running past the lease is requeued and then classified", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+      enqueueJob(database, {
+        sessionId: "s1",
+        forced: true,
+        now: "2026-09-04T14:00:00.000Z",
+        throttleMinutes: 10,
+      });
+      // The first runner claimed it and died.
+      claimNextJob(database, "2026-09-04T14:01:00.000Z");
+
+      const logs: string[] = [];
+      const result = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: (line) => logs.push(line),
+      });
+
+      expect(result.ran).toBe(true);
+      expect(result.summary?.traces).toBe(1);
+      const job = database.query("SELECT state, attempts FROM w5_jobs").get() as {
+        state: string;
+        attempts: number;
+      };
+      expect(job).toEqual({ state: "done", attempts: 2 });
+      expect(logs.some((line) => line.includes("reaped"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a job still inside its lease is left alone", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    enqueueJob(database, {
+      sessionId: "s1",
+      forced: true,
+      now: "2026-09-04T15:00:00.000Z",
+      throttleMinutes: 10,
+    });
+    claimNextJob(database, "2026-09-04T15:00:00.000Z");
+
+    const result = await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: new Date(
+        Date.parse("2026-09-04T15:00:00.000Z") + (JOB_LEASE_MINUTES - 1) * 60_000,
+      ).toISOString(),
+      log: () => {},
+    });
+
+    expect(result.ran).toBe(false);
+    expect((database.query("SELECT state FROM w5_jobs").get() as { state: string }).state).toBe(
+      "running",
+    );
+  });
+
+  test("a job that already used every attempt fails instead of looping forever", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    enqueueJob(database, {
+      sessionId: "s1",
+      forced: true,
+      now: "2026-09-04T14:00:00.000Z",
+      throttleMinutes: 10,
+    });
+    database.query("UPDATE w5_jobs SET attempts = ?").run(JOB_MAX_ATTEMPTS - 1);
+    claimNextJob(database, "2026-09-04T14:01:00.000Z");
+
+    const result = await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:21:00.000Z",
+      log: () => {},
+    });
+
+    expect(result.ran).toBe(false);
+    const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+      state: string;
+      error: string;
+    };
+    expect(job.state).toBe("failed");
+    expect(job.error).toContain("lease expired");
+    expect(job.error).toContain(`${JOB_MAX_ATTEMPTS} attempts`);
+  });
+});
+
+describe("a runner that lost its claim writes nothing (laptop asleep mid-classify)", () => {
+  const CLAIMED = "2026-09-04T15:30:00.000Z";
+  const LATER = new Date(Date.parse(CLAIMED) + (JOB_LEASE_MINUTES + 5) * 60_000).toISOString();
+
+  function eventCount(database: ReturnType<typeof openDatabase>): number {
+    return (database.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+  }
+
+  function setup() {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+    enqueueJob(database, { sessionId: "s1", forced: true, now: CLAIMED, throttleMinutes: 10 });
+    return { dir, database };
+  }
+
+  test("the old runner finishing after reap and re-claim applies and settles nothing; the new one runs the job once", async () => {
+    const { dir, database } = setup();
+    try {
+      let eventsBeforeApply = -1;
+      // Runner A is mid-classify when the machine wakes and runner B reaps and
+      // re-claims the job (B's classify is the one that counts).
+      const asleep = new FakeClassifier(async () => {
+        eventsBeforeApply = eventCount(database);
+        expect(reapStaleJobs(database, LATER)).toEqual({ requeued: 1, failed: 0 });
+        return good;
+      });
+      const logs: string[] = [];
+      const a = await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: (line) => logs.push(line),
+      });
+
+      expect(a.ran).toBe(true);
+      expect(a.summary).toBeUndefined();
+      expect(eventCount(database)).toBe(eventsBeforeApply);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 0 });
+      expect(logs.some((line) => line.includes("discarding"))).toBe(true);
+      // A's late finish did not touch the job B will take.
+      expect(database.query("SELECT state, attempts FROM w5_jobs").get()).toEqual({
+        state: "queued",
+        attempts: 1,
+      });
+
+      const b = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: LATER,
+        log: () => {},
+      });
+      expect(b.summary?.traces).toBe(1);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 1 });
+      expect(database.query("SELECT state, attempts FROM w5_jobs").get()).toEqual({
+        state: "done",
+        attempts: 2,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the old runner failing late does not overwrite the job another runner now holds", async () => {
+    const { dir, database } = setup();
+    try {
+      const asleep = new FakeClassifier(async () => {
+        reapStaleJobs(database, LATER);
+        claimNextJob(database, LATER);
+        throw new Error("classifier timed out");
+      });
+      const a = await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: () => {},
+      });
+
+      expect(a.ran).toBe(true);
+      expect(database.query("SELECT state, error, attempts FROM w5_jobs").get()).toEqual({
+        state: "running",
+        error: null,
+        attempts: 2,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the old runner failing late says it lost the claim, not that the run failed", async () => {
+    const { dir, database } = setup();
+    try {
+      const asleep = new FakeClassifier(async () => {
+        reapStaleJobs(database, LATER);
+        claimNextJob(database, LATER);
+        throw new Error("classifier timed out");
+      });
+      const logs: string[] = [];
+      await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: (line) => logs.push(line),
+      });
+
+      expect(logs.some((line) => line.includes("lost its claim"))).toBe(true);
+      expect(logs.some((line) => line.includes("w5 run failed"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a runner whose claim is gone before the idle-close closes no stint", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      const filePath = join(dir, "s1.jsonl");
+      const openStint = new FakeClassifier(async () => good);
+
+      // Window 1 opens a stint, which the two-hour gap before window 3 idles.
+      seedThreeWindowSession(database, filePath, 4);
+      enqueueJob(database, {
+        sessionId: "s1",
+        forced: true,
+        throttleMinutes: 10,
+        now: "2026-09-04T15:31:00.000Z",
+      });
+      await runOnce(database, makeConfig(dir), config, openStint, {
+        now: "2026-09-04T15:31:00.000Z",
+        log: () => {},
+      });
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM stints WHERE closed_at IS NULL").get(),
+      ).toEqual({
+        n: 1,
+      });
+
+      seedThreeWindowSession(database, filePath, 6);
+      const now = "2026-09-04T17:41:00.000Z";
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10, now });
+
+      // The first read of w5_runs happens right before the idle-close; the
+      // job is reaped and re-claimed by another runner just ahead of it.
+      let stolen = false;
+      const raced = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              if (!stolen && sql.includes("FROM w5_runs WHERE session_id")) {
+                stolen = true;
+                const later = new Date(Date.parse(now) + (JOB_LEASE_MINUTES + 5) * 60_000);
+                reapStaleJobs(target, later.toISOString());
+                claimNextJob(target, later.toISOString());
+              }
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      const before = eventCount(database);
+      const logs: string[] = [];
+      await runOnce(raced, makeConfig(dir), config, new FakeClassifier(good), {
+        now,
+        log: (line) => logs.push(line),
+      });
+
+      expect(stolen).toBe(true);
+      expect(eventCount(database)).toBe(before);
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM stints WHERE closed_at IS NULL").get(),
+      ).toEqual({
+        n: 1,
+      });
+      expect(logs.some((line) => line.includes("discarding"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failure while applying rolls back every event the job wrote", async () => {
+    const { dir, database } = setup();
+    try {
+      const before = eventCount(database);
+      // The first segment applies cleanly and writes events; reading the second
+      // throws, inside applyResult and after those events exist.
+      const first = good.segments[0] as ClassifierResult["segments"][number];
+      const broken = new FakeClassifier(async () => ({
+        segments: [
+          first,
+          {
+            ...first,
+            get what(): string {
+              throw new Error("segment unreadable");
+            },
+          },
+        ],
+        sessionNote: null,
+      }));
+      const result = await runOnce(database, makeConfig(dir), config, broken, {
+        now: CLAIMED,
+        log: () => {},
+      });
+
+      expect(result.summary).toBeUndefined();
+      expect(database.query("SELECT state FROM w5_jobs").get()).toEqual({ state: "failed" });
+      expect(eventCount(database)).toBe(before);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runOnce touches the lock before each job", () => {
+  test("beforeJob runs once per run, before the claim", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    const calls: string[] = [];
+    await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:00:00.000Z",
+      log: () => {},
+      beforeJob: () => calls.push("touch"),
+    });
+    await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:00:00.000Z",
+      log: () => {},
+      beforeJob: () => calls.push("touch"),
+    });
+    expect(calls).toEqual(["touch", "touch"]);
   });
 });

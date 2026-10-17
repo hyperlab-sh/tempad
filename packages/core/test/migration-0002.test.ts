@@ -35,7 +35,7 @@ describe("migration 0002_org_project", () => {
 
       const version = (database.query("PRAGMA user_version;").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(24);
+      expect(version).toBe(25);
 
       const repo = database
         .query("SELECT project, meta FROM gh_repos WHERE full_name = ?")

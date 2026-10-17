@@ -1,6 +1,20 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDatabase } from "../../src/db/database";
-import { claimNextJob, completeJob, enqueueJob, failJob, isThrottled } from "../../src/w5/jobs";
+import {
+  claimNextJob,
+  completeJob,
+  enqueueJob,
+  failJob,
+  holdsClaim,
+  isThrottled,
+  JOB_LEASE_MINUTES,
+  JOB_MAX_ATTEMPTS,
+  JOB_MAX_REQUEUE_AGE_HOURS,
+  reapStaleJobs,
+} from "../../src/w5/jobs";
 
 describe("w5 jobs", () => {
   test("enqueue, throttle, duplicate upgrade, claim, complete", () => {
@@ -210,5 +224,356 @@ describe("w5 jobs", () => {
       session_note: string | null;
     };
     expect(run.session_note).toBe("still on the walk order bug");
+  });
+});
+
+describe("reapStaleJobs", () => {
+  const T0 = "2026-09-05T10:00:00.000Z";
+  const minutesAfter = (iso: string, minutes: number) =>
+    new Date(Date.parse(iso) + minutes * 60_000).toISOString();
+
+  function claimed(database: ReturnType<typeof openDatabase>, sessionId: string, at = T0) {
+    enqueueJob(database, { sessionId, forced: true, now: at, throttleMinutes: 10 });
+    const job = claimNextJob(database, at);
+    if (!job) throw new Error("expected a job");
+    return job;
+  }
+
+  function row(database: ReturnType<typeof openDatabase>, id: number) {
+    return database
+      .query("SELECT state, claimed_at, finished_at, error, attempts FROM w5_jobs WHERE id = ?")
+      .get(id) as {
+      state: string;
+      claimed_at: string | null;
+      finished_at: string | null;
+      error: string | null;
+      attempts: number;
+    };
+  }
+
+  test("claiming counts an attempt", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+    expect(row(database, job.id).attempts).toBe(1);
+  });
+
+  test("requeues a running job once its lease has expired", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+
+    const result = reapStaleJobs(database, minutesAfter(T0, JOB_LEASE_MINUTES + 1));
+
+    expect(result).toEqual({ requeued: 1, failed: 0 });
+    expect(row(database, job.id)).toMatchObject({
+      state: "queued",
+      claimed_at: null,
+      finished_at: null,
+      attempts: 1,
+    });
+    // The next claim is a second attempt on the same row.
+    expect(claimNextJob(database, minutesAfter(T0, JOB_LEASE_MINUTES + 2))?.id).toBe(job.id);
+    expect(row(database, job.id).attempts).toBe(2);
+  });
+
+  test("leaves a job alone until the lease runs out, to the millisecond", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+    const edge = minutesAfter(T0, JOB_LEASE_MINUTES);
+
+    expect(reapStaleJobs(database, new Date(Date.parse(edge) - 1).toISOString())).toEqual({
+      requeued: 0,
+      failed: 0,
+    });
+    expect(row(database, job.id).state).toBe("running");
+    expect(reapStaleJobs(database, edge)).toEqual({ requeued: 1, failed: 0 });
+  });
+
+  test("fails a job that has used its attempts", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+    database.query("UPDATE w5_jobs SET attempts = ? WHERE id = ?").run(JOB_MAX_ATTEMPTS, job.id);
+    const now = minutesAfter(T0, JOB_LEASE_MINUTES + 1);
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 0, failed: 1 });
+    const reaped = row(database, job.id);
+    expect(reaped.state).toBe("failed");
+    // The claim time, not the reap time: a reap must not make an old failure recent.
+    expect(reaped.finished_at).toBe(T0);
+    expect(reaped.error).toContain("lease expired");
+    expect(reaped.error).toContain(`${JOB_MAX_ATTEMPTS} attempts`);
+  });
+
+  test("fails, rather than requeues, a job requested too long ago to classify live", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+    const now = minutesAfter(T0, JOB_MAX_REQUEUE_AGE_HOURS * 60 + 1);
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 0, failed: 1 });
+    expect(row(database, job.id).error).toContain("tempad w5 backfill");
+  });
+
+  test("a job requested exactly JOB_MAX_REQUEUE_AGE_HOURS ago is still requeued", () => {
+    const database = openDatabase(":memory:");
+    const job = claimed(database, "s1");
+    const now = minutesAfter(T0, JOB_MAX_REQUEUE_AGE_HOURS * 60);
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 1, failed: 0 });
+    expect(row(database, job.id).state).toBe("queued");
+    // One millisecond older is over the cap.
+    const other = claimed(database, "s2", T0);
+    expect(reapStaleJobs(database, new Date(Date.parse(now) + 1).toISOString())).toEqual({
+      requeued: 0,
+      failed: 1,
+    });
+    expect(row(database, other.id).state).toBe("failed");
+  });
+
+  test("the lease runs from the claim, not from the request", () => {
+    const database = openDatabase(":memory:");
+    enqueueJob(database, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+    // Requested two hours ago, claimed a minute ago.
+    const now = minutesAfter(T0, 120);
+    const job = claimNextJob(database, minutesAfter(now, -1));
+    if (!job) throw new Error("expected a job");
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 0, failed: 0 });
+    expect(row(database, job.id).state).toBe("running");
+  });
+
+  test("a failed reap keeps the request time when the job was never claimed", () => {
+    const database = openDatabase(":memory:");
+    database
+      .query(
+        "INSERT INTO w5_jobs (session_id, kind, forced, requested_at, state, attempts) VALUES ('s1', 'classify', 1, ?, 'running', ?)",
+      )
+      .run(T0, JOB_MAX_ATTEMPTS);
+
+    reapStaleJobs(database, minutesAfter(T0, JOB_LEASE_MINUTES + 1));
+
+    expect(
+      (database.query("SELECT finished_at FROM w5_jobs").get() as { finished_at: string })
+        .finished_at,
+    ).toBe(T0);
+  });
+
+  test("fails a stale job as superseded when its session already has a queued row", () => {
+    const database = openDatabase(":memory:");
+    const stale = claimed(database, "s1");
+    database.query("UPDATE w5_jobs SET kind = 'session_end' WHERE id = ?").run(stale.id);
+    // A hook enqueued again after the runner died: a plain, unforced classify.
+    enqueueJob(database, {
+      sessionId: "s1",
+      forced: false,
+      now: minutesAfter(T0, 5),
+      throttleMinutes: 0,
+    });
+    const now = minutesAfter(T0, JOB_LEASE_MINUTES + 1);
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 0, failed: 1 });
+
+    expect(row(database, stale.id).state).toBe("failed");
+    expect(row(database, stale.id).error).toContain("superseded");
+    const queued = database
+      .query("SELECT kind, forced FROM w5_jobs WHERE session_id = 's1' AND state = 'queued'")
+      .all();
+    // One queued row, carrying the stale job's session_end and forced flag.
+    expect(queued).toEqual([{ kind: "session_end", forced: 1 }]);
+  });
+
+  test("two stale jobs of one session leave exactly one queued row", () => {
+    const database = openDatabase(":memory:");
+    const first = claimed(database, "s1");
+    const second = claimed(database, "s1", minutesAfter(T0, 1));
+
+    reapStaleJobs(database, minutesAfter(T0, JOB_LEASE_MINUTES + 5));
+
+    const states = [first.id, second.id].map((id) => row(database, id).state).sort();
+    expect(states).toEqual(["failed", "queued"]);
+    expect(
+      (
+        database
+          .query("SELECT COUNT(*) AS n FROM w5_jobs WHERE session_id = 's1' AND state = 'queued'")
+          .get() as { n: number }
+      ).n,
+    ).toBe(1);
+  });
+
+  test("does not touch queued, done or failed jobs, and reaps each stale one", () => {
+    const database = openDatabase(":memory:");
+    const done = claimed(database, "done");
+    completeJob(database, done.id, null, T0);
+    const failed = claimed(database, "failed");
+    failJob(database, failed.id, "boom");
+    const stale = claimed(database, "stale");
+    const fresh = claimed(database, "fresh", minutesAfter(T0, JOB_LEASE_MINUTES));
+    enqueueJob(database, { sessionId: "queued", forced: true, now: T0, throttleMinutes: 10 });
+    const now = minutesAfter(T0, JOB_LEASE_MINUTES + 1);
+
+    expect(reapStaleJobs(database, now)).toEqual({ requeued: 1, failed: 0 });
+    expect(row(database, done.id).state).toBe("done");
+    expect(row(database, failed.id).error).toBe("boom");
+    expect(row(database, stale.id).state).toBe("queued");
+    expect(row(database, fresh.id).state).toBe("running");
+  });
+
+  test("a running job with no claimed_at is reaped like any other", () => {
+    const database = openDatabase(":memory:");
+    database
+      .query(
+        "INSERT INTO w5_jobs (session_id, kind, forced, requested_at, state) VALUES ('s1', 'classify', 1, ?, 'running')",
+      )
+      .run(T0);
+    expect(reapStaleJobs(database, minutesAfter(T0, JOB_LEASE_MINUTES + 1))).toEqual({
+      requeued: 1,
+      failed: 0,
+    });
+  });
+});
+
+describe("job claims", () => {
+  const T0 = "2026-09-05T10:00:00.000Z";
+
+  test("a reaped runner's claim stops holding, even when the new claim has the same instant", () => {
+    const database = openDatabase(":memory:");
+    enqueueJob(database, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+    const first = claimNextJob(database, T0);
+    if (!first?.claimedAt) throw new Error("expected a claimed job");
+    const oldClaim = { claimedAt: first.claimedAt, attempts: first.attempts };
+    expect(holdsClaim(database, first.id, oldClaim)).toBe(true);
+
+    reapStaleJobs(database, new Date(Date.parse(T0) + 31 * 60_000).toISOString());
+    expect(holdsClaim(database, first.id, oldClaim)).toBe(false);
+
+    // Claimed again at the very same instant: only the attempt count differs.
+    const second = claimNextJob(database, T0);
+    expect(second?.claimedAt).toBe(T0);
+    expect(holdsClaim(database, first.id, oldClaim)).toBe(false);
+    expect(holdsClaim(database, first.id, { claimedAt: T0, attempts: second?.attempts ?? 0 })).toBe(
+      true,
+    );
+  });
+
+  test("completeJob and failJob with a lost claim write nothing", () => {
+    const database = openDatabase(":memory:");
+    enqueueJob(database, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+    const first = claimNextJob(database, T0);
+    if (!first?.claimedAt) throw new Error("expected a claimed job");
+    const oldClaim = { claimedAt: first.claimedAt, attempts: first.attempts };
+    const later = new Date(Date.parse(T0) + 31 * 60_000).toISOString();
+    reapStaleJobs(database, later);
+    const second = claimNextJob(database, later);
+    if (!second?.claimedAt) throw new Error("expected a second claim");
+
+    expect(completeJob(database, first.id, "2026-09-05T10:05:00.000Z", later, null, oldClaim)).toBe(
+      false,
+    );
+    expect(failJob(database, first.id, "late failure", oldClaim)).toBe(false);
+
+    expect(database.query("SELECT state, error FROM w5_jobs").get()).toEqual({
+      state: "running",
+      error: null,
+    });
+    expect(database.query("SELECT COUNT(*) AS n FROM w5_runs").get()).toEqual({ n: 0 });
+
+    // The current holder still finishes it.
+    const claim = { claimedAt: second.claimedAt, attempts: second.attempts };
+    expect(completeJob(database, second.id, null, later, null, claim)).toBe(true);
+    expect((database.query("SELECT state FROM w5_jobs").get() as { state: string }).state).toBe(
+      "done",
+    );
+    // A claim is spent once the job settled.
+    expect(failJob(database, second.id, "again", claim)).toBe(false);
+  });
+});
+
+describe("claimNextJob across connections", () => {
+  const T0 = "2026-09-05T10:00:00.000Z";
+
+  test("one connection's claim is not handed out again by another", () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-claim-test-"));
+    try {
+      const path = join(directory, "tempad.db");
+      const first = openDatabase(path);
+      const second = openDatabase(path);
+      enqueueJob(first, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+      enqueueJob(first, { sessionId: "s2", forced: true, now: T0, throttleMinutes: 10 });
+
+      const a = claimNextJob(first, T0);
+      const b = claimNextJob(second, T0);
+      expect([a?.sessionId, b?.sessionId]).toEqual(["s1", "s2"]);
+      expect(claimNextJob(second, T0)).toBeNull();
+      expect(claimNextJob(first, T0)).toBeNull();
+      first.close();
+      second.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("the claim returned is the one the statement wrote", () => {
+    const database = openDatabase(":memory:");
+    enqueueJob(database, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+    const job = claimNextJob(database, "2026-09-05T10:05:00.000Z");
+    expect(job).toMatchObject({ claimedAt: "2026-09-05T10:05:00.000Z", attempts: 1 });
+    expect(database.query("SELECT state, claimed_at, attempts FROM w5_jobs").get()).toEqual({
+      state: "running",
+      claimed_at: "2026-09-05T10:05:00.000Z",
+      attempts: 1,
+    });
+  });
+
+  test("racing processes never claim the same job twice", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-claim-race-"));
+    try {
+      const path = join(directory, "tempad.db");
+      const seeding = openDatabase(path);
+      const jobs = 150;
+      for (let index = 0; index < jobs; index += 1) {
+        enqueueJob(seeding, {
+          sessionId: `session-${index}`,
+          forced: true,
+          now: T0,
+          throttleMinutes: 10,
+        });
+      }
+      seeding.close();
+
+      // Each racer opens its own connection and claims until the queue is empty,
+      // starting together at a shared instant so the claims interleave.
+      const script = `
+        import { openDatabase } from ${JSON.stringify(join(import.meta.dir, "../../src/db/database"))};
+        import { claimNextJob } from ${JSON.stringify(join(import.meta.dir, "../../src/w5/jobs"))};
+        const database = openDatabase(${JSON.stringify(path)});
+        while (Date.now() < Number(process.argv[1])) {}
+        const claimed = [];
+        for (;;) {
+          const job = claimNextJob(database);
+          if (!job) break;
+          claimed.push([job.id, job.attempts]);
+        }
+        console.log(JSON.stringify(claimed));
+      `;
+      const startAt = String(Date.now() + 1500);
+      const racers = Array.from({ length: 4 }, () =>
+        Bun.spawn(["bun", "--no-env-file", "-e", script, startAt], {
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      );
+      const outputs = await Promise.all(
+        racers.map(async (racer) => {
+          const [text, exit] = await Promise.all([new Response(racer.stdout).text(), racer.exited]);
+          expect(exit).toBe(0);
+          return JSON.parse(text.trim()) as [number, number][];
+        }),
+      );
+
+      const claimed = outputs.flat();
+      expect(claimed).toHaveLength(jobs);
+      expect(new Set(claimed.map(([id]) => id)).size).toBe(jobs);
+      expect(claimed.every(([, attempts]) => attempts === 1)).toBe(true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

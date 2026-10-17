@@ -146,7 +146,7 @@ describe("migration 0024_side_quest_parent", () => {
     before.close();
 
     const database = openDatabase(path);
-    expect(userVersion(database)).toBe(24);
+    expect(userVersion(database)).toBe(25);
     expect(relation(database, side)).toEqual({
       stint: null,
       quest: "01PARENT000000000000000000",
@@ -272,7 +272,7 @@ describe("migration 0024_side_quest_parent", () => {
   test("a database whose intent layer was never used migrates without creating quests", () => {
     openDatabase(path, { upToVersion: 23 }).close();
     const database = openDatabase(path);
-    expect(userVersion(database)).toBe(24);
+    expect(userVersion(database)).toBe(25);
     expect(
       database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quests'").get(),
     ).toBeNull();

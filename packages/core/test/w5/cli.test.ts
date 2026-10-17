@@ -131,7 +131,7 @@ describe("w5 enqueue", () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
     try {
       const lockPath = join(dir, "w5.lock");
-      writeFileSync(lockPath, "12345");
+      writeFileSync(lockPath, String(Bun.spawnSync(["true"]).pid));
       const staleTime = new Date(Date.now() - 31 * 60_000);
       utimesSync(lockPath, staleTime, staleTime);
 
@@ -159,12 +159,138 @@ describe("w5 enqueue", () => {
   });
 });
 
+describe("w5 run lock ownership", () => {
+  function inHome(run: (dir: string, lockPath: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    return run(dir, join(dir, "w5.lock")).finally(() =>
+      rmSync(dir, { recursive: true, force: true }),
+    );
+  }
+
+  const runInline = (dir: string, database = openDatabase(":memory:")) =>
+    runW5Command(["run"], {
+      database,
+      config: makeConfig(dir),
+      intentConfig: defaultIntentConfig(),
+      stdout: () => {},
+      spawn: () => {},
+    });
+
+  test("takes the lock while it drains and removes its own when done", async () => {
+    await inHome(async (dir, lockPath) => {
+      const database = openDatabase(":memory:");
+      const held: string[] = [];
+      const watched = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              if (held.length === 0 && existsSync(lockPath)) {
+                held.push(readFileSync(lockPath, "utf8"));
+              }
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      expect(await runInline(dir, watched)).toBe(0);
+      expect(held).toEqual([String(process.pid)]);
+      expect(existsSync(lockPath)).toBe(false);
+    });
+  });
+
+  test("does not run, or touch the lock, while another live runner holds it", async () => {
+    await inHome(async (dir, lockPath) => {
+      writeFileSync(lockPath, String(process.pid));
+      const lines: string[] = [];
+      const database = openDatabase(":memory:");
+      const queried: string[] = [];
+      const watched = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              queried.push(sql);
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const code = await runW5Command(["run"], {
+        database: watched,
+        config: makeConfig(dir),
+        intentConfig: defaultIntentConfig(),
+        stdout: (line) => lines.push(line),
+        spawn: () => {},
+      });
+
+      expect(code).toBe(0);
+      expect(lines).toEqual([]);
+      expect(queried.some((sql) => sql.includes("w5_jobs"))).toBe(false);
+      expect(readFileSync(lockPath, "utf8")).toBe(String(process.pid));
+    });
+  });
+
+  test("a runner that finishes after its lock was replaced leaves the new one alone", async () => {
+    await inHome(async (dir, lockPath) => {
+      const database = openDatabase(":memory:");
+      const otherRunner = String(Bun.spawnSync(["true"]).pid);
+      let swapped = false;
+      const watched = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              if (!swapped && sql.includes("w5_jobs")) {
+                swapped = true;
+                // Cleared as stale by another runner, which took its own.
+                rmSync(lockPath);
+                writeFileSync(lockPath, otherRunner);
+              }
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      expect(await runInline(dir, watched)).toBe(0);
+      expect(swapped).toBe(true);
+      expect(readFileSync(lockPath, "utf8")).toBe(otherRunner);
+    });
+  });
+
+  test("the lock is released when the drain throws", async () => {
+    await inHome(async (dir, lockPath) => {
+      const database = openDatabase(":memory:");
+      const exploding = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              if (sql.includes("w5_jobs")) throw new Error("database is gone");
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      await expect(runInline(dir, exploding)).rejects.toThrow("database is gone");
+      expect(existsSync(lockPath)).toBe(false);
+    });
+  });
+});
+
 describe("w5 run stale lock", () => {
   test("removes a lock older than 30 minutes and continues", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
     try {
       const lockPath = join(dir, "w5.lock");
-      writeFileSync(lockPath, "12345");
+      writeFileSync(lockPath, String(Bun.spawnSync(["true"]).pid));
       const staleTime = new Date(Date.now() - 31 * 60_000);
       utimesSync(lockPath, staleTime, staleTime);
 
@@ -183,6 +309,32 @@ describe("w5 run stale lock", () => {
 
       const logContent = await Bun.file(join(dir, "logs", "w5.log")).text();
       expect(logContent).toContain("stale");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a lock older than 30 minutes whose runner is still alive blocks the run", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    try {
+      const lockPath = join(dir, "w5.lock");
+      writeFileSync(lockPath, String(process.pid));
+      const oldTime = new Date(Date.now() - 3 * 60 * 60_000);
+      utimesSync(lockPath, oldTime, oldTime);
+
+      const spawnCalls: unknown[] = [];
+      await runW5Command(["run", "--detached"], {
+        database: openDatabase(":memory:"),
+        config: makeConfig(dir),
+        intentConfig: defaultIntentConfig(),
+        stdout: () => {},
+        spawn: (options) => {
+          spawnCalls.push(options);
+        },
+      });
+
+      expect(spawnCalls).toHaveLength(0);
+      expect(existsSync(lockPath)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
