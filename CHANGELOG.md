@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- tempad now needs **Bun 1.4.2 or newer** (`engines.bun` was `>=1.3.14`). CI, `.prototools`, `.moon/toolchain.yml` and `packageManager` pin 1.4.2, the newest 1.4 patch older than two weeks, so local runs (which already got 1.4.x through the proto shim) and CI use one TOML parser. 1.3.14 accepted malformed `tempad.toml` that 1.4 rejects (`[w5` at end of file, `[sync]]`, a duplicate `[a]` table). If you are on 1.3.x, run `bun upgrade`.
+
 ### Added
 
 - `tempad scry [--json] [--days <n>] [--fast]` is a read-only health check of the data. It reports Health (config, schema version, `PRAGMA quick_check`, whether every projection matches a replay of the event log, collector freshness, failed or stuck w5 jobs, windows no classification covers, expired questions and unconfirmed quests waiting for you, and unpushed or pending sync state), Stats, and Recommendations, each a command to paste plus one line on why (`tempad sync claude`, `tempad w5 backfill --from <time>`, `tempad rebuild`, `tempad sync --push`, `tempad review`, ...). Exit 0 when nothing failed, 1 when a check failed, 2 on a usage error (`--days` takes 1 to 3650). The projection check also fails when a projection table or column is missing, not only when rows differ. The backfill it recommends is the same plan `tempad w5 backfill` runs. It opens `tempad.db` read-only, so it applies no migration, repairs no trigger, writes no host slug and never touches the network or loads `@libsql/client`. `tempad w5 eval` is only listed as conditional (after changing `[w5]` settings, the prompts or the tempad version): the database does not record what produced a classification, so the data cannot say an eval is due. `--fast` skips `quick_check` and the replay. On a 274 MB database with 64,000 events it takes about 1 s (about 0.2 s with `--fast`).
