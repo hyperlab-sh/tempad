@@ -52,7 +52,7 @@ function seed() {
   return { database, store: new EventStore(database) };
 }
 
-function declare(
+function declareFor(
   { database, store }: ReturnType<typeof seed>,
   at: string,
   extra: { done?: boolean } = {},
@@ -149,7 +149,7 @@ describe("a window with no active quest and a model that says belongs: true", ()
 
   test("cause B: the quest was declared only after the window", () => {
     const fixture = seed();
-    declare(fixture, "2026-09-04T16:00:00.000Z");
+    declareFor(fixture, "2026-09-04T16:00:00.000Z");
 
     const { result, summary } = classifyAndApply(fixture, "Q1");
 
@@ -162,8 +162,8 @@ describe("a window with no active quest and a model that says belongs: true", ()
 
   test("cause C: the only declared quest was ended with --done before the window", () => {
     const fixture = seed();
-    declare(fixture, "2026-09-04T14:05:00.000Z");
-    declare(fixture, "2026-09-04T14:30:00.000Z", { done: true });
+    declareFor(fixture, "2026-09-04T14:05:00.000Z");
+    declareFor(fixture, "2026-09-04T14:30:00.000Z", { done: true });
 
     const { result, summary } = classifyAndApply(fixture, undefined);
 
@@ -174,7 +174,7 @@ describe("a window with no active quest and a model that says belongs: true", ()
 
   test("cause D: the only declared quest was retracted", () => {
     const fixture = seed();
-    declare(fixture, "2026-09-04T14:05:00.000Z");
+    declareFor(fixture, "2026-09-04T14:05:00.000Z");
     fixture.database
       .query("UPDATE quests SET retracted_at = '2026-09-04T14:40:00.000Z' WHERE id = 'Q1'")
       .run();
@@ -188,7 +188,7 @@ describe("a window with no active quest and a model that says belongs: true", ()
 
   test("a quest that is active still gets its alias checked: one declared quest is assigned silently", () => {
     const fixture = seed();
-    declare(fixture, "2026-09-04T14:05:00.000Z");
+    declareFor(fixture, "2026-09-04T14:05:00.000Z");
     const window = buildWindow(fixture.database, {
       sessionId: "s1",
       sinceTs: null,
