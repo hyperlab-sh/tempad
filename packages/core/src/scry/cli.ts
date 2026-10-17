@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 import { loadConfig, tempadHome } from "../config/env";
 import { loadRules } from "../config/rules";
 import { defaultIntentConfig, loadIntentConfig } from "../intent/config";
+import { probeSchedule, type ScheduleProbe } from "../schedule/index";
 import { isSyncEnabled, loadSyncConfig, SyncConfigError } from "../sync/config";
 import { usageText } from "../usage";
 import { scry } from "./collect";
@@ -28,6 +29,8 @@ export interface ScryCommandOptions {
   now?: Date;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Stands in for the filesystem probe of the scheduler (`null`: no supported scheduler). */
+  schedule?: ScheduleProbe | null;
 }
 
 function failure(id: string, title: string, summary: string): Check {
@@ -190,6 +193,7 @@ export function runScryCommand(args: string[], options: ScryCommandOptions = {})
         syncEnabled,
         hostSlug,
         fast: values.fast === true,
+        schedule: options.schedule === undefined ? probeSchedule() : options.schedule,
         priorChecks,
         sizeBytes: statSync(databasePath).size,
       });

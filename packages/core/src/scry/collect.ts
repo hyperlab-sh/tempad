@@ -3,6 +3,7 @@ import { loadMigrations } from "../db/migration-files";
 import type { W5Config } from "../intent/config";
 import { hasAnyDeclaration, sessionEverDeclared } from "../intent/declarations";
 import { listProjections } from "../intent/projections";
+import type { ScheduleProbe } from "../schedule/index";
 import {
   FORGOTTEN_SERVER_PREFIX,
   PULL_OWN_PENDING,
@@ -51,6 +52,7 @@ export const RECOMMENDATION_ORDER = [
   "rebuild",
   "first-sync",
   "collect",
+  "schedule",
   "w5-unknown-session",
   "w5-reap",
   "backfill",
@@ -85,6 +87,8 @@ export interface ScryInput {
   hostSlug?: string;
   /** Skip `quick_check` and the projection replay: the two checks that scale with the database. */
   fast: boolean;
+  /** The scheduler on this machine and whether a definition is installed; absent when not probed or unsupported. */
+  schedule?: ScheduleProbe | null;
   /** Checks already decided by the caller (reading `tempad.toml`, `[sync]`, the database file). */
   priorChecks: Check[];
   sizeBytes: number;
@@ -340,6 +344,41 @@ function collectorChecks(
       ),
     ),
     collectors,
+  };
+}
+
+/** Called only when a collector is stale: is there a scheduled `tempad sync` that should have prevented it. */
+function scheduleCheck(probe: ScheduleProbe): { check: Check; recommendation: Recommendation } {
+  const where = probe.manager === "launchd" ? "LaunchAgent" : "systemd user timer";
+  if (!probe.installed) {
+    return {
+      check: check(
+        "schedule",
+        "Schedule",
+        "warn",
+        "no schedule runs tempad sync; the collectors only update when you run it by hand",
+      ),
+      recommendation: {
+        id: "schedule",
+        command: "tempad schedule install",
+        reason: `installs a ${where} that runs tempad sync every hour, so monday, github and claude stop going stale`,
+      },
+    };
+  }
+  return {
+    check: check(
+      "schedule",
+      "Schedule",
+      "warn",
+      `a ${where} is installed but the collectors are still stale`,
+      [`the job logs to ${probe.logPath}`],
+    ),
+    recommendation: {
+      id: "schedule",
+      command: "tempad schedule status",
+      reason:
+        "a schedule is installed yet the collectors are stale: shows whether it is loaded and how its last run ended",
+    },
   };
 }
 
@@ -964,6 +1003,13 @@ export function scry(input: ScryInput): ScryReport {
         command: staleSources.length === 1 ? `tempad sync ${staleSources[0]}` : "tempad sync",
         reason: `${staleSources.join(", ")} not collected in over ${COLLECTOR_STALE_HOURS} h; reports and coverage lag behind the work`,
       });
+    }
+
+    // Only a stale collector makes the schedule worth a line: with fresh data nobody needs telling.
+    if (staleSources.length > 0 && input.schedule) {
+      const schedule = scheduleCheck(input.schedule);
+      checks.push(schedule.check);
+      recommendations.push(schedule.recommendation);
     }
 
     const queue = queueCheck(database, now, input.home);

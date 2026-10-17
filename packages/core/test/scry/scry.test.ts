@@ -8,6 +8,7 @@ import { openDatabase } from "../../src/db/database";
 import { setSyncState } from "../../src/db/sync-state";
 import { declareQuest } from "../../src/intent/declarations";
 import { EventStore } from "../../src/intent/store";
+import type { ScheduleProbe } from "../../src/schedule/index";
 import { runScryCommand } from "../../src/scry/cli";
 import { RECOMMENDATION_ORDER } from "../../src/scry/collect";
 import type { Check, ScryReport } from "../../src/scry/types";
@@ -1277,6 +1278,81 @@ describe("recommendation order", () => {
     expect(RECOMMENDATION_ORDER.indexOf("w5-reap")).toBeGreaterThan(-1);
     expect(RECOMMENDATION_ORDER.indexOf("w5-reap")).toBeLessThan(
       RECOMMENDATION_ORDER.indexOf("backfill"),
+    );
+  });
+});
+
+describe("schedule", () => {
+  const darwinProbe = {
+    manager: "launchd",
+    installed: false,
+    logPath: "/h/.tempad/logs/sync.log",
+  } as const;
+
+  function scryWithSchedule(home: Home, schedule: ScheduleProbe | null): ScryReport {
+    process.env.TEMPAD_HOME = home.directory;
+    const lines: string[] = [];
+    runScryCommand(["--json"], { now: NOW, stdout: (line) => lines.push(line), schedule });
+    return JSON.parse(lines.join("\n")) as ScryReport;
+  }
+
+  test("stale collectors and no schedule warn and recommend installing, right after the collect command", async () => {
+    const home = track(await makeHealthyHome());
+    setSyncState(home.database, "monday", ago(3 * DAY));
+    const report = scryWithSchedule(home, darwinProbe);
+
+    const entry = checkOf(report, "schedule");
+    expect(entry.status).toBe("warn");
+    expect(entry.summary).toContain("no schedule runs tempad sync");
+    const recommendation = report.recommendations.find((item) => item.id === "schedule");
+    expect(recommendation?.command).toBe("tempad schedule install");
+    expect(recommendation?.reason).toContain("LaunchAgent");
+    expect(recommendationIds(report).slice(0, 2)).toEqual(["collect", "schedule"]);
+    expect(report.ok).toBe(true);
+  });
+
+  test("the systemd wording on Linux", async () => {
+    const home = track(await makeHealthyHome());
+    setSyncState(home.database, "github", ago(3 * DAY));
+    const report = scryWithSchedule(home, { ...darwinProbe, manager: "systemd" });
+    expect(report.recommendations.find((item) => item.id === "schedule")?.reason).toContain(
+      "systemd user timer",
+    );
+  });
+
+  test("fresh collectors stay quiet whether or not a schedule is installed", async () => {
+    const home = track(await makeHealthyHome());
+    for (const installed of [false, true]) {
+      const report = scryWithSchedule(home, { ...darwinProbe, installed });
+      expect(report.checks.map((entry) => entry.id)).not.toContain("schedule");
+      expect(recommendationIds(report)).not.toContain("schedule");
+    }
+  });
+
+  test("stale collectors with a schedule installed point at its status and log instead", async () => {
+    const home = track(await makeHealthyHome());
+    setSyncState(home.database, "claude", ago(3 * DAY));
+    const report = scryWithSchedule(home, { ...darwinProbe, installed: true });
+    const entry = checkOf(report, "schedule");
+    expect(entry.status).toBe("warn");
+    expect(entry.details).toEqual(["the job logs to /h/.tempad/logs/sync.log"]);
+    expect(report.recommendations.find((item) => item.id === "schedule")?.command).toBe(
+      "tempad schedule status",
+    );
+  });
+
+  test("an unsupported platform (no probe) adds nothing even when stale", async () => {
+    const home = track(await makeHealthyHome());
+    setSyncState(home.database, "monday", ago(3 * DAY));
+    const report = scryWithSchedule(home, null);
+    expect(report.checks.map((entry) => entry.id)).not.toContain("schedule");
+    expect(recommendationIds(report)).toContain("collect");
+    expect(recommendationIds(report)).not.toContain("schedule");
+  });
+
+  test("RECOMMENDATION_ORDER lists schedule after collect", () => {
+    expect(RECOMMENDATION_ORDER.indexOf("schedule")).toBe(
+      RECOMMENDATION_ORDER.indexOf("collect") + 1,
     );
   });
 });
