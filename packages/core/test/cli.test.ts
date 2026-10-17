@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runSkillCommand, runSync } from "../src/cli.ts";
+import { COMMAND_TREE, runSkillCommand, runSync } from "../src/cli.ts";
 import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
@@ -429,6 +429,108 @@ describe("cli --help", () => {
         expect(result.stdout).toContain("Usage:");
       }
       expect(existsSync(sandbox.tempadHome)).toBe(false);
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+});
+
+describe("cli --help on every command and subcommand", () => {
+  const paths: string[][] = [];
+  for (const [command, nested] of Object.entries(COMMAND_TREE)) {
+    paths.push([command]);
+    for (const path of nested) paths.push([command, ...path.split(" ")]);
+  }
+
+  test("the table covers every command the top-level usage lists", async () => {
+    const sandbox = makeSandbox();
+    try {
+      const { stdout } = await runCli(sandbox, ["--help"]);
+      const listed = new Set<string>();
+      for (const line of stdout.split("\n")) {
+        const match = /^ {2}tempad ([a-z0-9]+)/.exec(line);
+        if (match?.[1]) listed.add(match[1]);
+      }
+      listed.delete("init");
+      for (const command of listed) expect(Object.keys(COMMAND_TREE)).toContain(command);
+      for (const command of Object.keys(COMMAND_TREE)) {
+        if (command !== "init") expect(listed).toContain(command);
+      }
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
+  for (const configured of [false, true]) {
+    test(`--help and -h print usage to stdout, exit 0, no stack trace, no side effects (${configured ? "configured" : "unconfigured"} home)`, async () => {
+      const sandbox = makeSandbox();
+      try {
+        if (configured) configure(sandbox);
+        const before = configured ? readdirSync(sandbox.tempadHome).sort() : null;
+        for (const flag of ["--help", "-h"]) {
+          const results: { path: string[]; result: CliResult }[] = [];
+          for (let index = 0; index < paths.length; index += 8) {
+            results.push(
+              ...(await Promise.all(
+                paths
+                  .slice(index, index + 8)
+                  .map(async (path) => ({ path, result: await runCli(sandbox, [...path, flag]) })),
+              )),
+            );
+          }
+          for (const { path, result } of results) {
+            const label = `tempad ${path.join(" ")} ${flag}`;
+            expect({ label, exitCode: result.exitCode }).toEqual({ label, exitCode: 0 });
+            expect({ label, stderr: result.stderr }).toEqual({ label, stderr: "" });
+            expect(result.stdout).toContain("Usage:");
+            expect(`${result.stdout}${result.stderr}`).not.toMatch(
+              /TypeError|ERR_PARSE_ARGS|\n\s+at /,
+            );
+          }
+        }
+        if (before === null) expect(existsSync(sandbox.tempadHome)).toBe(false);
+        else expect(readdirSync(sandbox.tempadHome).sort()).toEqual(before);
+        expect(readdirSync(sandbox.cwd)).toEqual([]);
+      } finally {
+        cleanup(sandbox);
+      }
+    }, 120_000);
+  }
+
+  test("--help after other arguments still prints usage instead of running the command", async () => {
+    const sandbox = makeSandbox();
+    try {
+      configure(sandbox);
+      for (const args of [
+        ["w5", "backfill", "--days", "3", "--help"],
+        ["w5", "run", "--detached", "--help"],
+        ["sync", "monday", "--full", "-h"],
+        ["w5", "hook", "install", "--scope", "project", "--help"],
+      ]) {
+        const result = await runCli(sandbox, args);
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain("Usage:");
+        expect(result.stderr).toBe("");
+      }
+      expect(existsSync(join(sandbox.cwd, ".claude"))).toBe(false);
+      expect(existsSync(join(sandbox.tempadHome, "tempad.db"))).toBe(false);
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
+  test("an unknown nested name with --help is still a usage error", async () => {
+    const sandbox = makeSandbox();
+    try {
+      configure(sandbox);
+      for (const args of [
+        ["w5", "bogus", "--help"],
+        ["quest", "bogus", "-h"],
+      ]) {
+        const result = await runCli(sandbox, args);
+        expect(result.exitCode).toBe(2);
+        expect(result.stdout).toBe("");
+      }
     } finally {
       cleanup(sandbox);
     }

@@ -43,6 +43,63 @@ import {
 } from "./w5/cli.ts";
 import { userClaudeDirectory } from "./w5/hooks.ts";
 
+/**
+ * Every command and the nested paths below it (`w5 hook install`), as `dispatch` accepts them.
+ * `--help`/`-h` is answered from this table, and the help test walks it, so a command that
+ * is routed in `dispatch` but missing here gets no `--help` (the test catches that through
+ * `USAGE_LINES`).
+ */
+export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
+  hero: ["init"],
+  party: ["add", "leave", "list"],
+  client: ["add"],
+  saga: ["add", "reword", "replace", "end", "edit", "list"],
+  quest: [
+    "add",
+    "reword",
+    "replace",
+    "end",
+    "edit",
+    "confirm",
+    "merge",
+    "pause",
+    "resume",
+    "done",
+    "abandon",
+    "branch",
+    "return",
+    "retract",
+    "delete",
+    "list",
+    "declare",
+  ],
+  stint: ["list"],
+  trace: ["list"],
+  impact: ["set", "list", "import"],
+  answer: [],
+  rebuild: [],
+  setup: [],
+  init: [],
+  sync: ["monday", "github", "claude"],
+  report: ["daily", "project", "hourly", "weekly"],
+  w5: [
+    "enqueue",
+    "context",
+    "run",
+    "hook",
+    "hook install",
+    "hook uninstall",
+    "backfill",
+    "dedupe",
+    "eval",
+  ],
+  quiet: [],
+  review: [],
+  scry: [],
+  skill: ["install"],
+  project: ["register", "list", "reresolve"],
+};
+
 const INTENT_COMMANDS = new Set([
   "hero",
   "party",
@@ -595,22 +652,25 @@ async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[])
   return 2;
 }
 
-const OTHER_COMMANDS = new Set([
-  "setup",
-  "init",
-  "sync",
-  "report",
-  "w5",
-  "quiet",
-  "review",
-  "scry",
-  "skill",
-  "project",
-]);
-
 /** `<command> --help` only applies to a command that exists; an unknown one is a usage error. */
-function isKnownCommand(command: string | undefined): boolean {
-  return command !== undefined && (INTENT_COMMANDS.has(command) || OTHER_COMMANDS.has(command));
+function isKnownCommand(command: string | undefined): command is string {
+  return command !== undefined && Object.hasOwn(COMMAND_TREE, command);
+}
+
+/**
+ * `--help`/`-h` anywhere before a `--` terminator asks for usage, whatever the nesting
+ * (`w5 backfill --help`, `w5 hook install -h`). A nested name the command does not have
+ * (`w5 bogus --help`) is still a usage error, so only a known path gets help.
+ */
+function wantsHelp(command: string | undefined, rest: string[]): command is string {
+  if (!isKnownCommand(command)) return false;
+  const terminator = rest.indexOf("--");
+  const flags = terminator === -1 ? rest : rest.slice(0, terminator);
+  if (!flags.some((argument) => argument === "--help" || argument === "-h")) return false;
+  const subcommands = COMMAND_TREE[command] ?? [];
+  const first = rest[0];
+  if (subcommands.length === 0 || first === undefined || first.startsWith("-")) return true;
+  return subcommands.some((path) => path === first || path.startsWith(`${first} `));
 }
 
 async function dispatch(command: string | undefined, rest: string[]): Promise<number> {
@@ -622,7 +682,7 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     printHelp();
     return 0;
   }
-  if ((rest[0] === "--help" || rest[0] === "-h") && isKnownCommand(command)) {
+  if (wantsHelp(command, rest)) {
     printHelp();
     return 0;
   }
