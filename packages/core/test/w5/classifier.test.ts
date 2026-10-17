@@ -206,15 +206,88 @@ describe("classifier", () => {
     expect(result.selectorDefaulted).toBe(0);
   });
 
-  test("a missing quest with no active quest fails validation", () => {
+  describe("a window with no active quest", () => {
+    // What `buildWindow` produces for a session that has declared nothing, or
+    // whose declared quests were all ended or retracted: the prompt reads
+    // "active quests: none (ask to declare)".
     const noQuestWindow: ClassifierWindow = {
       ...window,
       activeQuests: [],
       activeQuestAliases: {},
     };
-    expect(() =>
-      validateResult({ segments: [{ ...good.segments[0], quest: null }] }, noQuestWindow),
-    ).toThrow(/quest: expected an active quest alias when belongs is true/);
+
+    test.each([
+      ["null", { quest: null }],
+      ["omitted", { quest: undefined }],
+      ["an alias the window never offered", { quest: "Q1" }],
+      ["a quest title", { quest: "Ship marko-ui" }],
+      ["a real quest id", { quest: "01HREALQUESTIDONE000000000" }],
+    ])("belongs: true with quest %s is repaired, not a validation failure", (_label, override) => {
+      const result = validateResult(
+        { segments: [{ ...good.segments[0], ...override }] },
+        noQuestWindow,
+      );
+
+      // Nothing to belong to, so no quest and no doubt: applyResult asks to
+      // declare once for the whole window instead of one question per segment.
+      expect(result.segments[0]?.quest).toBeNull();
+      expect(result.segments[0]?.belongs).toBe(true);
+      expect(result.segments[0]?.guess).toBeNull();
+      expect(result.selectorDefaulted).toBe(1);
+    });
+
+    test("every segment of the window is repaired, not just the first", () => {
+      const result = validateResult(
+        {
+          segments: [
+            { ...good.segments[0], quest: null },
+            { ...good.segments[1], belongs: true, quest: "Q2" },
+          ],
+        },
+        noQuestWindow,
+      );
+
+      expect(result.segments.map((segment) => segment.quest)).toEqual([null, null]);
+      expect(result.selectorDefaulted).toBe(2);
+    });
+
+    test("the repair does not touch the other fields the validator still enforces", () => {
+      expect(() =>
+        validateResult(
+          { segments: [{ ...good.segments[0], quest: null, confidence: 7 }] },
+          noQuestWindow,
+        ),
+      ).toThrow(/confidence/);
+    });
+
+    test("a model that says belongs: false keeps its guess and is not counted as repaired", () => {
+      const result = validateResult(
+        { segments: [{ ...good.segments[0], belongs: false, guess: "a build fix", quest: null }] },
+        noQuestWindow,
+      );
+
+      expect(result.segments[0]?.belongs).toBe(false);
+      expect(result.segments[0]?.guess).toBe("a build fix");
+      expect(result.selectorDefaulted).toBe(0);
+    });
+
+    test("classify recovers from it on the first response, with no retry", async () => {
+      let calls = 0;
+      const answer = { segments: [{ ...good.segments[0], quest: null }] };
+      const fakeFetch = (async () => {
+        calls += 1;
+        return new Response(
+          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(answer) }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      const classifier = new AnthropicClassifier({ apiKey: "k", model: "m", fetch: fakeFetch });
+
+      const result = await classifier.classify(noQuestWindow);
+
+      expect(calls).toBe(1);
+      expect(result.segments[0]?.quest).toBeNull();
+    });
   });
 
   test("a missing quest with two or more active quests is repaired to a doubt, not a validation failure", () => {

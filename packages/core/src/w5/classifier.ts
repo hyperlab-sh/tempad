@@ -312,9 +312,11 @@ function validateSegment(
     problems.push(`${where}.belongs: expected boolean`);
   } else {
     // A `quest` that names nothing the window offered: missing, null, or an
-    // alias the window never listed. With exactly one active quest there is
-    // an unambiguous default to assign silently; with none or several it is a
-    // doubt like any other unrecognized alias, never a validation failure.
+    // alias the window never listed. With exactly one active quest there is an
+    // unambiguous default to assign silently; with several it is a doubt like
+    // any other unrecognized alias; with none there is nothing to belong to,
+    // so the model's `quest` is dropped. Never a validation failure.
+    let nothingToBelongTo = false;
     if (segment.belongs === true && declaredAliases !== null) {
       const questIsUnrecognized =
         typeof segment.quest === "string" && !declaredAliases.quests.has(segment.quest);
@@ -322,6 +324,17 @@ function validateSegment(
 
       if ((questIsMissing || questIsUnrecognized) && declaredAliases.soleQuest !== null) {
         segment.quest = declaredAliases.soleQuest;
+      } else if ((questIsMissing || questIsUnrecognized) && declaredAliases.quests.size === 0) {
+        // The session has declared nothing (yet, or any more): the prompt says
+        // "active quests: none (ask to declare)", and a model that still answers
+        // `belongs: true` has no alias it could have meant. It is not a doubt
+        // about a quest: `applyResult` already records such a window's traces with no
+        // quest and asks to `declare` once for the whole window, so a per-segment
+        // doubt here would turn one gap into N questions. The quest is dropped,
+        // and counted like every other selector the model got wrong.
+        segment.quest = null;
+        nothingToBelongTo = true;
+        counters.selectorDefaulted += 1;
       } else if (questIsUnrecognized) {
         segment.belongs = false;
         segment.quest = null;
@@ -329,19 +342,15 @@ function validateSegment(
           segment.guess = UNRECOGNIZED_QUEST_ALIAS_GUESS;
         }
         counters.selectorDefaulted += 1;
-      } else if (questIsMissing && declaredAliases.quests.size >= 2) {
-        // No single quest to default to, but failing the whole window over a
-        // missing selector loses a real stretch of work: repaired exactly like
-        // an unrecognized alias, same counter, same doubt.
+      } else if (questIsMissing) {
+        // Two or more active quests and no single one to default to, but failing
+        // the whole window over a missing selector loses a real stretch of work:
+        // repaired exactly like an unrecognized alias, same counter, same doubt.
         segment.belongs = false;
         segment.quest = null;
         segment.guess = QUEST_NOT_NAMED_GUESS;
         counters.selectorDefaulted += 1;
       }
-      // Zero active quests with `belongs: true` falls through unrepaired: the
-      // session has nothing declared yet, so `needsDeclaration` already asks
-      // to declare for the whole window rather than per segment, and a
-      // `quest` naming nothing here is a genuine validation problem below.
     }
 
     if (segment.belongs === false) {
@@ -358,7 +367,7 @@ function validateSegment(
         // else it might be, and a model that fills it in anyway is just noisy.
         segment.guess = null;
       }
-      if (typeof segment.quest !== "string") {
+      if (typeof segment.quest !== "string" && !nothingToBelongTo) {
         problems.push(`${where}.quest: expected an active quest alias when belongs is true`);
       }
     }
