@@ -481,7 +481,16 @@ export function planW5Command(
 
 export { settingsPathFor };
 
-function runHook(args: string[]): number {
+/**
+ * Seams for tests. `hasUnstableInstall` decides whether `install` refuses because the scripts
+ * it would reference live somewhere disposable; the default looks at where this copy of tempad
+ * is, so a test that must reach a successful install from a checkout under `/tmp` replaces it.
+ */
+export interface HookCommandOptions {
+  hasUnstableInstall?: (binary: string | undefined) => boolean;
+}
+
+function runHook(args: string[], options: HookCommandOptions = {}): number {
   const [action, ...rest] = args;
   const { values } = parseArgs({
     args: rest,
@@ -494,7 +503,12 @@ function runHook(args: string[]): number {
   const scope = values.scope === "project" ? "project" : "user";
 
   try {
-    return applyHookAction(action, settingsPathFor(scope), values.bin);
+    return applyHookAction(
+      action,
+      settingsPathFor(scope),
+      values.bin,
+      options.hasUnstableInstall ?? hasUnstableInstall,
+    );
   } catch (error) {
     if (error instanceof SettingsParseError) {
       console.error(error.message);
@@ -508,9 +522,10 @@ function applyHookAction(
   action: string | undefined,
   settingsPath: string,
   binary: string | undefined,
+  isUnstableInstall: (binary: string | undefined) => boolean,
 ): number {
   if (action === "install") {
-    if (hasUnstableInstall(binary)) {
+    if (isUnstableInstall(binary)) {
       console.error(UNSTABLE_INSTALL_MESSAGE);
       return 1;
     }
@@ -741,8 +756,8 @@ function runDedupe(args: string[], context: W5Context): number {
 }
 
 /** `tempad w5 hook ...`: edits settings.json only, needs no config and no database. */
-export function runW5HookCommand(args: string[]): number {
-  return runHook(args);
+export function runW5HookCommand(args: string[], options: HookCommandOptions = {}): number {
+  return runHook(args, options);
 }
 
 export async function runW5Command(args: string[], context: W5Context): Promise<number> {

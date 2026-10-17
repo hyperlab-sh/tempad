@@ -69,6 +69,7 @@ async function openConcurrently(
   const goAt = Date.now() + 1500;
   const children = Array.from({ length: processes }, (_, index) =>
     Bun.spawn([process.execPath, script, DATABASE_MODULE, path, String(goAt), `host-${index}`], {
+      env: process.env,
       stdout: "pipe",
       stderr: "pipe",
       timeout: 60_000,

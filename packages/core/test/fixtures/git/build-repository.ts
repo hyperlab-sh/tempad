@@ -84,7 +84,11 @@ export async function addCommitOnDetachedRef(
   await run(["git", "checkout", "-b", branchName], directory);
   await addCommit(directory, commit);
 
-  const proc = Bun.spawn(["git", "rev-parse", "HEAD"], { cwd: directory, stdout: "pipe" });
+  const proc = Bun.spawn(["git", "rev-parse", "HEAD"], {
+    cwd: directory,
+    env: process.env,
+    stdout: "pipe",
+  });
   const sha = (await new Response(proc.stdout).text()).trim();
   await proc.exited;
 

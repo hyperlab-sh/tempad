@@ -14,6 +14,8 @@ import { runSkillCommand, runSync } from "../src/cli.ts";
 import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
+import { renderHookSettings } from "../src/w5/hooks.ts";
+import { withEnvironment } from "./isolation.ts";
 
 function makeCollector(
   name: Collector["name"],
@@ -794,12 +796,31 @@ describe("cli without setup", () => {
     try {
       const settingsPath = join(sandbox.home, ".claude", "settings.json");
       mkdirSync(dirname(settingsPath), { recursive: true });
-      const install = await runCli(sandbox, ["w5", "hook", "install"]);
-      expect(install.exitCode).toBe(0);
-      expect(readFileSync(settingsPath, "utf8")).toContain('"tempad": true');
+      // Written by hand, not by `w5 hook install`: install refuses to run from a checkout that
+      // lives under the OS temp directory, and this test is about uninstall.
+      const foreign = { type: "command", command: "echo someone-elses-hook" };
+      const fragment = renderHookSettings("/opt/tempad/src/cli.ts");
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({
+          theme: "dark",
+          hooks: { ...fragment, Stop: [{ hooks: [foreign] }, ...(fragment.Stop ?? [])] },
+        }),
+      );
+      expect(readFileSync(settingsPath, "utf8")).toMatch(/"tempad":\s*true/);
       const uninstall = await runCli(sandbox, ["w5", "hook", "uninstall"]);
       expect(uninstall.exitCode).toBe(0);
-      expect(readFileSync(settingsPath, "utf8")).not.toContain('"tempad": true');
+      const after = readFileSync(settingsPath, "utf8");
+      expect(after).not.toMatch(/"tempad":\s*true/);
+      expect(JSON.parse(after)).toEqual({
+        theme: "dark",
+        hooks: {
+          Stop: [{ hooks: [foreign] }],
+          PreCompact: [],
+          SessionEnd: [],
+          UserPromptSubmit: [],
+        },
+      });
       expect(existsSync(sandbox.tempadHome)).toBe(false);
     } finally {
       cleanup(sandbox);
@@ -914,10 +935,10 @@ describe("cli ignores a .env in the current directory", () => {
 describe("tempad skill install", () => {
   test("--scope user copies the skill into a temporary HOME's ~/.claude/skills, never the real one", () => {
     const tempHome = mkdtempSync(join(tmpdir(), "tempad-skill-home-"));
-    const previousHome = process.env.HOME;
-    process.env.HOME = tempHome;
     try {
-      const exitCode = runSkillCommand(["install", "--scope", "user"]);
+      const exitCode = withEnvironment({ HOME: tempHome, CLAUDE_CONFIG_DIR: null }, () =>
+        runSkillCommand(["install", "--scope", "user"]),
+      );
       expect(exitCode).toBe(0);
       const destination = join(tempHome, ".claude", "skills", "tempad-quest", "SKILL.md");
       expect(existsSync(destination)).toBe(true);
@@ -926,7 +947,6 @@ describe("tempad skill install", () => {
       expect(content).not.toMatch(/^name: quest$/m);
       expect(content).toContain("tempad quest declare");
     } finally {
-      process.env.HOME = previousHome;
       rmSync(tempHome, { recursive: true, force: true });
     }
   });
@@ -934,24 +954,20 @@ describe("tempad skill install", () => {
   test("--scope user follows CLAUDE_CONFIG_DIR when set and non-empty, else HOME", () => {
     const tempHome = mkdtempSync(join(tmpdir(), "tempad-skill-home-"));
     const configDir = mkdtempSync(join(tmpdir(), "tempad-skill-config-"));
-    const previousHome = process.env.HOME;
-    const previousConfig = process.env.CLAUDE_CONFIG_DIR;
-    process.env.HOME = tempHome;
     try {
-      process.env.CLAUDE_CONFIG_DIR = configDir;
-      expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      withEnvironment({ HOME: tempHome, CLAUDE_CONFIG_DIR: configDir }, () => {
+        expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      });
       expect(existsSync(join(configDir, "skills", "tempad-quest", "SKILL.md"))).toBe(true);
       expect(existsSync(join(tempHome, ".claude"))).toBe(false);
 
-      process.env.CLAUDE_CONFIG_DIR = "";
-      expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      withEnvironment({ HOME: tempHome, CLAUDE_CONFIG_DIR: "" }, () => {
+        expect(runSkillCommand(["install", "--scope", "user"])).toBe(0);
+      });
       expect(existsSync(join(tempHome, ".claude", "skills", "tempad-quest", "SKILL.md"))).toBe(
         true,
       );
     } finally {
-      process.env.HOME = previousHome;
-      if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-      else process.env.CLAUDE_CONFIG_DIR = previousConfig;
       rmSync(tempHome, { recursive: true, force: true });
       rmSync(configDir, { recursive: true, force: true });
     }
@@ -960,30 +976,26 @@ describe("tempad skill install", () => {
   test("--scope project copies the skill into .claude/skills under the current working directory", () => {
     const tempHome = mkdtempSync(join(tmpdir(), "tempad-skill-home-"));
     const projectDir = mkdtempSync(join(tmpdir(), "tempad-skill-project-"));
-    const previousHome = process.env.HOME;
     const previousCwd = process.cwd();
-    process.env.HOME = tempHome;
     process.chdir(projectDir);
     try {
-      const exitCode = runSkillCommand(["install", "--scope", "project"]);
+      const exitCode = withEnvironment({ HOME: tempHome, CLAUDE_CONFIG_DIR: null }, () =>
+        runSkillCommand(["install", "--scope", "project"]),
+      );
       expect(exitCode).toBe(0);
       const destination = join(projectDir, ".claude", "skills", "tempad-quest", "SKILL.md");
       expect(existsSync(destination)).toBe(true);
+      expect(existsSync(join(tempHome, ".claude"))).toBe(false);
     } finally {
       process.chdir(previousCwd);
-      process.env.HOME = previousHome;
       rmSync(tempHome, { recursive: true, force: true });
       rmSync(projectDir, { recursive: true, force: true });
     }
   });
 
   test("--scope user throws a clear error when HOME is unset, never defaults to '/'", () => {
-    const previousHome = process.env.HOME;
-    delete process.env.HOME;
-    try {
+    withEnvironment({ HOME: null, CLAUDE_CONFIG_DIR: null }, () => {
       expect(() => runSkillCommand(["install", "--scope", "user"])).toThrow(/HOME is not set/);
-    } finally {
-      process.env.HOME = previousHome;
-    }
+    });
   });
 });

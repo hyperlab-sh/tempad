@@ -1,0 +1,3 @@
+# `bun test` from the repository root (CI) must isolate like `bun test` inside packages/core.
+[test]
+preload = ["./packages/core/test/preload.ts"]
