@@ -49,6 +49,9 @@ export interface BackfillResult {
   overlapDropped: number;
   questProposedOnMatched: number;
   selectorDefaulted: number;
+  boundsClamped: number;
+  guessDefaulted: number;
+  sessionNoteTruncated: number;
   selectorAmbiguous: number;
   /** Sessions classified this run whose `modeFor` was `"declared"`. */
   sessionsDeclared: number;
@@ -248,6 +251,9 @@ export async function backfill(
   let overlapDropped = 0;
   let questProposedOnMatched = 0;
   let selectorDefaulted = 0;
+  let boundsClamped = 0;
+  let guessDefaulted = 0;
+  let sessionNoteTruncated = 0;
   let selectorAmbiguous = 0;
   const windowMinutes = backfillWindowMinutes(intentConfig);
 
@@ -377,9 +383,12 @@ export async function backfill(
       });
       doubts += applied.doubts;
       unknownStintIds += applied.unknownStintIds;
-      overlapDropped += applied.overlapDropped;
+      overlapDropped += result.overlapDropped ?? 0;
       questProposedOnMatched += applied.questProposedOnMatched;
       selectorDefaulted += result.selectorDefaulted ?? 0;
+      boundsClamped += result.boundsClamped ?? 0;
+      guessDefaulted += result.guessDefaulted ?? 0;
+      sessionNoteTruncated += result.sessionNoteTruncated ?? 0;
       selectorAmbiguous += result.selectorAmbiguous ?? 0;
       writeSessionNote(database, session.id, result.sessionNote, options.now);
       applyIncremental(
@@ -426,6 +435,9 @@ export async function backfill(
     overlapDropped,
     questProposedOnMatched,
     selectorDefaulted,
+    boundsClamped,
+    guessDefaulted,
+    sessionNoteTruncated,
     selectorAmbiguous,
     sessionsDeclared,
     sessionsInferred,

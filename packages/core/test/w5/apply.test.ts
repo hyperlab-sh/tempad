@@ -705,47 +705,6 @@ describe("applyResult", () => {
     expect(a1Traces.count).toBe(2); // T0 from seed() plus the returning segment.
   });
 
-  test("a segment entirely inside the overlap range records no trace", () => {
-    const database = openDatabase(":memory:");
-    const { store } = seed(database);
-
-    const overlapWindow: ClassifierWindow = {
-      ...window,
-      overlapMessages: [
-        { ts: "2026-09-04T14:40:00.000Z", role: "user", text: "tail one" },
-        { ts: "2026-09-04T14:50:00.000Z", role: "user", text: "tail two" },
-      ],
-    };
-
-    const insideOverlap: ClassifierResult = {
-      segments: [
-        {
-          ...baseMatched,
-          startedAt: "2026-09-04T14:40:00.000Z",
-          endedAt: "2026-09-04T14:50:00.000Z",
-          matchedStint: "A1",
-          continuesStint: null,
-          newStintReason: null,
-        },
-      ],
-      sessionNote: null,
-    };
-
-    const summary = applyResult(store, database, overlapWindow, insideOverlap, {
-      actor: "hook",
-      askingEnabled: false,
-      now: "2026-09-04T15:21:00.000Z",
-      log: () => {},
-      mode: "inferred",
-      stintMinMinutes: 5,
-    });
-
-    expect(summary.traces).toBe(0);
-    expect(summary.overlapDropped).toBe(1);
-    const count = database.query("SELECT COUNT(*) as count FROM traces").get() as { count: number };
-    expect(count.count).toBe(1);
-  });
-
   test("matchedStint naming an id absent from the slice opens a new stint and counts it", () => {
     const database = openDatabase(":memory:");
     const { store } = seed(database);
@@ -1496,38 +1455,6 @@ describe("applyResult in declared mode", () => {
       kind: string;
     }[];
     expect(asked.some((q) => q.kind === "declare")).toBe(true);
-  });
-
-  test("a declare question is not asked when only overlap-dropped segments meet stintMinMinutes", () => {
-    const database = openDatabase(":memory:");
-    const { store } = seed(database);
-
-    const overlapDeclaredWindow: ClassifierWindow = {
-      ...undeclaredWindow,
-      overlapMessages: [
-        { ts: "2026-09-04T15:00:00.000Z", role: "user", text: "tail one" },
-        { ts: "2026-09-04T15:06:00.000Z", role: "user", text: "tail two" },
-      ],
-    };
-
-    const summary = applyResult(
-      store,
-      database,
-      overlapDeclaredWindow,
-      {
-        segments: [
-          segment({ startedAt: "2026-09-04T15:00:00.000Z", endedAt: "2026-09-04T15:06:00.000Z" }),
-        ],
-        sessionNote: null,
-      },
-      declaredOptions,
-    );
-
-    expect(summary.overlapDropped).toBe(1);
-    const asked = database.query("SELECT kind FROM questions WHERE state = 'watching'").all() as {
-      kind: string;
-    }[];
-    expect(asked.some((q) => q.kind === "declare")).toBe(false);
   });
 
   test("a subagent's doubt is addressed to the parent session", () => {

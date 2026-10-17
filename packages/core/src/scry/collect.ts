@@ -14,6 +14,7 @@ import {
 import { SYNCED_UPSERT_TABLES } from "../sync/tables";
 import { MIRROR_SYNC_ENABLED } from "../sync/triggers";
 import { backfillWindowMinutes, planBackfillWindows, selectBackfillSessions } from "../w5/backfill";
+import { failureMessage } from "../w5/classifier-shared";
 import { compareProjectionsToReplay } from "./replay";
 import type {
   Check,
@@ -158,7 +159,9 @@ function formatAge(hours: number): string {
 }
 
 function normalizeError(message: string): string {
-  return message
+  // A failed job may carry the start of the response that failed it; every one
+  // differs, so grouping on it would make each failure its own group.
+  return failureMessage(message)
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<id>")
     .replace(/\s+/g, " ")
     .trim()

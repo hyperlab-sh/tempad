@@ -166,6 +166,18 @@ export interface ClassifierResult {
    */
   selectorDefaulted?: number;
   /**
+   * Segments the model placed wholly before the window's first message, i.e. in
+   * the context-only overlap tail, and that validation dropped: that stretch was
+   * already classified by an earlier run, so recording it would double-count.
+   */
+  overlapDropped?: number;
+  /** Segments that partly overlapped the window and had a bound clamped to it. */
+  boundsClamped?: number;
+  /** Segments with `belongs: false` that named no guess and got `UNSPECIFIED_GUESS`. */
+  guessDefaulted?: number;
+  /** 1 when the `sessionNote` was over the limit and cut, else 0. */
+  sessionNoteTruncated?: number;
+  /**
    * Segments that named more than one selector and were narrowed to the first by
    * precedence (matchedStint > continuesStint > newStintReason).
    */
@@ -173,6 +185,14 @@ export interface ClassifierResult {
 }
 
 export const MAX_SESSION_NOTE_LENGTH = 300;
+
+/**
+ * Stands in for the `guess` of a `belongs: false` segment that named none. The
+ * doubt itself is real, only its description is missing; this is the same text
+ * the hand-back falls back to for a question stored with no guess, so the human
+ * reads one wording either way.
+ */
+export const UNSPECIFIED_GUESS = "something else";
 
 /** Stands in for a `newStintReason` the classifier omitted entirely. */
 export const DEFAULT_NEW_STINT_REASON = "classifier gave no reason";
@@ -223,6 +243,93 @@ function requireString(value: unknown, path: string, problems: string[]): value 
 interface SelectorCounters {
   selectorDefaulted: number;
   selectorAmbiguous: number;
+  guessDefaulted: number;
+}
+
+interface RepairCounters {
+  overlapDropped: number;
+  boundsClamped: number;
+}
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function instantOf(value: string): number {
+  return ISO_INSTANT.test(value) ? Date.parse(value) : Number.NaN;
+}
+
+/**
+ * Cuts `text` to at most `length` UTF-16 units without leaving half of a
+ * surrogate pair at the end.
+ */
+export function cutAtCodePoint(text: string, length: number): string {
+  let cut = length;
+  const last = text.charCodeAt(cut - 1);
+  if (cut > 0 && last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return text.slice(0, cut);
+}
+
+/**
+ * Brings a segment's timestamps inside the window, or says to drop it.
+ *
+ * The prompt lists an overlap tail as context only, but models classify it
+ * anyway, and a segment that starts in the tail and runs into the window is
+ * ordinary. A segment ending at or before the window's first message lies
+ * wholly in that tail (it is earlier work an earlier run already recorded) and
+ * is dropped. One that straddles the first message starts there instead, and
+ * one that runs a moment past the last message ends there; both are counted as
+ * clamped, and a clamp that leaves no time (`start >= end`) drops the segment
+ * too, since a zero-minute trace would only open a stint or re-ask a question
+ * about work already recorded. Instants are compared, not strings, and a kept
+ * pair is normalized to canonical UTC text.
+ *
+ * Anything that is not a well-formed pair is left alone for `validateSegment`
+ * to report with its retry hint: not an ISO timestamp, an end before its start,
+ * or a start after the last message. Dropping those would turn a mistake the
+ * model can fix into silent loss.
+ */
+function repairBounds(
+  raw: unknown,
+  bounds: { firstTs: string; lastTs: string },
+  counters: RepairCounters,
+): "keep" | "drop" {
+  if (typeof raw !== "object" || raw === null) return "keep";
+  const segment = raw as Record<string, unknown>;
+  const { startedAt, endedAt } = segment;
+  if (typeof startedAt !== "string" || typeof endedAt !== "string") return "keep";
+
+  const first = instantOf(bounds.firstTs);
+  const last = instantOf(bounds.lastTs);
+  const start = instantOf(startedAt);
+  const end = instantOf(endedAt);
+  if (Number.isNaN(first) || Number.isNaN(last) || Number.isNaN(start) || Number.isNaN(end)) {
+    return "keep";
+  }
+  if (start > end) return "keep";
+
+  // A well-formed pair is rewritten to canonical UTC (`toISOString`) so that
+  // `validateSegment` and everything after it, which compare and store text,
+  // see the instant the model meant: `12:05-03:00` is `15:05:00.000Z`, and
+  // `15:30:00Z` equals a message at `15:30:00.000Z` instead of sorting after it.
+  segment.startedAt = new Date(start).toISOString();
+  segment.endedAt = new Date(end).toISOString();
+
+  if (start < first && end <= first) {
+    counters.overlapDropped += 1;
+    return "drop";
+  }
+  if (start > last) return "keep";
+
+  const clampStart = start < first;
+  const clampEnd = end > last;
+  if (!clampStart && !clampEnd) return "keep";
+  if ((clampStart ? first : start) >= (clampEnd ? last : end)) {
+    counters.overlapDropped += 1;
+    return "drop";
+  }
+  if (clampStart) segment.startedAt = bounds.firstTs;
+  if (clampEnd) segment.endedAt = bounds.lastTs;
+  counters.boundsClamped += 1;
+  return "keep";
 }
 
 interface DeclaredAliases {
@@ -312,9 +419,11 @@ function validateSegment(
     problems.push(`${where}.belongs: expected boolean`);
   } else {
     // A `quest` that names nothing the window offered: missing, null, or an
-    // alias the window never listed. With exactly one active quest there is
-    // an unambiguous default to assign silently; with none or several it is a
-    // doubt like any other unrecognized alias, never a validation failure.
+    // alias the window never listed. With exactly one active quest there is an
+    // unambiguous default to assign silently; with several it is a doubt like
+    // any other unrecognized alias; with none there is nothing to belong to,
+    // so the model's `quest` is dropped. Never a validation failure.
+    let nothingToBelongTo = false;
     if (segment.belongs === true && declaredAliases !== null) {
       const questIsUnrecognized =
         typeof segment.quest === "string" && !declaredAliases.quests.has(segment.quest);
@@ -322,6 +431,17 @@ function validateSegment(
 
       if ((questIsMissing || questIsUnrecognized) && declaredAliases.soleQuest !== null) {
         segment.quest = declaredAliases.soleQuest;
+      } else if ((questIsMissing || questIsUnrecognized) && declaredAliases.quests.size === 0) {
+        // The session has declared nothing (yet, or any more): the prompt says
+        // "active quests: none (ask to declare)", and a model that still answers
+        // `belongs: true` has no alias it could have meant. It is not a doubt
+        // about a quest: `applyResult` already records such a window's traces with no
+        // quest and asks to `declare` once for the whole window, so a per-segment
+        // doubt here would turn one gap into N questions. The quest is dropped,
+        // and counted like every other selector the model got wrong.
+        segment.quest = null;
+        nothingToBelongTo = true;
+        counters.selectorDefaulted += 1;
       } else if (questIsUnrecognized) {
         segment.belongs = false;
         segment.quest = null;
@@ -329,26 +449,24 @@ function validateSegment(
           segment.guess = UNRECOGNIZED_QUEST_ALIAS_GUESS;
         }
         counters.selectorDefaulted += 1;
-      } else if (questIsMissing && declaredAliases.quests.size >= 2) {
-        // No single quest to default to, but failing the whole window over a
-        // missing selector loses a real stretch of work: repaired exactly like
-        // an unrecognized alias, same counter, same doubt.
+      } else if (questIsMissing) {
+        // Two or more active quests and no single one to default to, but failing
+        // the whole window over a missing selector loses a real stretch of work:
+        // repaired exactly like an unrecognized alias, same counter, same doubt.
         segment.belongs = false;
         segment.quest = null;
         segment.guess = QUEST_NOT_NAMED_GUESS;
         counters.selectorDefaulted += 1;
       }
-      // Zero active quests with `belongs: true` falls through unrepaired: the
-      // session has nothing declared yet, so `needsDeclaration` already asks
-      // to declare for the whole window rather than per segment, and a
-      // `quest` naming nothing here is a genuine validation problem below.
     }
 
     if (segment.belongs === false) {
-      // A doubt with nothing to say is useless to the human answering it, so this
-      // is the one new hard requirement rather than a repair.
+      // A doubt with nothing to say is useless to the human answering it, but
+      // the doubt is real: only its description is missing, and failing the
+      // window would lose the stretch of work it describes.
       if (typeof segment.guess !== "string" || segment.guess.trim() === "") {
-        problems.push(`${where}.guess: expected a non-empty string when belongs is false`);
+        segment.guess = UNSPECIFIED_GUESS;
+        counters.guessDefaulted += 1;
       }
       // A segment that serves nothing declared has no quest to name.
       segment.quest = null;
@@ -358,7 +476,7 @@ function validateSegment(
         // else it might be, and a model that fills it in anyway is just noisy.
         segment.guess = null;
       }
-      if (typeof segment.quest !== "string") {
+      if (typeof segment.quest !== "string" && !nothingToBelongTo) {
         problems.push(`${where}.quest: expected an active quest alias when belongs is true`);
       }
     }
@@ -510,18 +628,31 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
         })()
       : null;
 
-  const counters: SelectorCounters = { selectorDefaulted: 0, selectorAmbiguous: 0 };
-  const segments = (raw as { segments: unknown[] }).segments;
+  const counters: SelectorCounters = {
+    selectorDefaulted: 0,
+    selectorAmbiguous: 0,
+    guessDefaulted: 0,
+  };
+  const repairs: RepairCounters = { overlapDropped: 0, boundsClamped: 0 };
+  const segments =
+    bounds === null
+      ? (raw as { segments: unknown[] }).segments
+      : (raw as { segments: unknown[] }).segments.filter(
+          (segment) => repairBounds(segment, bounds, repairs) === "keep",
+        );
   for (const [index, segment] of segments.entries()) {
     validateSegment(segment, index, problems, bounds, counters, aliases, mode, declaredAliases);
   }
 
-  const sessionNote = (raw as { sessionNote?: unknown }).sessionNote;
-  if (
-    sessionNote !== undefined &&
-    sessionNote !== null &&
-    (typeof sessionNote !== "string" || sessionNote.length > MAX_SESSION_NOTE_LENGTH)
-  ) {
+  let sessionNote = (raw as { sessionNote?: unknown }).sessionNote;
+  let sessionNoteTruncated = 0;
+  if (typeof sessionNote === "string" && sessionNote.length > MAX_SESSION_NOTE_LENGTH) {
+    // A hint for the next run, not a fact: cutting it loses a few words, failing
+    // the window would lose the work classified alongside it.
+    sessionNote = `${cutAtCodePoint(sessionNote, MAX_SESSION_NOTE_LENGTH - 1)}…`;
+    sessionNoteTruncated = 1;
+  }
+  if (sessionNote !== undefined && sessionNote !== null && typeof sessionNote !== "string") {
     problems.push(
       `sessionNote: expected null or a string of at most ${MAX_SESSION_NOTE_LENGTH} characters`,
     );
@@ -529,12 +660,15 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
   if (problems.length > 0) {
     throw new Error(`classifier result invalid:\n${problems.join("\n")}`);
   }
-  const result = raw as { segments: ClassifierSegment[]; sessionNote?: string | null };
   return {
-    segments: result.segments,
-    sessionNote: result.sessionNote ?? null,
+    segments: segments as ClassifierSegment[],
+    sessionNote: (sessionNote as string | null | undefined) ?? null,
     selectorDefaulted: counters.selectorDefaulted,
     selectorAmbiguous: counters.selectorAmbiguous,
+    guessDefaulted: counters.guessDefaulted,
+    overlapDropped: repairs.overlapDropped,
+    boundsClamped: repairs.boundsClamped,
+    sessionNoteTruncated,
   };
 }
 

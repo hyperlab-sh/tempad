@@ -6,6 +6,7 @@ import { registerAllProjections } from "../intent/projections/register";
 import { EventStore } from "../intent/store";
 import { type AppliedSummary, applyResult } from "./apply";
 import type { Classifier } from "./classifier";
+import { describeJobFailure } from "./classifier-shared";
 import { claimNextJob, completeJob, failJob } from "./jobs";
 import { closeIdleStints, closeSessionStints } from "./lifecycle";
 import { advanceQuestions } from "./questions";
@@ -171,7 +172,7 @@ export async function runOnce(
     return { ran: true, sessionId: job.sessionId, summary };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    failJob(database, job.id, message);
+    failJob(database, job.id, describeJobFailure(error));
     options.log(`w5 run failed for session ${job.sessionId}: ${message}`);
     return { ran: true, sessionId: job.sessionId };
   }

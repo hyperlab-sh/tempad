@@ -2,10 +2,18 @@ import { describe, expect, test } from "bun:test";
 import {
   AnthropicClassifier,
   type ClassifierWindow,
+  cutAtCodePoint,
   DEFAULT_NEW_STINT_REASON,
   UNRECOGNIZED_QUEST_ALIAS_GUESS,
+  UNSPECIFIED_GUESS,
   validateResult,
 } from "../../src/w5/classifier";
+import {
+  ClassifierResponseError,
+  describeJobFailure,
+  RESPONSE_EXCERPT_LENGTH,
+  RESPONSE_EXCERPT_MARKER,
+} from "../../src/w5/classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
 
 const window: ClassifierWindow = {
@@ -154,14 +162,40 @@ describe("classifier", () => {
     expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
   });
 
-  test("validateResult rejects belongs: false with a null guess", () => {
-    expect(() =>
-      validateResult({ segments: [{ ...good.segments[0], belongs: false, guess: null }] }, window),
-    ).toThrow(/guess: expected a non-empty string when belongs is false/);
+  test("validateResult gives belongs: false with an empty, missing or non-string guess a placeholder and counts it", () => {
+    for (const guess of [null, "   ", "", undefined, 7]) {
+      const segment: Record<string, unknown> = { ...good.segments[0], belongs: false, guess };
+      if (guess === undefined) delete segment.guess;
+      const result = validateResult({ segments: [segment] }, window);
+      expect(result.segments[0]?.guess).toBe(UNSPECIFIED_GUESS);
+      expect(result.guessDefaulted).toBe(1);
+    }
+  });
 
-    expect(() =>
-      validateResult({ segments: [{ ...good.segments[0], belongs: false, guess: "   " }] }, window),
-    ).toThrow(/guess: expected a non-empty string when belongs is false/);
+  test("validateResult replaces a whitespace-only guess alongside an unrecognized quest alias", () => {
+    const twoQuestWindow: ClassifierWindow = {
+      ...window,
+      activeQuests: [
+        ...window.activeQuests,
+        { alias: "Q2", title: "Other quest", outcome: "done", plan: [] },
+      ],
+      activeQuestAliases: { ...window.activeQuestAliases, Q2: "01HREALQUESTIDTWO000000000" },
+    };
+    const result = validateResult(
+      { segments: [{ ...good.segments[0], quest: "Q9", belongs: true, guess: "   " }] },
+      twoQuestWindow,
+    );
+    expect(result.segments[0]?.belongs).toBe(false);
+    expect(result.segments[0]?.guess).toBe(UNRECOGNIZED_QUEST_ALIAS_GUESS);
+  });
+
+  test("validateResult keeps a real guess untouched and counts nothing", () => {
+    const result = validateResult(
+      { segments: [{ ...good.segments[0], belongs: false, guess: "a comparison" }] },
+      window,
+    );
+    expect(result.segments[0]?.guess).toBe("a comparison");
+    expect(result.guessDefaulted).toBe(0);
   });
 
   test("validateResult repairs a guess sent alongside belongs: true back to null", () => {
@@ -206,15 +240,88 @@ describe("classifier", () => {
     expect(result.selectorDefaulted).toBe(0);
   });
 
-  test("a missing quest with no active quest fails validation", () => {
+  describe("a window with no active quest", () => {
+    // What `buildWindow` produces for a session that has declared nothing, or
+    // whose declared quests were all ended or retracted: the prompt reads
+    // "active quests: none (ask to declare)".
     const noQuestWindow: ClassifierWindow = {
       ...window,
       activeQuests: [],
       activeQuestAliases: {},
     };
-    expect(() =>
-      validateResult({ segments: [{ ...good.segments[0], quest: null }] }, noQuestWindow),
-    ).toThrow(/quest: expected an active quest alias when belongs is true/);
+
+    test.each([
+      ["null", { quest: null }],
+      ["omitted", { quest: undefined }],
+      ["an alias the window never offered", { quest: "Q1" }],
+      ["a quest title", { quest: "Ship marko-ui" }],
+      ["a real quest id", { quest: "01HREALQUESTIDONE000000000" }],
+    ])("belongs: true with quest %s is repaired, not a validation failure", (_label, override) => {
+      const result = validateResult(
+        { segments: [{ ...good.segments[0], ...override }] },
+        noQuestWindow,
+      );
+
+      // Nothing to belong to, so no quest and no doubt: applyResult asks to
+      // declare once for the whole window instead of one question per segment.
+      expect(result.segments[0]?.quest).toBeNull();
+      expect(result.segments[0]?.belongs).toBe(true);
+      expect(result.segments[0]?.guess).toBeNull();
+      expect(result.selectorDefaulted).toBe(1);
+    });
+
+    test("every segment of the window is repaired, not just the first", () => {
+      const result = validateResult(
+        {
+          segments: [
+            { ...good.segments[0], quest: null },
+            { ...good.segments[1], belongs: true, quest: "Q2" },
+          ],
+        },
+        noQuestWindow,
+      );
+
+      expect(result.segments.map((segment) => segment.quest)).toEqual([null, null]);
+      expect(result.selectorDefaulted).toBe(2);
+    });
+
+    test("the repair does not touch the other fields the validator still enforces", () => {
+      expect(() =>
+        validateResult(
+          { segments: [{ ...good.segments[0], quest: null, confidence: 7 }] },
+          noQuestWindow,
+        ),
+      ).toThrow(/confidence/);
+    });
+
+    test("a model that says belongs: false keeps its guess and is not counted as repaired", () => {
+      const result = validateResult(
+        { segments: [{ ...good.segments[0], belongs: false, guess: "a build fix", quest: null }] },
+        noQuestWindow,
+      );
+
+      expect(result.segments[0]?.belongs).toBe(false);
+      expect(result.segments[0]?.guess).toBe("a build fix");
+      expect(result.selectorDefaulted).toBe(0);
+    });
+
+    test("classify recovers from it on the first response, with no retry", async () => {
+      let calls = 0;
+      const answer = { segments: [{ ...good.segments[0], quest: null }] };
+      const fakeFetch = (async () => {
+        calls += 1;
+        return new Response(
+          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(answer) }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      const classifier = new AnthropicClassifier({ apiKey: "k", model: "m", fetch: fakeFetch });
+
+      const result = await classifier.classify(noQuestWindow);
+
+      expect(calls).toBe(1);
+      expect(result.segments[0]?.quest).toBeNull();
+    });
   });
 
   test("a missing quest with two or more active quests is repaired to a doubt, not a validation failure", () => {
@@ -373,10 +480,20 @@ describe("classifier", () => {
     expect(text).toContain("S1:");
   });
 
-  test("validateResult rejects a sessionNote that is not null or is over 300 characters", () => {
-    expect(() => validateResult({ ...good, sessionNote: "n".repeat(301) })).toThrow(
-      /sessionNote: expected null or a string of at most 300 characters/,
-    );
+  test("validateResult truncates a sessionNote over 300 characters with an ellipsis and counts it", () => {
+    const result = validateResult({ ...good, sessionNote: "n".repeat(301) });
+    expect(result.sessionNote).toBe(`${"n".repeat(299)}…`);
+    expect(result.sessionNote?.length).toBe(300);
+    expect(result.sessionNoteTruncated).toBe(1);
+  });
+
+  test("validateResult leaves a sessionNote of exactly 300 characters alone", () => {
+    const result = validateResult({ ...good, sessionNote: "n".repeat(300) });
+    expect(result.sessionNote).toBe("n".repeat(300));
+    expect(result.sessionNoteTruncated).toBe(0);
+  });
+
+  test("validateResult still rejects a sessionNote that is not a string or null", () => {
     expect(() => validateResult({ ...good, sessionNote: 7 })).toThrow(/sessionNote/);
     expect(validateResult({ ...good, sessionNote: null }).sessionNote).toBeNull();
   });
@@ -409,26 +526,335 @@ describe("classifier", () => {
     await expect(classifier.classify(window)).rejects.toThrow();
   });
 
-  test("validateResult rejects a segment whose timestamps fall outside the window", () => {
+  test("a response that stays invalid after the retry is thrown with the second response attached", async () => {
+    let calls = 0;
+    const fakeFetch = (async () => {
+      calls += 1;
+      const text =
+        calls === 1
+          ? "first, not json"
+          : JSON.stringify({ segments: [{ ...good.segments[0], confidence: 2 }] });
+      return new Response(JSON.stringify({ content: [{ type: "text", text }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const classifier = new AnthropicClassifier({ apiKey: "k", model: "m", fetch: fakeFetch });
+
+    const error = await classifier.classify(window).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ClassifierResponseError);
+    expect((error as ClassifierResponseError).message).toMatch(/confidence/);
+    expect((error as ClassifierResponseError).rawResponse).toContain('"confidence":2');
+    expect((error as ClassifierResponseError).rawResponse).not.toContain("first, not json");
+  });
+
+  test("a second response that is not JSON is thrown with its text attached", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ content: [{ type: "text", text: "I cannot do that" }] }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    const classifier = new AnthropicClassifier({ apiKey: "k", model: "m", fetch: fakeFetch });
+
+    const error = await classifier.classify(window).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ClassifierResponseError);
+    expect((error as ClassifierResponseError).rawResponse).toBe("I cannot do that");
+  });
+
+  test("validateResult drops a segment that lies wholly in the overlap tail and counts it", () => {
+    const tail = {
+      ...good.segments[0],
+      startedAt: "2026-09-04T14:40:00.000Z",
+      endedAt: "2026-09-04T14:50:00.000Z",
+    };
+    const result = validateResult({ segments: [tail, good.segments[0]] }, window);
+    expect(result.segments.length).toBe(1);
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.overlapDropped).toBe(1);
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult yields an empty valid result when every segment is in the tail", () => {
+    const tail = {
+      ...good.segments[0],
+      startedAt: "2026-09-04T14:40:00.000Z",
+      endedAt: "2026-09-04T14:50:00.000Z",
+    };
+    const result = validateResult({ segments: [tail] }, window);
+    expect(result.segments).toEqual([]);
+    expect(result.overlapDropped).toBe(1);
+  });
+
+  test("validateResult clamps a segment that starts in the overlap tail to the window start", () => {
+    const result = validateResult(
+      { segments: [{ ...good.segments[0], startedAt: "2026-09-04T14:45:00.000Z" }] },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:20:00.000Z");
+    expect(result.boundsClamped).toBe(1);
+    expect(result.overlapDropped).toBe(0);
+  });
+
+  test("validateResult clamps a segment that ends after the last message to the window end", () => {
+    const result = validateResult(
+      { segments: [{ ...good.segments[0], endedAt: "2026-09-04T18:00:00.000Z" }] },
+      window,
+    );
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:20:00.000Z");
+    expect(result.boundsClamped).toBe(1);
+  });
+
+  test("validateResult drops a tail segment that ends exactly on the first message", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T14:50:00.000Z",
+            endedAt: "2026-09-04T15:00:00.000Z",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.overlapDropped).toBe(1);
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult drops a segment that starts on the last message and runs past it, not a zero-minute trace", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:20:00.000Z",
+            endedAt: "2026-09-04T16:00:00.000Z",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.overlapDropped).toBe(1);
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult keeps a zero-length segment the model sent inside the window", () => {
+    const result = validateResult(good, window);
+    expect(result.segments[1]?.startedAt).toBe(result.segments[1]?.endedAt as string);
+    expect(result.overlapDropped).toBe(0);
+  });
+
+  test("validateResult does not drop a segment whose end precedes its start, it reports it", () => {
     expect(() =>
       validateResult(
         {
-          segments: [{ ...good.segments[0], startedAt: "2026-09-04T13:00:00.000Z" }],
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T15:20:00.000Z",
+              endedAt: "2026-09-04T14:55:00.000Z",
+            },
+          ],
         },
         window,
       ),
     ).toThrow(/outside the window/);
+  });
 
+  test("validateResult accepts an offset segment inside the window and stores it as canonical UTC", () => {
+    // 12:05-03:00 is 15:05Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T12:05:00.000-03:00",
+            endedAt: "2026-09-04T12:15:00-03:00",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:05:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:15:00.000Z");
+    expect(result.boundsClamped).toBe(0);
+    expect(result.overlapDropped).toBe(0);
+  });
+
+  test("validateResult accepts a segment ending at ...:00Z when the last message is ...:00.000Z", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:00:00Z",
+            endedAt: "2026-09-04T15:20:00Z",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:20:00.000Z");
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult clamps an offset segment that straddles the first message", () => {
+    // 11:55-03:00 is 14:55Z, 12:10-03:00 is 15:10Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T11:55:00.000-03:00",
+            endedAt: "2026-09-04T12:10:00.000-03:00",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:10:00.000Z");
+    expect(result.boundsClamped).toBe(1);
+  });
+
+  test("validateResult still reports an offset segment that is outside the window by instant", () => {
+    // 13:00-03:00 is 16:00Z, after the last message, though "13:00" sorts before "15:20".
     expect(() =>
       validateResult(
         {
-          segments: [{ ...good.segments[0], endedAt: "2026-09-04T18:00:00.000Z" }],
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T13:00:00.000-03:00",
+              endedAt: "2026-09-04T13:10:00.000-03:00",
+            },
+          ],
         },
         window,
       ),
     ).toThrow(/outside the window/);
+  });
 
-    expect(validateResult(good, window).segments.length).toBe(2);
+  test("validateResult does not read a bare year as a timestamp", () => {
+    // Date.parse("2026") is 2026-01-01T00:00:00Z; as an instant it would be clamped quietly.
+    expect(() =>
+      validateResult({ segments: [{ ...good.segments[0], startedAt: "2026" }] }, window),
+    ).toThrow(/startedAt/);
+  });
+
+  test("validateResult does not silently drop an inverted pair that lies wholly in the tail", () => {
+    expect(() =>
+      validateResult(
+        {
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T14:50:00.000Z",
+              endedAt: "2026-09-04T14:40:00.000Z",
+            },
+          ],
+        },
+        window,
+      ),
+    ).toThrow(/outside the window/);
+  });
+
+  test("validateResult does not drop a segment whose timestamp is not a timestamp, it reports it", () => {
+    expect(() =>
+      validateResult({ segments: [{ ...good.segments[0], endedAt: "1h" }] }, window),
+    ).toThrow(/endedAt/);
+  });
+
+  test("validateResult compares instants: an offset end before the first message is a tail segment", () => {
+    // 11:55-03:00 is 14:55Z, before the window's first message at 15:00Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T11:45:00.000-03:00",
+            endedAt: "2026-09-04T11:55:00.000-03:00",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.overlapDropped).toBe(1);
+  });
+
+  test("validateResult never splits a surrogate pair when it truncates a sessionNote", () => {
+    const note = `${"n".repeat(298)}😀${"tail".repeat(10)}`;
+    const result = validateResult({ ...good, sessionNote: note });
+    expect(result.sessionNote?.isWellFormed()).toBe(true);
+    expect(result.sessionNote).toBe(`${"n".repeat(298)}…`);
+    expect(result.sessionNoteTruncated).toBe(1);
+  });
+
+  test("validateResult keeps a surrogate pair that ends exactly at the sessionNote cut", () => {
+    const note = `${"n".repeat(297)}😀${"tail".repeat(10)}`;
+    const result = validateResult({ ...good, sessionNote: note });
+    expect(result.sessionNote).toBe(`${"n".repeat(297)}😀…`);
+    expect(result.sessionNote?.isWellFormed()).toBe(true);
+  });
+
+  test("cutAtCodePoint steps back over a high surrogate at either end of the range", () => {
+    // U+10000 starts with D800 and U+10FFFF with DBFF: the first and last high surrogates.
+    for (const character of ["\u{10000}", "\u{10FFFF}"]) {
+      const cut = cutAtCodePoint(`abc${character}def`, 4);
+      expect(cut).toBe("abc");
+      expect(cut.isWellFormed()).toBe(true);
+    }
+    expect(cutAtCodePoint("abc\u{10FFFF}def", 5)).toBe("abc\u{10FFFF}");
+    // A lone low surrogate is not a reason to step back, and neither is a character just below D800.
+    expect(cutAtCodePoint("ab\u{D7FF}cd", 3)).toBe("ab\u{D7FF}");
+    expect(cutAtCodePoint("abc", 0)).toBe("");
+  });
+
+  test("describeJobFailure never splits a surrogate pair at the excerpt boundary", () => {
+    const raw = `${"x".repeat(RESPONSE_EXCERPT_LENGTH - 1)}😀 and more`;
+    const stored = describeJobFailure(new ClassifierResponseError("bad", raw));
+    const excerpt = stored.split(RESPONSE_EXCERPT_MARKER)[1] as string;
+    expect(excerpt.isWellFormed()).toBe(true);
+    expect(excerpt).toBe("x".repeat(RESPONSE_EXCERPT_LENGTH - 1));
+  });
+
+  test("validateResult still rejects a segment that starts after the last message", () => {
+    expect(() =>
+      validateResult(
+        {
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T16:00:00.000Z",
+              endedAt: "2026-09-04T16:10:00.000Z",
+            },
+          ],
+        },
+        window,
+      ),
+    ).toThrow(/outside the window/);
+  });
+
+  test("validateResult still rejects timestamps that are not strings", () => {
+    expect(() =>
+      validateResult({ segments: [{ ...good.segments[0], startedAt: 5 }] }, window),
+    ).toThrow(/startedAt/);
+  });
+
+  test("validateResult counts no repairs on a result inside the window", () => {
+    const result = validateResult(good, window);
+    expect(result.segments.length).toBe(2);
+    expect(result.overlapDropped).toBe(0);
+    expect(result.boundsClamped).toBe(0);
+    expect(result.guessDefaulted).toBe(0);
+    expect(result.sessionNoteTruncated).toBe(0);
   });
 
   test("anthropic client throws with status and body excerpt on a non-2xx response, never the key", async () => {
