@@ -924,6 +924,98 @@ describe("a runner that lost its claim writes nothing (laptop asleep mid-classif
     }
   });
 
+  test("the old runner failing late says it lost the claim, not that the run failed", async () => {
+    const { dir, database } = setup();
+    try {
+      const asleep = new FakeClassifier(async () => {
+        reapStaleJobs(database, LATER);
+        claimNextJob(database, LATER);
+        throw new Error("classifier timed out");
+      });
+      const logs: string[] = [];
+      await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: (line) => logs.push(line),
+      });
+
+      expect(logs.some((line) => line.includes("lost its claim"))).toBe(true);
+      expect(logs.some((line) => line.includes("w5 run failed"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a runner whose claim is gone before the idle-close closes no stint", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      const filePath = join(dir, "s1.jsonl");
+      const openStint = new FakeClassifier(async () => good);
+
+      // Window 1 opens a stint, which the two-hour gap before window 3 idles.
+      seedThreeWindowSession(database, filePath, 4);
+      enqueueJob(database, {
+        sessionId: "s1",
+        forced: true,
+        throttleMinutes: 10,
+        now: "2026-09-04T15:31:00.000Z",
+      });
+      await runOnce(database, makeConfig(dir), config, openStint, {
+        now: "2026-09-04T15:31:00.000Z",
+        log: () => {},
+      });
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM stints WHERE closed_at IS NULL").get(),
+      ).toEqual({
+        n: 1,
+      });
+
+      seedThreeWindowSession(database, filePath, 6);
+      const now = "2026-09-04T17:41:00.000Z";
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10, now });
+
+      // The first read of w5_runs happens right before the idle-close; the
+      // job is reaped and re-claimed by another runner just ahead of it.
+      let stolen = false;
+      const raced = new Proxy(database, {
+        get(target, property) {
+          if (property === "query") {
+            return (sql: string) => {
+              if (!stolen && sql.includes("FROM w5_runs WHERE session_id")) {
+                stolen = true;
+                const later = new Date(Date.parse(now) + (JOB_LEASE_MINUTES + 5) * 60_000);
+                reapStaleJobs(target, later.toISOString());
+                claimNextJob(target, later.toISOString());
+              }
+              return target.query(sql);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+
+      const before = eventCount(database);
+      const logs: string[] = [];
+      await runOnce(raced, makeConfig(dir), config, new FakeClassifier(good), {
+        now,
+        log: (line) => logs.push(line),
+      });
+
+      expect(stolen).toBe(true);
+      expect(eventCount(database)).toBe(before);
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM stints WHERE closed_at IS NULL").get(),
+      ).toEqual({
+        n: 1,
+      });
+      expect(logs.some((line) => line.includes("discarding"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a failure while applying rolls back every event the job wrote", async () => {
     const { dir, database } = setup();
     try {

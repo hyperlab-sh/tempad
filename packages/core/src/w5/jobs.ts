@@ -138,21 +138,24 @@ export function enqueueJob(database: Database, input: EnqueueJobInput): EnqueueJ
   return { enqueued: true };
 }
 
+/**
+ * Claims the oldest queued job in ONE statement. A select followed by an update
+ * lets two runners pick the same row: both then update it and both read back
+ * the other's claim, so both would hold it. Here the write lock is taken before
+ * the subquery runs, the row can only still be `queued` for one caller, and the
+ * claim returned is the one this statement wrote.
+ */
 export function claimNextJob(database: Database, now?: string): Job | null {
   const claimedAt = now ?? new Date().toISOString();
   const row = database
-    .query("SELECT id FROM w5_jobs WHERE state = 'queued' ORDER BY id ASC LIMIT 1")
-    .get() as { id: number } | null;
-  if (!row) return null;
-
-  database
     .query(
-      "UPDATE w5_jobs SET state = 'running', claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
+      `UPDATE w5_jobs SET state = 'running', claimed_at = ?, attempts = attempts + 1
+        WHERE id = (SELECT id FROM w5_jobs WHERE state = 'queued' ORDER BY id ASC LIMIT 1)
+          AND state = 'queued'
+        RETURNING *`,
     )
-    .run(claimedAt, row.id);
-
-  const job = database.query("SELECT * FROM w5_jobs WHERE id = ?").get(row.id) as JobRow;
-  return toJob(job);
+    .get(claimedAt) as JobRow | null;
+  return row ? toJob(row) : null;
 }
 
 export interface ReapResult {
@@ -291,9 +294,11 @@ export function holdsClaim(database: Database, id: number, claim: JobClaim): boo
 }
 
 /**
- * Marks the job done. With a `claim`, writes nothing and returns false unless
- * the caller still holds it (see `holdsClaim`); callers that applied a result
- * do both in one transaction, so a reaped runner discards the result too.
+ * Marks the job done. With a `claim`, the update itself requires the caller to
+ * still hold it (the same test as `holdsClaim`, in the one statement, so nothing
+ * can change between check and write) and nothing is written otherwise; callers
+ * that applied a result do both in one transaction, so a reaped runner discards
+ * the result too. Returns whether the job was settled.
  */
 export function completeJob(
   database: Database,
@@ -303,35 +308,50 @@ export function completeJob(
   sessionNote?: string | null,
   claim?: JobClaim,
 ): boolean {
-  const job = database.query("SELECT session_id FROM w5_jobs WHERE id = ?").get(id) as {
-    session_id: string;
-  } | null;
-  if (!job) return false;
-  if (claim && !holdsClaim(database, id, claim)) return false;
-
   const finishedAt = now ?? new Date().toISOString();
+  const settle = database.transaction((): boolean => {
+    const job = database.query("SELECT session_id FROM w5_jobs WHERE id = ?").get(id) as {
+      session_id: string;
+    } | null;
+    if (!job) return false;
 
-  database
-    .query("UPDATE w5_jobs SET state = 'done', finished_at = ? WHERE id = ?")
-    .run(finishedAt, id);
+    const settled = claim
+      ? database
+          .query(
+            `UPDATE w5_jobs SET state = 'done', finished_at = ?
+              WHERE id = ? AND state = 'running' AND claimed_at = ? AND attempts = ?`,
+          )
+          .run(finishedAt, id, claim.claimedAt, claim.attempts)
+      : database
+          .query("UPDATE w5_jobs SET state = 'done', finished_at = ? WHERE id = ?")
+          .run(finishedAt, id);
+    if (settled.changes !== 1) return false;
 
-  database
-    .query(
-      `INSERT INTO w5_runs (session_id, last_run_at, last_message_ts, session_note) VALUES (?, ?, ?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET last_run_at = excluded.last_run_at,
-                                             last_message_ts = excluded.last_message_ts,
-                                             session_note = excluded.session_note`,
-    )
-    .run(job.session_id, finishedAt, lastMessageTs, sessionNote ?? null);
-  return true;
+    database
+      .query(
+        `INSERT INTO w5_runs (session_id, last_run_at, last_message_ts, session_note) VALUES (?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET last_run_at = excluded.last_run_at,
+                                               last_message_ts = excluded.last_message_ts,
+                                               session_note = excluded.session_note`,
+      )
+      .run(job.session_id, finishedAt, lastMessageTs, sessionNote ?? null);
+    return true;
+  });
+  return settle();
 }
 
-/** Marks the job failed; with a `claim`, only while the caller still holds it. */
+/** Marks the job failed; with a `claim`, only while the caller still holds it (one statement). */
 export function failJob(database: Database, id: number, error: string, claim?: JobClaim): boolean {
-  if (claim && !holdsClaim(database, id, claim)) return false;
   const now = new Date().toISOString();
-  database
-    .query("UPDATE w5_jobs SET state = 'failed', finished_at = ?, error = ? WHERE id = ?")
-    .run(now, error, id);
-  return true;
+  const result = claim
+    ? database
+        .query(
+          `UPDATE w5_jobs SET state = 'failed', finished_at = ?, error = ?
+            WHERE id = ? AND state = 'running' AND claimed_at = ? AND attempts = ?`,
+        )
+        .run(now, error, id, claim.claimedAt, claim.attempts)
+    : database
+        .query("UPDATE w5_jobs SET state = 'failed', finished_at = ?, error = ? WHERE id = ?")
+        .run(now, error, id);
+  return result.changes === 1;
 }

@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { openDatabase } from "../../src/db/database";
 import {
   claimNextJob,
@@ -480,5 +483,97 @@ describe("job claims", () => {
     );
     // A claim is spent once the job settled.
     expect(failJob(database, second.id, "again", claim)).toBe(false);
+  });
+});
+
+describe("claimNextJob across connections", () => {
+  const T0 = "2026-09-05T10:00:00.000Z";
+
+  test("one connection's claim is not handed out again by another", () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-claim-test-"));
+    try {
+      const path = join(directory, "tempad.db");
+      const first = openDatabase(path);
+      const second = openDatabase(path);
+      enqueueJob(first, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+      enqueueJob(first, { sessionId: "s2", forced: true, now: T0, throttleMinutes: 10 });
+
+      const a = claimNextJob(first, T0);
+      const b = claimNextJob(second, T0);
+      expect([a?.sessionId, b?.sessionId]).toEqual(["s1", "s2"]);
+      expect(claimNextJob(second, T0)).toBeNull();
+      expect(claimNextJob(first, T0)).toBeNull();
+      first.close();
+      second.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("the claim returned is the one the statement wrote", () => {
+    const database = openDatabase(":memory:");
+    enqueueJob(database, { sessionId: "s1", forced: true, now: T0, throttleMinutes: 10 });
+    const job = claimNextJob(database, "2026-09-05T10:05:00.000Z");
+    expect(job).toMatchObject({ claimedAt: "2026-09-05T10:05:00.000Z", attempts: 1 });
+    expect(database.query("SELECT state, claimed_at, attempts FROM w5_jobs").get()).toEqual({
+      state: "running",
+      claimed_at: "2026-09-05T10:05:00.000Z",
+      attempts: 1,
+    });
+  });
+
+  test("racing processes never claim the same job twice", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-claim-race-"));
+    try {
+      const path = join(directory, "tempad.db");
+      const seeding = openDatabase(path);
+      const jobs = 150;
+      for (let index = 0; index < jobs; index += 1) {
+        enqueueJob(seeding, {
+          sessionId: `session-${index}`,
+          forced: true,
+          now: T0,
+          throttleMinutes: 10,
+        });
+      }
+      seeding.close();
+
+      // Each racer opens its own connection and claims until the queue is empty,
+      // starting together at a shared instant so the claims interleave.
+      const script = `
+        import { openDatabase } from ${JSON.stringify(join(import.meta.dir, "../../src/db/database"))};
+        import { claimNextJob } from ${JSON.stringify(join(import.meta.dir, "../../src/w5/jobs"))};
+        const database = openDatabase(${JSON.stringify(path)});
+        while (Date.now() < Number(process.argv[1])) {}
+        const claimed = [];
+        for (;;) {
+          const job = claimNextJob(database);
+          if (!job) break;
+          claimed.push([job.id, job.attempts]);
+        }
+        console.log(JSON.stringify(claimed));
+      `;
+      const startAt = String(Date.now() + 1500);
+      const racers = Array.from({ length: 4 }, () =>
+        Bun.spawn(["bun", "--no-env-file", "-e", script, startAt], {
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      );
+      const outputs = await Promise.all(
+        racers.map(async (racer) => {
+          const [text, exit] = await Promise.all([new Response(racer.stdout).text(), racer.exited]);
+          expect(exit).toBe(0);
+          return JSON.parse(text.trim()) as [number, number][];
+        }),
+      );
+
+      const claimed = outputs.flat();
+      expect(claimed).toHaveLength(jobs);
+      expect(new Set(claimed.map(([id]) => id)).size).toBe(jobs);
+      expect(claimed.every(([, attempts]) => attempts === 1)).toBe(true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

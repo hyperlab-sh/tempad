@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, mkdirSync, openSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { childEnvironment } from "../config/child-env";
@@ -37,7 +37,7 @@ import {
   uninstallHooks,
 } from "./hooks";
 import { enqueueJob } from "./jobs";
-import { clearStaleLock, touchLock } from "./lock";
+import { acquireLock, clearStaleLock, releaseLock, touchLock } from "./lock";
 import type { QuestionRow } from "./questions";
 import { drain } from "./runner";
 
@@ -227,18 +227,22 @@ async function runRun(args: string[], context: W5Context): Promise<number> {
   const lockPath = lockPathFor(context.config);
   clearStaleLock(lockPath, (line) => log(context.config, line));
 
-  if (existsSync(lockPath)) {
-    return 0;
-  }
   mkdirSync(dirname(lockPath), { recursive: true });
 
   if (values.detached) {
-    spawnDetachedRun(context);
+    // The child takes the lock itself; this only avoids spawning one that
+    // would find it held.
+    if (!existsSync(lockPath)) spawnDetachedRun(context);
     return 0;
   }
 
+  // Of two runners spawned together (a Stop and a SessionEnd hook) one takes the
+  // lock and the other leaves its jobs to it. The lock only avoids duplicate work
+  // (a stale one can be cleared by two runners at once); a job being applied once
+  // is the claim's guarantee, not the lock's.
+  if (!acquireLock(lockPath)) return 0;
+
   try {
-    await Bun.write(lockPath, String(process.pid));
     const classifier = buildClassifier(context.config, context.intentConfig);
     const count = await drain(
       context.database,
@@ -252,11 +256,7 @@ async function runRun(args: string[], context: W5Context): Promise<number> {
     );
     context.stdout(`w5: ran ${count} job(s)`);
   } finally {
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // lock already gone
-    }
+    releaseLock(lockPath);
   }
   return 0;
 }

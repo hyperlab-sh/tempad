@@ -14,6 +14,12 @@ import { buildWindow, findSessionFile } from "./window";
 
 registerAllProjections();
 
+class LostClaimError extends Error {
+  constructor() {
+    super("claim lost while completing the job");
+  }
+}
+
 export interface RunOnceOptions {
   now?: string;
   log: (line: string) => void;
@@ -136,13 +142,23 @@ export async function runOnce(
     const sinceTs = runRow?.last_message_ts ?? null;
 
     // Idle-close before the window is built, so the classifier's "open stints
-    // this session" slice never offers a stint that idleness already ended.
-    closeIdleStints(store, database, {
-      sessionId: job.sessionId,
-      windowStartedAt: windowStartedAt(database, job.sessionId, sinceTs) ?? now,
-      idleMinutes: intentConfig.stintIdleMinutes,
-      stintMinMinutes: intentConfig.stintMinMinutes,
+    // this session" slice never offers a stint that idleness already ended. It
+    // appends events (which cannot be removed), so like the result below it runs
+    // in a transaction that first checks this runner still holds the claim, and
+    // reads the open stints inside it: a runner that was reaped, or that races
+    // the one that re-claimed the job, cannot close the same stint twice. Losing
+    // the claim here only skips the close; the check after classification is
+    // what discards the result.
+    const closeIdle = database.transaction(() => {
+      if (!holdsClaim(database, job.id, claim)) return;
+      closeIdleStints(store, database, {
+        sessionId: job.sessionId,
+        windowStartedAt: windowStartedAt(database, job.sessionId, sinceTs) ?? now,
+        idleMinutes: intentConfig.stintIdleMinutes,
+        stintMinMinutes: intentConfig.stintMinMinutes,
+      });
     });
+    closeIdle.immediate();
 
     // A live session that has never declared anything still runs in declared mode
     // (it gets a `declare` question); the inference fallback is backfill's, for
@@ -201,7 +217,11 @@ export async function runOnce(
       // `closeSessionActivities` cleared the note for a session that just ended;
       // writing the classifier's note back would resurrect it.
       const sessionNote = job.kind === "session_end" ? null : result.sessionNote;
-      completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote, claim);
+      // The claim was checked above in this same transaction, so this cannot
+      // fail; if it ever does, throwing rolls back every event applied here.
+      if (!completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote, claim)) {
+        throw new LostClaimError();
+      }
       return summary;
     });
     const summary = finish.immediate();
@@ -215,9 +235,16 @@ export async function runOnce(
     return { ran: true, sessionId: job.sessionId, summary };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    failJob(database, job.id, describeJobFailure(error));
-    failJob(database, job.id, message, claim);
-    options.log(`w5 run failed for session ${job.sessionId}: ${message}`);
+    // `failJob` settles the job only while this runner still holds the claim; if
+    // it does not, the failure belongs to a claim that is no longer ours and
+    // another runner owns the job, so say that instead of reporting a failed run.
+    if (!failJob(database, job.id, describeJobFailure(error), claim)) {
+      options.log(
+        `w5 job ${job.id} for session ${job.sessionId} lost its claim before it could be marked failed (${message}); leaving it to the runner that holds it`,
+      );
+    } else {
+      options.log(`w5 run failed for session ${job.sessionId}: ${message}`);
+    }
     return { ran: true, sessionId: job.sessionId };
   }
 }
