@@ -16,7 +16,13 @@ import {
   RESPONSE_EXCERPT_MARKER,
 } from "../../src/w5/classifier-shared";
 import { buildBelongsHandback } from "../../src/w5/hooks";
-import { claimNextJob, enqueueJob, JOB_LEASE_MINUTES, JOB_MAX_ATTEMPTS } from "../../src/w5/jobs";
+import {
+  claimNextJob,
+  enqueueJob,
+  JOB_LEASE_MINUTES,
+  JOB_MAX_ATTEMPTS,
+  reapStaleJobs,
+} from "../../src/w5/jobs";
 import { runOnce } from "../../src/w5/runner";
 
 registerAllProjections();
@@ -831,5 +837,142 @@ describe("runOnce reaps jobs a crashed runner left running (tempad-0xk)", () => 
     expect(job.state).toBe("failed");
     expect(job.error).toContain("lease expired");
     expect(job.error).toContain(`${JOB_MAX_ATTEMPTS} attempts`);
+  });
+});
+
+describe("a runner that lost its claim writes nothing (laptop asleep mid-classify)", () => {
+  const CLAIMED = "2026-09-04T15:30:00.000Z";
+  const LATER = new Date(Date.parse(CLAIMED) + (JOB_LEASE_MINUTES + 5) * 60_000).toISOString();
+
+  function eventCount(database: ReturnType<typeof openDatabase>): number {
+    return (database.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+  }
+
+  function setup() {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+    enqueueJob(database, { sessionId: "s1", forced: true, now: CLAIMED, throttleMinutes: 10 });
+    return { dir, database };
+  }
+
+  test("the old runner finishing after reap and re-claim applies and settles nothing; the new one runs the job once", async () => {
+    const { dir, database } = setup();
+    try {
+      let eventsBeforeApply = -1;
+      // Runner A is mid-classify when the machine wakes and runner B reaps and
+      // re-claims the job (B's classify is the one that counts).
+      const asleep = new FakeClassifier(async () => {
+        eventsBeforeApply = eventCount(database);
+        expect(reapStaleJobs(database, LATER)).toEqual({ requeued: 1, failed: 0 });
+        return good;
+      });
+      const logs: string[] = [];
+      const a = await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: (line) => logs.push(line),
+      });
+
+      expect(a.ran).toBe(true);
+      expect(a.summary).toBeUndefined();
+      expect(eventCount(database)).toBe(eventsBeforeApply);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 0 });
+      expect(logs.some((line) => line.includes("discarding"))).toBe(true);
+      // A's late finish did not touch the job B will take.
+      expect(database.query("SELECT state, attempts FROM w5_jobs").get()).toEqual({
+        state: "queued",
+        attempts: 1,
+      });
+
+      const b = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: LATER,
+        log: () => {},
+      });
+      expect(b.summary?.traces).toBe(1);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 1 });
+      expect(database.query("SELECT state, attempts FROM w5_jobs").get()).toEqual({
+        state: "done",
+        attempts: 2,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the old runner failing late does not overwrite the job another runner now holds", async () => {
+    const { dir, database } = setup();
+    try {
+      const asleep = new FakeClassifier(async () => {
+        reapStaleJobs(database, LATER);
+        claimNextJob(database, LATER);
+        throw new Error("classifier timed out");
+      });
+      const a = await runOnce(database, makeConfig(dir), config, asleep, {
+        now: CLAIMED,
+        log: () => {},
+      });
+
+      expect(a.ran).toBe(true);
+      expect(database.query("SELECT state, error, attempts FROM w5_jobs").get()).toEqual({
+        state: "running",
+        error: null,
+        attempts: 2,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failure while applying rolls back every event the job wrote", async () => {
+    const { dir, database } = setup();
+    try {
+      const before = eventCount(database);
+      // The first segment applies cleanly and writes events; reading the second
+      // throws, inside applyResult and after those events exist.
+      const first = good.segments[0] as ClassifierResult["segments"][number];
+      const broken = new FakeClassifier(async () => ({
+        segments: [
+          first,
+          {
+            ...first,
+            get what(): string {
+              throw new Error("segment unreadable");
+            },
+          },
+        ],
+        sessionNote: null,
+      }));
+      const result = await runOnce(database, makeConfig(dir), config, broken, {
+        now: CLAIMED,
+        log: () => {},
+      });
+
+      expect(result.summary).toBeUndefined();
+      expect(database.query("SELECT state FROM w5_jobs").get()).toEqual({ state: "failed" });
+      expect(eventCount(database)).toBe(before);
+      expect(database.query("SELECT COUNT(*) AS n FROM traces").get()).toEqual({ n: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runOnce touches the lock before each job", () => {
+  test("beforeJob runs once per run, before the claim", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    const calls: string[] = [];
+    await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:00:00.000Z",
+      log: () => {},
+      beforeJob: () => calls.push("touch"),
+    });
+    await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:00:00.000Z",
+      log: () => {},
+      beforeJob: () => calls.push("touch"),
+    });
+    expect(calls).toEqual(["touch", "touch"]);
   });
 });

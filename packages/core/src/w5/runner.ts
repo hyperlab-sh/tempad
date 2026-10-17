@@ -7,8 +7,7 @@ import { EventStore } from "../intent/store";
 import { type AppliedSummary, applyResult } from "./apply";
 import type { Classifier } from "./classifier";
 import { describeJobFailure } from "./classifier-shared";
-import { claimNextJob, completeJob, failJob } from "./jobs";
-import { claimNextJob, completeJob, failJob, reapStaleJobs } from "./jobs";
+import { claimNextJob, claimOf, completeJob, failJob, holdsClaim, reapStaleJobs } from "./jobs";
 import { closeIdleStints, closeSessionStints } from "./lifecycle";
 import { advanceQuestions } from "./questions";
 import { buildWindow, findSessionFile } from "./window";
@@ -18,6 +17,8 @@ registerAllProjections();
 export interface RunOnceOptions {
   now?: string;
   log: (line: string) => void;
+  /** Called before each job is claimed; the runner touches its lock here. */
+  beforeJob?: () => void;
 }
 
 export interface RunOnceResult {
@@ -96,6 +97,7 @@ export async function runOnce(
   classifier: Classifier,
   options: RunOnceOptions,
 ): Promise<RunOnceResult> {
+  options.beforeJob?.();
   const now = options.now ?? new Date().toISOString();
   const reaped = reapStaleJobs(database, now);
   if (reaped.requeued + reaped.failed > 0) {
@@ -107,6 +109,8 @@ export async function runOnce(
   if (!job) return { ran: false };
 
   const store = new EventStore(database);
+  const claim = claimOf(job);
+  if (claim === null) throw new Error(`job ${job.id} was claimed without a claim time`);
 
   try {
     // The hook fires on the session's first Stop, which can be before any
@@ -159,43 +163,60 @@ export async function runOnce(
     });
 
     const result = await classifier.classify(window);
-    const summary = applyResult(store, database, window, result, {
-      actor: "hook",
-      askingEnabled: !job.forced,
-      now,
-      log: options.log,
-      mode,
-      stintMinMinutes: intentConfig.stintMinMinutes,
-    });
-
-    if (job.kind === "session_end") {
-      closeSessionStints(store, database, {
-        sessionId: job.sessionId,
+    // The classifier call above can outlast the lease (a laptop asleep mid-run
+    // looks dead to the next runner, which reaps and re-claims the job). Every
+    // event this job writes, and the job's own completion, therefore happen in
+    // one transaction that first checks this runner still holds the claim: a
+    // runner that lost it writes nothing, and events are never removable.
+    const finish = database.transaction((): AppliedSummary | null => {
+      if (!holdsClaim(database, job.id, claim)) return null;
+      const summary = applyResult(store, database, window, result, {
+        actor: "hook",
+        askingEnabled: !job.forced,
         now,
+        log: options.log,
+        mode,
         stintMinMinutes: intentConfig.stintMinMinutes,
       });
-    }
 
-    const turnsSinceLastRun = countUserMessages(database, job.sessionId, sinceTs);
-    const stintMinutes = sessionStintMinutes(database, job.sessionId, sinceTs);
-    advanceQuestions(store, database, intentConfig, {
-      sessionId: job.sessionId,
-      now,
-      turnsSinceLastRun,
-      sessionStintMinutes: stintMinutes,
-      resolvedByContext: [],
+      if (job.kind === "session_end") {
+        closeSessionStints(store, database, {
+          sessionId: job.sessionId,
+          now,
+          stintMinMinutes: intentConfig.stintMinMinutes,
+        });
+      }
+
+      const turnsSinceLastRun = countUserMessages(database, job.sessionId, sinceTs);
+      const stintMinutes = sessionStintMinutes(database, job.sessionId, sinceTs);
+      advanceQuestions(store, database, intentConfig, {
+        sessionId: job.sessionId,
+        now,
+        turnsSinceLastRun,
+        sessionStintMinutes: stintMinutes,
+        resolvedByContext: [],
+      });
+
+      const lastMessage = window.messages.at(-1);
+      // `closeSessionActivities` cleared the note for a session that just ended;
+      // writing the classifier's note back would resurrect it.
+      const sessionNote = job.kind === "session_end" ? null : result.sessionNote;
+      completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote, claim);
+      return summary;
     });
-
-    const lastMessage = window.messages.at(-1);
-    // `closeSessionActivities` cleared the note for a session that just ended;
-    // writing the classifier's note back would resurrect it.
-    const sessionNote = job.kind === "session_end" ? null : result.sessionNote;
-    completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote);
+    const summary = finish.immediate();
+    if (summary === null) {
+      options.log(
+        `w5 job ${job.id} for session ${job.sessionId} was reaped and claimed again while it ran; discarding its result`,
+      );
+      return { ran: true, sessionId: job.sessionId };
+    }
 
     return { ran: true, sessionId: job.sessionId, summary };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     failJob(database, job.id, describeJobFailure(error));
+    failJob(database, job.id, message, claim);
     options.log(`w5 run failed for session ${job.sessionId}: ${message}`);
     return { ran: true, sessionId: job.sessionId };
   }

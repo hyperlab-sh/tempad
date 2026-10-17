@@ -131,7 +131,7 @@ describe("w5 enqueue", () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
     try {
       const lockPath = join(dir, "w5.lock");
-      writeFileSync(lockPath, "12345");
+      writeFileSync(lockPath, String(Bun.spawnSync(["true"]).pid));
       const staleTime = new Date(Date.now() - 31 * 60_000);
       utimesSync(lockPath, staleTime, staleTime);
 
@@ -164,7 +164,7 @@ describe("w5 run stale lock", () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
     try {
       const lockPath = join(dir, "w5.lock");
-      writeFileSync(lockPath, "12345");
+      writeFileSync(lockPath, String(Bun.spawnSync(["true"]).pid));
       const staleTime = new Date(Date.now() - 31 * 60_000);
       utimesSync(lockPath, staleTime, staleTime);
 
@@ -183,6 +183,32 @@ describe("w5 run stale lock", () => {
 
       const logContent = await Bun.file(join(dir, "logs", "w5.log")).text();
       expect(logContent).toContain("stale");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a lock older than 30 minutes whose runner is still alive blocks the run", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    try {
+      const lockPath = join(dir, "w5.lock");
+      writeFileSync(lockPath, String(process.pid));
+      const oldTime = new Date(Date.now() - 3 * 60 * 60_000);
+      utimesSync(lockPath, oldTime, oldTime);
+
+      const spawnCalls: unknown[] = [];
+      await runW5Command(["run", "--detached"], {
+        database: openDatabase(":memory:"),
+        config: makeConfig(dir),
+        intentConfig: defaultIntentConfig(),
+        stdout: () => {},
+        spawn: (options) => {
+          spawnCalls.push(options);
+        },
+      });
+
+      expect(spawnCalls).toHaveLength(0);
+      expect(existsSync(lockPath)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

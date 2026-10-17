@@ -32,6 +32,16 @@ export const JOB_MAX_ATTEMPTS = 3;
  */
 export const JOB_MAX_REQUEUE_AGE_HOURS = 24;
 
+/**
+ * What a runner holds while it works a job: the claim time plus the attempt
+ * count, which rises on every claim, so two claims stamped with the same
+ * instant still differ.
+ */
+export interface JobClaim {
+  claimedAt: string;
+  attempts: number;
+}
+
 export interface Job {
   id: number;
   sessionId: string;
@@ -64,6 +74,10 @@ function toJob(row: JobRow): Job {
   };
 }
 
+export function claimOf(job: Job): JobClaim | null {
+  return job.claimedAt === null ? null : { claimedAt: job.claimedAt, attempts: job.attempts };
+}
+
 export function isThrottled(
   database: Database,
   sessionId: string,
@@ -78,6 +92,25 @@ export function isThrottled(
   return elapsedMinutes < throttleMinutes;
 }
 
+/**
+ * Folds a request into the session's queued job instead of adding a second row.
+ * "session_end" is monotonic: once a job is marked for session close, a later
+ * "classify" (e.g. a Stop that races behind a SessionEnd) must not downgrade it
+ * back, and `forced` only ever turns on.
+ */
+function mergeIntoQueued(
+  database: Database,
+  queued: { id: number; forced: number; kind: string },
+  request: { kind: string; forced: boolean },
+): void {
+  const nextKind = queued.kind === "session_end" ? "session_end" : request.kind;
+  if ((request.forced && queued.forced === 0) || nextKind !== queued.kind) {
+    database
+      .query("UPDATE w5_jobs SET forced = ?, kind = ? WHERE id = ?")
+      .run(request.forced ? 1 : queued.forced, nextKind, queued.id);
+  }
+}
+
 export function enqueueJob(database: Database, input: EnqueueJobInput): EnqueueJobResult {
   const now = input.now ?? new Date().toISOString();
 
@@ -88,15 +121,7 @@ export function enqueueJob(database: Database, input: EnqueueJobInput): EnqueueJ
     .get(input.sessionId) as { id: number; forced: number; kind: string } | null;
 
   if (existingQueued) {
-    // "session_end" is monotonic: once a job is marked for session close, a
-    // later "classify" (e.g. a Stop that races behind a SessionEnd) must not
-    // downgrade it back.
-    const nextKind = existingQueued.kind === "session_end" ? "session_end" : kind;
-    if ((input.forced && existingQueued.forced === 0) || nextKind !== existingQueued.kind) {
-      database
-        .query("UPDATE w5_jobs SET forced = ?, kind = ? WHERE id = ?")
-        .run(input.forced ? 1 : existingQueued.forced, nextKind, existingQueued.id);
-    }
+    mergeIntoQueued(database, existingQueued, { kind, forced: input.forced });
     return { enqueued: false, reason: "duplicate" };
   }
 
@@ -140,8 +165,17 @@ export interface ReapResult {
  * with the machine). A `running` job whose claim is older than the lease goes
  * back to `queued` for another attempt, unless it has used `JOB_MAX_ATTEMPTS`
  * or was requested more than `JOB_MAX_REQUEUE_AGE_HOURS` ago: those fail, with
- * the reason in `error`. Safe next to a live runner: only one holds `w5.lock`,
- * and a job inside its lease is never touched.
+ * the reason in `error`. A job inside its lease is never touched. A runner that
+ * was only slow, not dead (a laptop asleep mid-classify), can still be working a
+ * job reaped from under it, and `w5.lock` cannot rule that out, so ownership is
+ * the claim: `holdsClaim` is checked in the transaction that applies a result,
+ * and the reaped runner's late finish writes nothing.
+ *
+ * A requeued job whose session already has another queued row (a hook enqueued
+ * one after the crash) is failed as superseded, its `kind` and `forced` merged
+ * into that row by the rules `enqueueJob` uses, so a session never holds two.
+ * A failed job's `finished_at` is its claim time, not the reap time, so a reap
+ * does not move old failures into the recent window.
  */
 export function reapStaleJobs(
   database: Database,
@@ -157,10 +191,18 @@ export function reapStaleJobs(
   const reap = database.transaction((): ReapResult => {
     const stale = database
       .query(
-        `SELECT id, attempts, requested_at FROM w5_jobs
+        `SELECT id, session_id, kind, forced, attempts, requested_at, claimed_at FROM w5_jobs
           WHERE state = 'running' AND COALESCE(claimed_at, requested_at) <= ?`,
       )
-      .all(leaseEnds) as { id: number; attempts: number; requested_at: string }[];
+      .all(leaseEnds) as {
+      id: number;
+      session_id: string;
+      kind: string;
+      forced: number;
+      attempts: number;
+      requested_at: string;
+      claimed_at: string | null;
+    }[];
 
     const requeue = database.query(
       "UPDATE w5_jobs SET state = 'queued', claimed_at = NULL WHERE id = ?",
@@ -170,24 +212,43 @@ export function reapStaleJobs(
     );
     let requeued = 0;
     let failed = 0;
+    const queuedFor = database.query(
+      "SELECT id, forced, kind FROM w5_jobs WHERE session_id = ? AND state = 'queued'",
+    );
     for (const job of stale) {
+      const finishedAt = job.claimed_at ?? job.requested_at;
       if (job.attempts >= maxAttempts) {
         fail.run(
-          now,
+          finishedAt,
           `lease expired: the runner never finished this job in ${job.attempts} attempts`,
           job.id,
         );
         failed += 1;
       } else if (job.requested_at < oldestRequeued) {
         fail.run(
-          now,
+          finishedAt,
           `lease expired: the runner never finished this job and it is too old to classify live; tempad w5 backfill covers its session`,
           job.id,
         );
         failed += 1;
       } else {
-        requeue.run(job.id);
-        requeued += 1;
+        const queued = queuedFor.get(job.session_id) as {
+          id: number;
+          forced: number;
+          kind: string;
+        } | null;
+        if (queued) {
+          mergeIntoQueued(database, queued, { kind: job.kind, forced: job.forced === 1 });
+          fail.run(
+            finishedAt,
+            `lease expired: superseded by queued job ${queued.id} for the same session`,
+            job.id,
+          );
+          failed += 1;
+        } else {
+          requeue.run(job.id);
+          requeued += 1;
+        }
       }
     }
     return { requeued, failed };
@@ -214,17 +275,39 @@ export function writeSessionNote(
     .run(sessionId, now, sessionNote);
 }
 
+/**
+ * True while `claim` is still the claim on a running job: the job was not
+ * reaped and re-claimed (a different `claimed_at` or `attempts`) and not
+ * settled by anyone else.
+ */
+export function holdsClaim(database: Database, id: number, claim: JobClaim): boolean {
+  return (
+    database
+      .query(
+        "SELECT 1 FROM w5_jobs WHERE id = ? AND state = 'running' AND claimed_at = ? AND attempts = ?",
+      )
+      .get(id, claim.claimedAt, claim.attempts) !== null
+  );
+}
+
+/**
+ * Marks the job done. With a `claim`, writes nothing and returns false unless
+ * the caller still holds it (see `holdsClaim`); callers that applied a result
+ * do both in one transaction, so a reaped runner discards the result too.
+ */
 export function completeJob(
   database: Database,
   id: number,
   lastMessageTs: string | null,
   now?: string,
   sessionNote?: string | null,
-): void {
+  claim?: JobClaim,
+): boolean {
   const job = database.query("SELECT session_id FROM w5_jobs WHERE id = ?").get(id) as {
     session_id: string;
   } | null;
-  if (!job) return;
+  if (!job) return false;
+  if (claim && !holdsClaim(database, id, claim)) return false;
 
   const finishedAt = now ?? new Date().toISOString();
 
@@ -240,11 +323,15 @@ export function completeJob(
                                              session_note = excluded.session_note`,
     )
     .run(job.session_id, finishedAt, lastMessageTs, sessionNote ?? null);
+  return true;
 }
 
-export function failJob(database: Database, id: number, error: string): void {
+/** Marks the job failed; with a `claim`, only while the caller still holds it. */
+export function failJob(database: Database, id: number, error: string, claim?: JobClaim): boolean {
+  if (claim && !holdsClaim(database, id, claim)) return false;
   const now = new Date().toISOString();
   database
     .query("UPDATE w5_jobs SET state = 'failed', finished_at = ?, error = ? WHERE id = ?")
     .run(now, error, id);
+  return true;
 }

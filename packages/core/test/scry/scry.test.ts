@@ -9,6 +9,7 @@ import { setSyncState } from "../../src/db/sync-state";
 import { declareQuest } from "../../src/intent/declarations";
 import { EventStore } from "../../src/intent/store";
 import { runScryCommand } from "../../src/scry/cli";
+import { RECOMMENDATION_ORDER } from "../../src/scry/collect";
 import type { Check, ScryReport } from "../../src/scry/types";
 import { enableMirrorSync } from "../../src/sync/triggers";
 import {
@@ -1150,5 +1151,30 @@ describe("--days range and database errors", () => {
     } finally {
       Database.prototype.query = original;
     }
+  });
+});
+
+describe("recommendation order", () => {
+  test("every recommendation id the report can emit has a rank", () => {
+    const emitted = new Set<string>();
+    for (const file of ["collect.ts", "cli.ts"]) {
+      const source = readFileSync(join(import.meta.dir, "../../src/scry", file), "utf8");
+      // Recommendations are `id: "<slug>"` object literals; checks use `name`.
+      for (const match of source.matchAll(/\bid: "([a-z][a-z-]*)"/g)) {
+        emitted.add(match[1] as string);
+      }
+    }
+    // `config` is a check id in cli.ts, not a recommendation.
+    emitted.delete("config");
+
+    expect(emitted.size).toBeGreaterThan(10);
+    expect([...emitted].filter((id) => !RECOMMENDATION_ORDER.includes(id))).toEqual([]);
+  });
+
+  test("reaping stuck jobs ranks before the backfill", () => {
+    expect(RECOMMENDATION_ORDER.indexOf("w5-reap")).toBeGreaterThan(-1);
+    expect(RECOMMENDATION_ORDER.indexOf("w5-reap")).toBeLessThan(
+      RECOMMENDATION_ORDER.indexOf("backfill"),
+    );
   });
 });

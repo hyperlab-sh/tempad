@@ -175,7 +175,8 @@ CREATE TABLE w5_jobs (
   claimed_at   TEXT,
   finished_at  TEXT,
   state        TEXT NOT NULL DEFAULT 'queued',
-  error        TEXT
+  error        TEXT,
+  attempts     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE w5_runs (

@@ -46,12 +46,13 @@ const EVAL_WINDOW_DAYS = 7;
 const SOURCES = ["monday", "github", "claude"] as const;
 
 /** Order of the recommendations: repair the data, collect, classify, sync, then what waits for a human. */
-const RECOMMENDATION_ORDER = [
+export const RECOMMENDATION_ORDER = [
   "migrate",
   "rebuild",
   "first-sync",
   "collect",
   "w5-unknown-session",
+  "w5-reap",
   "backfill",
   "sync-first",
   "sync-reseed",

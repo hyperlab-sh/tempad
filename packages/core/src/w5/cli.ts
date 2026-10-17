@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, mkdirSync, openSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { childEnvironment } from "../config/child-env";
@@ -37,6 +37,7 @@ import {
   uninstallHooks,
 } from "./hooks";
 import { enqueueJob } from "./jobs";
+import { clearStaleLock, touchLock } from "./lock";
 import type { QuestionRow } from "./questions";
 import { drain } from "./runner";
 
@@ -216,21 +217,6 @@ function runContext(args: string[], context: W5Context): number {
   return 0;
 }
 
-const STALE_LOCK_MINUTES = 30;
-
-function clearStaleLock(lockPath: string, log: (line: string) => void): void {
-  if (!existsSync(lockPath)) return;
-  const ageMinutes = (Date.now() - statSync(lockPath).mtimeMs) / 60_000;
-  if (ageMinutes >= STALE_LOCK_MINUTES) {
-    log(`w5.lock is stale (${Math.round(ageMinutes)}m old), removing`);
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      // already gone
-    }
-  }
-}
-
 async function runRun(args: string[], context: W5Context): Promise<number> {
   const { values } = parseArgs({
     args,
@@ -261,6 +247,7 @@ async function runRun(args: string[], context: W5Context): Promise<number> {
       classifier,
       {
         log: (line) => log(context.config, line),
+        beforeJob: () => touchLock(lockPath),
       },
     );
     context.stdout(`w5: ran ${count} job(s)`);

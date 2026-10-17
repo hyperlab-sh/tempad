@@ -805,7 +805,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       old.exec("INSERT INTO sync_meta (key, value) VALUES ('server_id', 'S1')");
       old.close();
 
-      // 23 fails if it runs twice, so re-running what the other process
+      // 24 fails if it runs twice, so re-running what the other process
       // already applied would throw (CREATE TABLE, not ADD COLUMN, which
       // runMigration tolerates as a duplicate).
       const chain = [
@@ -813,7 +813,7 @@ describe("migrations from 22 on apply as one transaction", () => {
         { version: 24, sql: "CREATE TABLE t23 (x);" },
         { version: 25, sql: "CREATE TABLE t24 (x);" },
       ];
-      // Another process got 22 and 23 in after this one read user_version 21.
+      // Another process got 22 through 24 in after this one read user_version 21.
       const load = spyOn(migrationFiles, "loadMigrations").mockImplementation(() => {
         load.mockImplementation(() => chain);
         openDatabase(path, { hostSlug: "host-a", upToVersion: 24 }).close();
@@ -826,7 +826,7 @@ describe("migrations from 22 on apply as one transaction", () => {
       try {
         const upgraded = openDatabase(path, { hostSlug: "host-a" });
         expect(userVersion(upgraded)).toBe(25);
-        // Once at the end of the other process's 22..23, once here after 24.
+        // Once at the end of the other process's 22..24, once here after 25.
         expect(reconcile).toHaveBeenCalledTimes(2);
         expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
         expect(
