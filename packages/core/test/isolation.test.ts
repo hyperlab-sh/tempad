@@ -12,8 +12,14 @@ describe("test environment isolation", () => {
   });
 
   test("no user-scoped variable survives into the test process", () => {
-    const leaked = USER_SCOPED_VARIABLES.filter((name) => process.env[name] !== undefined);
+    const leaked = USER_SCOPED_VARIABLES.filter(
+      (name) => name !== "TEMPAD_HOME" && process.env[name] !== undefined,
+    );
     expect(leaked).toEqual([]);
+  });
+
+  test("TEMPAD_HOME points inside the throwaway HOME, never at the real one", () => {
+    expect(process.env.TEMPAD_HOME).toBe(`${process.env.HOME}/.tempad`);
   });
 
   test("git ignores the developer's global and system config", async () => {

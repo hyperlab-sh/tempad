@@ -39,8 +39,15 @@ export const PINNED_VARIABLES: Readonly<Record<string, string>> = {
 /**
  * Points this process at a throwaway HOME and removes every user-scoped variable, so a test
  * that installs a skill or hook, or opens `TEMPAD_HOME`, can only ever write under a temporary
- * directory, whatever the developer exported. Subprocesses spawned with `...process.env`
- * inherit it. Returns a function that restores the environment and deletes the directory.
+ * directory, whatever the developer exported. `TEMPAD_HOME` is set to `<home>/.tempad`, not
+ * removed: `tempadHome()` falls back to `os.homedir()`, which Bun freezes at startup to the real
+ * home. A test that needs it unset deletes it itself.
+ *
+ * A subprocess only sees this when the test passes `env` explicitly (`env: process.env`, or a
+ * spread of it): `Bun.spawn`, `Bun.spawnSync` and `child_process` called without `env` hand the
+ * child the environment the run was started with. The one exception is `sync/sqld.integration`'s
+ * `docker` and `ssh` calls, which must keep the developer's HOME to find the docker context and
+ * ssh keys; they write nothing. Returns a function that restores the environment and deletes the directory.
  * `test/preload.ts` calls this once per `bun test` run, before any test file loads.
  */
 export function isolateProcessEnvironment(): () => void {
@@ -52,6 +59,7 @@ export function isolateProcessEnvironment(): () => void {
   for (const name of USER_SCOPED_VARIABLES) delete process.env[name];
   Object.assign(process.env, PINNED_VARIABLES);
   process.env.HOME = home;
+  process.env.TEMPAD_HOME = join(home, ".tempad");
   return () => {
     for (const [name, value] of saved) {
       if (value === undefined) delete process.env[name];
