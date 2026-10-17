@@ -1087,7 +1087,7 @@ describe("w5 run / eval without the fields they need", () => {
  */
 function runHookCommand(
   args: string[],
-  options: { configDir?: string; home?: string } = {},
+  options: { configDir?: string; home?: string; realGuard?: boolean } = {},
 ): {
   code: number;
   out: string[];
@@ -1110,9 +1110,15 @@ function runHookCommand(
       // which is wherever this checkout is, and a checkout under /tmp (a CI or review clone)
       // would refuse every install these tests expect to succeed.
       () =>
-        runW5HookCommand(args, {
-          hasUnstableInstall: (binary) => binary !== undefined && isUnstableInstallPath(binary),
-        }),
+        runW5HookCommand(
+          args,
+          options.realGuard
+            ? undefined
+            : {
+                hasUnstableInstall: (binary) =>
+                  binary !== undefined && isUnstableInstallPath(binary),
+              },
+        ),
     );
     return { code, out, err, home, settingsPath };
   } finally {
@@ -1132,6 +1138,27 @@ describe("w5 hook install", () => {
       expect(code).toBe(0);
       expect(existsSync(settingsPath)).toBe(true);
       expect(out).toContain(PLUGIN_RECOMMENDATION_MESSAGE);
+    } finally {
+      rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
+    }
+  });
+
+  test("the production guard refuses a bunx binary with no seam given, wherever this checkout lives", () => {
+    // `realGuard` passes no options at all, so `runW5HookCommand` uses `hasUnstableInstall`.
+    // A bunx path is unstable on any machine, so this holds for a checkout under /tmp too.
+    const { code, out, err, settingsPath } = runHookCommand(
+      [
+        "install",
+        "--bin",
+        "/home/me/cache/bunx-501-@hyperlab.sh/tempad@0.1.0/node_modules/@hyperlab.sh/tempad/src/cli.ts",
+      ],
+      { realGuard: true },
+    );
+    try {
+      expect(code).toBe(1);
+      expect(err).toContain(UNSTABLE_INSTALL_MESSAGE);
+      expect(out).not.toContain(PLUGIN_RECOMMENDATION_MESSAGE);
+      expect(existsSync(settingsPath)).toBe(false);
     } finally {
       rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
     }
