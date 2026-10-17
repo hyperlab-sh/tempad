@@ -27,10 +27,14 @@ import {
   settingsPathFor,
 } from "../../src/w5/cli";
 import {
+  hasUnstableInstall,
   isUnstableInstallPath,
   PLUGIN_RECOMMENDATION_MESSAGE,
+  promptHookScriptPath,
+  stopHookScriptPath,
   UNSTABLE_INSTALL_MESSAGE,
 } from "../../src/w5/hooks";
+import { withEnvironment } from "../isolation";
 
 registerAllProjections();
 
@@ -1093,25 +1097,27 @@ function runHookCommand(
 } {
   const home = options.home ?? mkdtempSync(join(tmpdir(), "tempad-hook-cli-"));
   const settingsPath = join(home, ".claude", "settings.json");
-  const saved = { HOME: process.env.HOME, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
   const savedLog = console.log;
   const savedError = console.error;
   const out: string[] = [];
   const err: string[] = [];
-  process.env.HOME = home;
-  if (options.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-  else process.env.CLAUDE_CONFIG_DIR = options.configDir;
   console.log = (...parts: unknown[]) => out.push(parts.join(" "));
   console.error = (...parts: unknown[]) => err.push(parts.join(" "));
   try {
-    return { code: runW5HookCommand(args), out, err, home, settingsPath };
+    const code = withEnvironment(
+      { HOME: home, CLAUDE_CONFIG_DIR: options.configDir ?? null },
+      // Judge only the `--bin` path: the real guard also looks at where the hook scripts live,
+      // which is wherever this checkout is, and a checkout under /tmp (a CI or review clone)
+      // would refuse every install these tests expect to succeed.
+      () =>
+        runW5HookCommand(args, {
+          hasUnstableInstall: (binary) => binary !== undefined && isUnstableInstallPath(binary),
+        }),
+    );
+    return { code, out, err, home, settingsPath };
   } finally {
     console.log = savedLog;
     console.error = savedError;
-    for (const [name, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[name];
-      else process.env[name] = value;
-    }
   }
 }
 
@@ -1172,6 +1178,15 @@ describe("w5 hook install", () => {
     } finally {
       rmSync(join(settingsPath, "..", ".."), { recursive: true, force: true });
     }
+  });
+});
+
+describe("hasUnstableInstall", () => {
+  test("judges the binary and both hook scripts, wherever this checkout lives", () => {
+    const scriptsUnstable =
+      isUnstableInstallPath(stopHookScriptPath()) || isUnstableInstallPath(promptHookScriptPath());
+    expect(hasUnstableInstall("/opt/tempad/src/cli.ts")).toBe(scriptsUnstable);
+    expect(hasUnstableInstall("/var/folders/ab/xyz/T/bunx-501-tempad@0.1.0/src/cli.ts")).toBe(true);
   });
 });
 
