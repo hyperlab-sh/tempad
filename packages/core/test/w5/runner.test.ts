@@ -243,6 +243,58 @@ describe("runOnce", () => {
     }
   });
 
+  test("records the completion time, not the run's start, as finished_at", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        clock: () => "2026-09-04T15:21:07.250Z",
+        log: () => {},
+      });
+
+      expect(database.query("SELECT state, claimed_at, finished_at FROM w5_jobs").get()).toEqual({
+        state: "done",
+        claimed_at: "2026-09-04T15:21:00.000Z",
+        finished_at: "2026-09-04T15:21:07.250Z",
+      });
+      // Throttling measures from the start of the run, as before.
+      expect(database.query("SELECT last_run_at FROM w5_runs").get()).toEqual({
+        last_run_at: "2026-09-04T15:21:00.000Z",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("records the failure time, not the run's start, as finished_at of a failed job", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    enqueueJob(database, { sessionId: "ghost", forced: true, throttleMinutes: 10 });
+
+    await runOnce(
+      database,
+      makeConfig("/tmp/tempad-no-such-dir"),
+      config,
+      new FakeClassifier(good),
+      {
+        now: "2026-09-04T15:21:00.000Z",
+        clock: () => "2026-09-04T15:21:02.000Z",
+        log: () => {},
+      },
+    );
+
+    expect(database.query("SELECT state, claimed_at, finished_at FROM w5_jobs").get()).toEqual({
+      state: "failed",
+      claimed_at: "2026-09-04T15:21:00.000Z",
+      finished_at: "2026-09-04T15:21:02.000Z",
+    });
+  });
+
   test("returns ran: false when there is no job", async () => {
     const database = openDatabase(":memory:");
     seedHero(database);

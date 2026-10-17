@@ -22,6 +22,8 @@ class LostClaimError extends Error {
 
 export interface RunOnceOptions {
   now?: string;
+  /** Wall clock read when a job settles (`w5_jobs.finished_at`); injected by tests, `now` is the run's start. */
+  clock?: () => string;
   log: (line: string) => void;
   /** Called before each job is claimed; the runner touches its lock here. */
   beforeJob?: () => void;
@@ -105,6 +107,7 @@ export async function runOnce(
 ): Promise<RunOnceResult> {
   options.beforeJob?.();
   const now = options.now ?? new Date().toISOString();
+  const clock = options.clock ?? (() => new Date().toISOString());
   const reaped = reapStaleJobs(database, now);
   if (reaped.requeued + reaped.failed > 0) {
     options.log(
@@ -219,7 +222,9 @@ export async function runOnce(
       const sessionNote = job.kind === "session_end" ? null : result.sessionNote;
       // The claim was checked above in this same transaction, so this cannot
       // fail; if it ever does, throwing rolls back every event applied here.
-      if (!completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote, claim)) {
+      if (
+        !completeJob(database, job.id, lastMessage?.ts ?? sinceTs, now, sessionNote, claim, clock())
+      ) {
         throw new LostClaimError();
       }
       return summary;
@@ -238,7 +243,7 @@ export async function runOnce(
     // `failJob` settles the job only while this runner still holds the claim; if
     // it does not, the failure belongs to a claim that is no longer ours and
     // another runner owns the job, so say that instead of reporting a failed run.
-    if (!failJob(database, job.id, describeJobFailure(error), claim)) {
+    if (!failJob(database, job.id, describeJobFailure(error), claim, clock())) {
       options.log(
         `w5 job ${job.id} for session ${job.sessionId} lost its claim before it could be marked failed (${message}); leaving it to the runner that holds it`,
       );

@@ -117,6 +117,61 @@ describe("w5 jobs", () => {
     expect(isThrottled(database, "s4", "2026-09-05T10:05:00.000Z", 10)).toBe(true);
   });
 
+  test("completeJob and failJob stamp finished_at with finishedAt, completeJob keeps now for last_run_at", () => {
+    const database = openDatabase(":memory:");
+    for (const sessionId of ["s-done", "s-failed"]) {
+      enqueueJob(database, {
+        sessionId,
+        forced: true,
+        now: "2026-09-05T10:00:00.000Z",
+        throttleMinutes: 10,
+      });
+    }
+    const done = claimNextJob(database, "2026-09-05T10:00:00.000Z");
+    const failed = claimNextJob(database, "2026-09-05T10:00:00.000Z");
+    const claim = (job: typeof done) => ({
+      claimedAt: job?.claimedAt ?? "",
+      attempts: job?.attempts ?? 0,
+    });
+
+    expect(
+      completeJob(
+        database,
+        done?.id ?? 0,
+        null,
+        "2026-09-05T10:00:00.000Z",
+        null,
+        claim(done),
+        "2026-09-05T10:00:42.000Z",
+      ),
+    ).toBe(true);
+    expect(
+      failJob(database, failed?.id ?? 0, "boom", claim(failed), "2026-09-05T10:00:09.000Z"),
+    ).toBe(true);
+
+    expect(
+      database
+        .query("SELECT session_id, state, claimed_at, finished_at FROM w5_jobs ORDER BY id")
+        .all(),
+    ).toEqual([
+      {
+        session_id: "s-done",
+        state: "done",
+        claimed_at: "2026-09-05T10:00:00.000Z",
+        finished_at: "2026-09-05T10:00:42.000Z",
+      },
+      {
+        session_id: "s-failed",
+        state: "failed",
+        claimed_at: "2026-09-05T10:00:00.000Z",
+        finished_at: "2026-09-05T10:00:09.000Z",
+      },
+    ]);
+    expect(
+      database.query("SELECT last_run_at FROM w5_runs WHERE session_id = 's-done'").get(),
+    ).toEqual({ last_run_at: "2026-09-05T10:00:00.000Z" });
+  });
+
   test("completeJob defaults now to the current time when omitted", () => {
     const database = openDatabase(":memory:");
     enqueueJob(database, {
