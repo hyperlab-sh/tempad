@@ -356,3 +356,124 @@ project = "njhcqi"
     expect(() => loadRules(path)).toThrow();
   });
 });
+
+describe("loadRules wrong-typed values", () => {
+  function load(toml: string) {
+    const path = writeToml(toml);
+    const warnings: string[] = [];
+    const rules = loadRules(path, (message) => warnings.push(message));
+    return { rules, warnings, path };
+  }
+
+  test("a name of the wrong type is ignored with a warning naming the file, on both rule kinds", () => {
+    const { rules, warnings, path } = load(`
+[[projects]]
+path = "/tmp/tempad-name-a"
+org = "a"
+project = "a"
+name = 5
+
+[[projects]]
+pattern = "/tmp/tempad-name-b/:rest*"
+org = "b"
+project = "b"
+name = ["x"]
+
+[[projects]]
+path = "/tmp/tempad-name-c"
+org = "c"
+project = "c"
+name = "Fine"
+`);
+    expect(rules.projects.map((rule) => rule.name)).toEqual([null, null, "Fine"]);
+    expect(warnings).toEqual([
+      `${path}: projects entry at index 0: "name" must be a string, got 5 (a number); ignoring it. Fix the value.`,
+      `${path}: projects entry at index 1: "name" must be a string, got ["x"] (an array); ignoring it. Fix the value.`,
+    ]);
+  });
+
+  test("an absent or string name warns about nothing", () => {
+    expect(
+      load('[[projects]]\npath = "/tmp/tempad-name-d"\norg = "d"\nproject = "d"\nname = "D"\n')
+        .warnings,
+    ).toEqual([]);
+    expect(
+      load('[[projects]]\npath = "/tmp/tempad-name-e"\norg = "e"\nproject = "e"\n').warnings,
+    ).toEqual([]);
+  });
+
+  test("a path rule with a non-string path, org or project is an error, not a stored number", () => {
+    expect(() => load('[[projects]]\npath = 5\norg = "o"\nproject = "p"\n')).toThrow(
+      'projects entry at index 0: "path" must be a string, got 5 (a number)',
+    );
+    expect(() => load('[[projects]]\npath = "/tmp/x"\norg = 5\nproject = "p"\n')).toThrow(
+      'projects entry at index 0: "org" must be a string, got 5 (a number)',
+    );
+    expect(() => load('[[projects]]\npath = "/tmp/x"\norg = "o"\nproject = true\n')).toThrow(
+      'projects entry at index 0: "project" must be a string, got true (a boolean)',
+    );
+  });
+
+  test("a pattern rule with a non-string pattern is an error", () => {
+    expect(() => load('[[projects]]\npattern = 5\norg = "o"\nproject = "p"\n')).toThrow(
+      'projects entry at index 0: "pattern" must be a string, got 5 (a number)',
+    );
+  });
+
+  test("a pattern rule's optional org or project of the wrong type warns and falls back to the named group", () => {
+    const { rules, warnings, path } = load(
+      '[[projects]]\npattern = "/tmp/tempad-groups/:org/:project/:rest*"\norg = 5\nproject = [1]\n',
+    );
+    expect(warnings).toEqual([
+      `${path}: projects entry at index 0: "org" must be a string, got 5 (a number); ignoring it. Fix the value.`,
+      `${path}: projects entry at index 0: "project" must be a string, got [1] (an array); ignoring it. Fix the value.`,
+    ]);
+    expect(resolvePath(rules, "/tmp/tempad-groups/acme/widgets/src")).toMatchObject({
+      org: "acme",
+      project: "widgets",
+    });
+  });
+
+  test("a wrong-typed org on a pattern rule with no group to supply it is the existing error", () => {
+    expect(() =>
+      load('[[projects]]\npattern = "/tmp/tempad-none/:project"\norg = 5\nproject = "p"\n'),
+    ).toThrow('cannot supply "org"');
+  });
+
+  test("an empty path or pattern is an error", () => {
+    expect(() => load('[[projects]]\npath = ""\norg = "o"\nproject = "p"\n')).toThrow(
+      'has an empty "path"',
+    );
+    expect(() => load('[[projects]]\npattern = ""\norg = "o"\nproject = "p"\n')).toThrow(
+      'has an empty "pattern"',
+    );
+  });
+
+  test("projects, repositories and boards must be arrays of tables", () => {
+    expect(() => load('[projects]\npath = "/tmp/x"\n')).toThrow(
+      "projects must be an array of tables ([[projects]]), got",
+    );
+    expect(() => load("projects = 5\n")).toThrow("got 5 (a number)");
+    expect(() => load('[repositories]\nfull_name = "a/b"\n')).toThrow(
+      "repositories must be an array of tables",
+    );
+    expect(() => load('[boards]\nname = "b"\n')).toThrow("boards must be an array of tables");
+    expect(() => load("projects = [1]\n")).toThrow(
+      "projects entry at index 0 must be a table, got 1 (a number)",
+    );
+    expect(() => load("repositories = [1]\n")).toThrow(
+      "repositories entry at index 0 must be a table, got 1 (a number)",
+    );
+  });
+
+  test("a wrong-typed value never reaches the compiled rule", () => {
+    const { rules } = load(
+      '[[projects]]\npath = "/tmp/tempad-typed"\norg = "o"\nproject = "p"\nname = 7\n',
+    );
+    for (const rule of rules.projects) {
+      expect(typeof rule.org).toBe("string");
+      expect(typeof rule.project).toBe("string");
+      expect(rule.name === null || typeof rule.name === "string").toBe(true);
+    }
+  });
+});

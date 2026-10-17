@@ -58,7 +58,7 @@ describe("release: package.json is publishable", () => {
   });
 
   test("requires the bun version the tool is tested on", () => {
-    expect(manifest.engines.bun).toBe(">=1.3.14");
+    expect(manifest.engines.bun).toBe(">=1.4.2");
   });
 
   test("the bin points at an executable file with a bun shebang", () => {

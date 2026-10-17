@@ -57,7 +57,7 @@ Sagas, quests and stints come from the `w5` hook and the `quest` skill (see [Dec
 
 ## Install
 
-Requires [Bun](https://bun.sh) 1.3.14 or newer and [Claude Code](https://claude.com/claude-code). The [GitHub CLI](https://cli.github.com) (`gh`) is optional: without a `GH_TOKEN`, GitHub sync uses its credentials.
+Requires [Bun](https://bun.sh) 1.4.2 or newer and [Claude Code](https://claude.com/claude-code). The [GitHub CLI](https://cli.github.com) (`gh`) is optional: without a `GH_TOKEN`, GitHub sync uses its credentials.
 
 1. **Add the marketplace:**
 
@@ -288,7 +288,7 @@ bun test
 bun run fmt:check   # biome + dprint; `bun run fmt` fixes
 ```
 
-Tooling: [moon](https://moonrepo.dev) orchestrates tasks, [Biome](https://biomejs.dev) lints and formats JS/TS/JSON, [dprint](https://dprint.dev) formats Markdown, TOML and YAML. Bun is pinned to 1.3.14 in `.prototools`.
+Tooling: [moon](https://moonrepo.dev) orchestrates tasks, [Biome](https://biomejs.dev) lints and formats JS/TS/JSON, [dprint](https://dprint.dev) formats Markdown, TOML and YAML. Bun is pinned to 1.4.2 in `.prototools`.
 
 To try the packed package the way users get it: `cd packages/core && bun pm pack`, then `bun add <tarball>` in an empty directory.
 

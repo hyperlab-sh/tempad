@@ -3,6 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, tempadHome } from "../config/env";
+import { loadRules } from "../config/rules";
 import { defaultIntentConfig, loadIntentConfig } from "../intent/config";
 import { isSyncEnabled, loadSyncConfig, SyncConfigError } from "../sync/config";
 import { scry } from "./collect";
@@ -99,9 +100,22 @@ export function runScryCommand(args: string[], options: ScryCommandOptions = {})
   const priorChecks: Check[] = [];
 
   const warnings: string[] = [];
+  let renamedKeys = 0;
+  let wrongTypes = 0;
   let intentConfig = defaultIntentConfig();
+  const tomlPath = join(home, "tempad.toml");
   try {
-    intentConfig = loadIntentConfig(join(home, "tempad.toml"), (message) => warnings.push(message));
+    intentConfig = loadIntentConfig(tomlPath, (message, kind) => {
+      warnings.push(message);
+      if (kind === "renamed-key") renamedKeys += 1;
+      else wrongTypes += 1;
+    });
+    // The `[[projects]]` rules are read by the collectors, not by `loadIntentConfig`; a bad one
+    // there throws (a failed check) or warns (a wrong-typed `name`, counted as a wrong type).
+    loadRules(tomlPath, (message) => {
+      warnings.push(message);
+      wrongTypes += 1;
+    });
   } catch (error) {
     priorChecks.push(
       failure(
@@ -128,7 +142,13 @@ export function runScryCommand(args: string[], options: ScryCommandOptions = {})
       status: warnings.length > 0 ? "warn" : "ok",
       summary:
         warnings.length > 0
-          ? `${warnings.length} deprecated setting(s) in tempad.toml`
+          ? [
+              wrongTypes > 0 ? `${wrongTypes} setting(s) of the wrong type (default used)` : null,
+              renamedKeys > 0 ? `${renamedKeys} deprecated setting(s)` : null,
+            ]
+              .filter((part) => part !== null)
+              .join(", ")
+              .concat(" in tempad.toml")
           : "tempad.toml reads cleanly",
       details: warnings,
     });

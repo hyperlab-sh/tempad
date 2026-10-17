@@ -2,7 +2,7 @@
 
 Reconstructs your work history, hour by hour, from git, Monday.com and Claude Code sessions into SQLite, then generates timesheet reports.
 
-Runs on [Bun](https://bun.sh) 1.3.14 or newer.
+Runs on [Bun](https://bun.sh) 1.4.2 or newer.
 
 Install the Claude Code plugin, then run `/tempad:setup` inside Claude Code:
 

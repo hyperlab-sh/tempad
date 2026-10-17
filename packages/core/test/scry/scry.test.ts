@@ -757,18 +757,50 @@ describe("schema", () => {
 });
 
 describe("read-only", () => {
-  test("leaves the database file byte for byte as it was and creates no files", async () => {
+  test("leaves the database file and its sidecars as they were and creates no file but empty reader sidecars", async () => {
     const home = track(
       await makeHealthyHome({ toml: '[sync]\nurl = "libsql://example.invalid"\n' }),
     );
+    // Move everything the fixture's writer left in the `-wal` into the main file first, so the main
+    // file holds the data and a write by scry would show up as a change (Bun 1.3.14 on macOS left
+    // 1.47 MB in the `-wal` and 4 KB in the main file).
+    home.database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     home.database.close();
     home.database = openDatabase(":memory:");
-    const digest = () => createHash("sha256").update(readFileSync(home.databasePath)).digest("hex");
-    const entries = () => readdirSync(home.directory).sort();
-    const before = { digest: digest(), entries: entries() };
+    const snapshot = () =>
+      Object.fromEntries(
+        readdirSync(home.directory)
+          .sort()
+          .map((name) => {
+            const bytes = readFileSync(join(home.directory, name));
+            return [
+              name,
+              { size: bytes.length, digest: createHash("sha256").update(bytes).digest("hex") },
+            ];
+          }),
+      );
+    // Which sidecars exist before scry runs depends on the platform and Bun version: macOS 1.4.2
+    // leaves an empty `-wal` and a 32 KB `-shm`, Linux 1.4.2 removes both on the writer's close.
+    // A readonly connection opens them like any reader and cannot remove them, so a sidecar that
+    // appears is not a file scry made; one that appears must be an empty `-wal` or the `-shm`.
+    const before = snapshot();
 
     for (const flags of [[], ["--fast"], ["--days", "3"]]) scryJson(home, ...flags);
-    expect({ digest: digest(), entries: entries() }).toEqual(before);
+    const after = snapshot();
+
+    // The `-shm` is the readers' shared-memory index (read marks live in it), so every reader
+    // changes its bytes; only its size is stable. The main file and the `-wal` must be identical.
+    for (const [name, state] of Object.entries(before)) {
+      const now = after[name];
+      expect({ name, size: now?.size }).toEqual({ name, size: state.size });
+      if (!name.endsWith(".db-shm"))
+        expect({ name, digest: now?.digest }).toEqual({ name, digest: state.digest });
+    }
+    for (const name of Object.keys(after)) {
+      if (name in before) continue;
+      expect(name).toMatch(/\.db-(shm|wal)$/);
+      if (name.endsWith(".db-wal")) expect(after[name]?.size).toBe(0);
+    }
 
     const reopened = new Database(home.databasePath, { readonly: true });
     expect(
@@ -916,8 +948,8 @@ describe("sync", () => {
 
 describe("config", () => {
   test("an unreadable tempad.toml fails the config check", () => {
-    // Not `[w5\nbroken`: Bun 1.3.14's parser accepts that as `{ w5: {} }` (1.4 throws), so it only
-    // failed on a newer Bun. A doubled `=` is rejected by every version.
+    // Not `[w5\nbroken`: Bun 1.3.14's parser accepted that as `{ w5: {} }`. A doubled `=` is
+    // malformed whatever the version.
     const home = track(makeHome({ toml: "[w5]\nmodel = = 1\n" }));
     const { code, report } = scryJson(home);
     expect(code).toBe(1);
@@ -931,6 +963,76 @@ describe("config", () => {
     const config = checkOf(report, "config");
     expect(config.status).toBe("warn");
     expect(config.details[0]).toContain("memory_stints");
+    expect(config.summary).toBe("1 deprecated setting(s) in tempad.toml");
+  });
+
+  test("a [w5] key of the wrong type warns with the key, the expected type and the value", () => {
+    const home = track(
+      makeHome({ toml: '[w5]\nstint_idle_minutes = "abc"\ninference_fallback = 1\n' }),
+    );
+    const { code, report } = scryJson(home);
+    expect(code).toBe(0);
+    const config = checkOf(report, "config");
+    expect(config.status).toBe("warn");
+    expect(config.summary).toBe("2 setting(s) of the wrong type (default used) in tempad.toml");
+    const toml = join(home.directory, "tempad.toml");
+    expect(config.details).toEqual([
+      `${toml}: [w5].stint_idle_minutes must be a number, 0 or more, got "abc" (a string); using the default 45. Fix the value.`,
+      `${toml}: [w5].inference_fallback must be true or false, got 1 (a number); using the default true. Fix the value.`,
+    ]);
+    // the run itself carries on with the defaults
+    expect(report.ok).toBe(true);
+  });
+
+  test("a wrong type and a legacy key are both counted in the summary", () => {
+    const home = track(makeHome({ toml: '[w5]\nmemory_activities = 4\nwatch_turns = "x"\n' }));
+    const { report } = scryJson(home);
+    expect(checkOf(report, "config").summary).toBe(
+      "1 setting(s) of the wrong type (default used), 1 deprecated setting(s) in tempad.toml",
+    );
+  });
+
+  test("a [[projects]] name of the wrong type warns, as the collectors would read it", () => {
+    const home = track(
+      makeHome({
+        toml: '[[projects]]\npath = "/tmp/scry-rules"\norg = "o"\nproject = "p"\nname = 5\n',
+      }),
+    );
+    const { code, report } = scryJson(home);
+    expect(code).toBe(0);
+    const config = checkOf(report, "config");
+    expect(config.status).toBe("warn");
+    expect(config.summary).toBe("1 setting(s) of the wrong type (default used) in tempad.toml");
+    expect(config.details).toEqual([
+      `${join(home.directory, "tempad.toml")}: projects entry at index 0: "name" must be a string, got 5 (a number); ignoring it. Fix the value.`,
+    ]);
+  });
+
+  test("a [[projects]] rule the collectors would reject fails the config check", () => {
+    const home = track(makeHome({ toml: '[[projects]]\npath = 5\norg = "o"\nproject = "p"\n' }));
+    const { code, report } = scryJson(home);
+    expect(code).toBe(1);
+    const config = checkOf(report, "config");
+    expect(config.status).toBe("fail");
+    expect(config.summary).toContain(
+      'projects entry at index 0: "path" must be a string, got 5 (a number)',
+    );
+  });
+
+  test("a valid [[projects]] rule reads cleanly", () => {
+    const home = track(
+      makeHome({
+        toml: '[[projects]]\npath = "/tmp/scry-rules"\norg = "o"\nproject = "p"\nname = "P"\n',
+      }),
+    );
+    const { report } = scryJson(home);
+    expect(checkOf(report, "config").status).toBe("ok");
+  });
+
+  test("a clean tempad.toml still reads cleanly", () => {
+    const home = track(makeHome({ toml: "[w5]\nstint_idle_minutes = 30\n" }));
+    const { report } = scryJson(home);
+    expect(checkOf(report, "config").status).toBe("ok");
   });
 });
 
