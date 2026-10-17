@@ -59,7 +59,7 @@ describe("the real 0001-0011 chain over a pre-rename database", () => {
 
     expect(
       (database.query("PRAGMA user_version").get() as { user_version: number }).user_version,
-    ).toBe(24);
+    ).toBe(25);
     expect(database.query("PRAGMA integrity_check").get()).toEqual({
       integrity_check: "ok",
     });

@@ -17,6 +17,7 @@ import {
   selectBackfillSessions,
 } from "../../src/w5/backfill";
 import { RESPONSE_EXCERPT_MARKER } from "../../src/w5/classifier-shared";
+import { JOB_LEASE_MINUTES } from "../../src/w5/jobs";
 import {
   ago,
   classifyAll,
@@ -429,6 +430,71 @@ describe("classification jobs", () => {
         "1 session named by failed jobs has no transcript",
       );
     });
+  });
+
+  test("a failure the runner worded as no-transcript-found is not recommended for collecting, even after the last collection", async () => {
+    const home = track(await makeHealthyHome());
+    insertFailedJob(
+      home.database,
+      "unknown claude session: gone (no transcript found under CLAUDE_DIRS, or it holds no messages)",
+      ago(60_000),
+      "gone",
+    );
+    const { report } = scryJson(home);
+    expect(recommendationIds(report)).not.toContain("w5-unknown-session");
+    expect(checkOf(report, "w5-queue").details.join("\n")).toContain(
+      "1 session named by failed jobs has no transcript found",
+    );
+  });
+
+  test("an old-style unknown-session failure newer than a runner-worded one still recommends collecting", async () => {
+    const home = track(await makeHealthyHome());
+    insertFailedJob(
+      home.database,
+      "unknown claude session: gone (no transcript found under CLAUDE_DIRS, or it holds no messages)",
+      ago(2 * DAY),
+      "gone",
+    );
+    insertFailedJob(home.database, "unknown claude session: gone", ago(60_000), "gone");
+    const { report } = scryJson(home);
+    expect(recommendationIds(report)).toContain("w5-unknown-session");
+  });
+
+  test("a job requeued by the reaper is neither failed nor stuck", async () => {
+    const home = track(await makeHealthyHome());
+    home.database
+      .query(
+        "INSERT INTO w5_jobs (session_id, requested_at, state, attempts) VALUES ('s', ?, 'queued', 1)",
+      )
+      .run(ago(5 * HOUR));
+    const { report } = scryJson(home);
+    expect(checkOf(report, "w5-queue").status).toBe("ok");
+    expect(report.stats?.w5).toMatchObject({ jobsFailedLast7Days: 0, jobsStuckRunning: 0 });
+    expect(recommendationIds(report)).not.toContain("w5-reap");
+  });
+
+  test("a stuck running job recommends `tempad w5 run`, which reaps it", async () => {
+    const home = track(await makeHealthyHome());
+    home.database
+      .query(
+        "INSERT INTO w5_jobs (session_id, requested_at, claimed_at, state, attempts) VALUES ('s', ?, ?, 'running', 1)",
+      )
+      .run(ago(5 * HOUR), ago(5 * HOUR));
+    const { report } = scryJson(home);
+    const entry = report.recommendations.find((item) => item.id === "w5-reap");
+    expect(entry?.command).toBe("tempad w5 run");
+    expect(entry?.reason).toContain("1 job claimed over 1 h ago is still running");
+  });
+
+  test("a job inside its lease is not called stuck", async () => {
+    const home = track(await makeHealthyHome());
+    home.database
+      .query(
+        "INSERT INTO w5_jobs (session_id, requested_at, claimed_at, state, attempts) VALUES ('s', ?, ?, 'running', 1)",
+      )
+      .run(ago(JOB_LEASE_MINUTES * 60_000), ago(JOB_LEASE_MINUTES * 60_000));
+    const { report } = scryJson(home);
+    expect(report.stats?.w5).toMatchObject({ jobsStuckRunning: 0 });
   });
 
   test("a claude collector that never ran has looked for nothing: the missing session is not written off", async () => {

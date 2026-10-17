@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { syncOneSessionFile } from "../collect/claude";
+import { findSessionTranscript, syncOneSessionFile } from "../collect/claude";
 import type { LoadedConfig } from "../config/env";
 import type { W5Config } from "../intent/config";
 import { registerAllProjections } from "../intent/projections/register";
@@ -8,6 +8,7 @@ import { type AppliedSummary, applyResult } from "./apply";
 import type { Classifier } from "./classifier";
 import { describeJobFailure } from "./classifier-shared";
 import { claimNextJob, completeJob, failJob } from "./jobs";
+import { claimNextJob, completeJob, failJob, reapStaleJobs } from "./jobs";
 import { closeIdleStints, closeSessionStints } from "./lifecycle";
 import { advanceQuestions } from "./questions";
 import { buildWindow, findSessionFile } from "./window";
@@ -23,6 +24,10 @@ export interface RunOnceResult {
   ran: boolean;
   sessionId?: string;
   summary?: AppliedSummary;
+}
+
+function sessionIsStored(database: Database, sessionId: string): boolean {
+  return database.query("SELECT 1 FROM claude_sessions WHERE id = ?").get(sessionId) !== null;
 }
 
 function countUserMessages(database: Database, sessionId: string, sinceTs: string | null): number {
@@ -92,15 +97,33 @@ export async function runOnce(
   options: RunOnceOptions,
 ): Promise<RunOnceResult> {
   const now = options.now ?? new Date().toISOString();
+  const reaped = reapStaleJobs(database, now);
+  if (reaped.requeued + reaped.failed > 0) {
+    options.log(
+      `w5 reaped ${reaped.requeued + reaped.failed} job(s) left running: ${reaped.requeued} requeued, ${reaped.failed} failed`,
+    );
+  }
   const job = claimNextJob(database, now);
   if (!job) return { ran: false };
 
   const store = new EventStore(database);
 
   try {
-    const filePath = findSessionFile(database, job.sessionId);
+    // The hook fires on the session's first Stop, which can be before any
+    // `tempad sync claude`: the transcript is on disk but the session is not in
+    // the database. Find the file ourselves; nothing is retried later because
+    // waiting does not help (the collector runs on its own schedule, and a
+    // transcript outside CLAUDE_DIRS never turns up).
+    const filePath =
+      findSessionFile(database, job.sessionId) ??
+      findSessionTranscript(config.claudeDirs, job.sessionId);
     if (filePath !== null) {
       await syncOneSessionFile(database, config, filePath);
+    }
+    if (!sessionIsStored(database, job.sessionId)) {
+      throw new Error(
+        `unknown claude session: ${job.sessionId} (no transcript found under CLAUDE_DIRS, or it holds no messages)`,
+      );
     }
 
     const runRow = database

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config/env";
@@ -16,7 +16,7 @@ import {
   RESPONSE_EXCERPT_MARKER,
 } from "../../src/w5/classifier-shared";
 import { buildBelongsHandback } from "../../src/w5/hooks";
-import { enqueueJob } from "../../src/w5/jobs";
+import { claimNextJob, enqueueJob, JOB_LEASE_MINUTES, JOB_MAX_ATTEMPTS } from "../../src/w5/jobs";
 import { runOnce } from "../../src/w5/runner";
 
 registerAllProjections();
@@ -665,5 +665,171 @@ describe("runOnce drives a belongs question to the user", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/** The transcript of `s1` on disk, where Claude Code writes it: `<dir>/projects/<project>/<id>.jsonl`. */
+function writeTranscript(dir: string): string {
+  const projectDirectory = join(dir, "projects", "-w-marko-ui");
+  mkdirSync(projectDirectory, { recursive: true });
+  const filePath = join(projectDirectory, "s1.jsonl");
+  writeFileSync(
+    filePath,
+    `${[
+      ["m1", "2026-09-04T15:00:00.000Z", "fix walk order"],
+      ["m2", "2026-09-04T15:20:00.000Z", "done"],
+    ]
+      .map(([uuid, ts, text]) =>
+        JSON.stringify({
+          type: "user",
+          uuid,
+          sessionId: "s1",
+          timestamp: ts,
+          cwd: "/w/marko-ui",
+          gitBranch: "main",
+          message: { role: "user", content: text },
+        }),
+      )
+      .join("\n")}\n`,
+  );
+  return filePath;
+}
+
+describe("runOnce when the session has not been collected yet", () => {
+  test("collects the session's transcript first, then classifies (tempad-fyl)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      writeTranscript(dir);
+      expect(database.query("SELECT 1 FROM claude_sessions WHERE id = 's1'").get()).toBeNull();
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      const result = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+      });
+
+      expect(result.summary?.traces).toBe(1);
+      const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+        state: string;
+        error: string | null;
+      };
+      expect(job).toEqual({ state: "done", error: null });
+      expect(database.query("SELECT 1 FROM claude_sessions WHERE id = 's1'").get()).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a session with no transcript under CLAUDE_DIRS fails once, saying so", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      enqueueJob(database, { sessionId: "s1", forced: true, throttleMinutes: 10 });
+
+      await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+      });
+
+      const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+        state: string;
+        error: string;
+      };
+      expect(job.state).toBe("failed");
+      expect(job.error).toStartWith("unknown claude session: s1");
+      expect(job.error).toContain("no transcript");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runOnce reaps jobs a crashed runner left running (tempad-0xk)", () => {
+  test("a job running past the lease is requeued and then classified", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-runner-test-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedHero(database);
+      seedSessionWithMessages(database, join(dir, "s1.jsonl"));
+      enqueueJob(database, {
+        sessionId: "s1",
+        forced: true,
+        now: "2026-09-04T14:00:00.000Z",
+        throttleMinutes: 10,
+      });
+      // The first runner claimed it and died.
+      claimNextJob(database, "2026-09-04T14:01:00.000Z");
+
+      const logs: string[] = [];
+      const result = await runOnce(database, makeConfig(dir), config, new FakeClassifier(good), {
+        now: "2026-09-04T15:21:00.000Z",
+        log: (line) => logs.push(line),
+      });
+
+      expect(result.ran).toBe(true);
+      expect(result.summary?.traces).toBe(1);
+      const job = database.query("SELECT state, attempts FROM w5_jobs").get() as {
+        state: string;
+        attempts: number;
+      };
+      expect(job).toEqual({ state: "done", attempts: 2 });
+      expect(logs.some((line) => line.includes("reaped"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a job still inside its lease is left alone", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    enqueueJob(database, {
+      sessionId: "s1",
+      forced: true,
+      now: "2026-09-04T15:00:00.000Z",
+      throttleMinutes: 10,
+    });
+    claimNextJob(database, "2026-09-04T15:00:00.000Z");
+
+    const result = await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: new Date(
+        Date.parse("2026-09-04T15:00:00.000Z") + (JOB_LEASE_MINUTES - 1) * 60_000,
+      ).toISOString(),
+      log: () => {},
+    });
+
+    expect(result.ran).toBe(false);
+    expect((database.query("SELECT state FROM w5_jobs").get() as { state: string }).state).toBe(
+      "running",
+    );
+  });
+
+  test("a job that already used every attempt fails instead of looping forever", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    enqueueJob(database, {
+      sessionId: "s1",
+      forced: true,
+      now: "2026-09-04T14:00:00.000Z",
+      throttleMinutes: 10,
+    });
+    database.query("UPDATE w5_jobs SET attempts = ?").run(JOB_MAX_ATTEMPTS - 1);
+    claimNextJob(database, "2026-09-04T14:01:00.000Z");
+
+    const result = await runOnce(database, makeConfig("/tmp"), config, new FakeClassifier(good), {
+      now: "2026-09-04T15:21:00.000Z",
+      log: () => {},
+    });
+
+    expect(result.ran).toBe(false);
+    const job = database.query("SELECT state, error FROM w5_jobs").get() as {
+      state: string;
+      error: string;
+    };
+    expect(job.state).toBe("failed");
+    expect(job.error).toContain("lease expired");
+    expect(job.error).toContain(`${JOB_MAX_ATTEMPTS} attempts`);
   });
 });

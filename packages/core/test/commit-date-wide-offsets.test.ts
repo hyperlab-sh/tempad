@@ -112,7 +112,7 @@ const SEEDS: Seed[] = [
 const WIDE = ["w1", "w2", "w3", "null-stamp"];
 const SCHEMA_BEFORE_STEP = 22;
 // A full open migrates to the head schema, past the step at 23.
-const SCHEMA_HEAD = 24;
+const SCHEMA_HEAD = 25;
 
 function seed(database: Database): void {
   database.exec(`

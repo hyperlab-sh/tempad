@@ -521,6 +521,27 @@ async function syncFile(
   return { sessionsInserted, sessionsUpdated, messagesInserted, warnings };
 }
 
+/** What Claude Code names a session: a UUID, or a `session_<uuid>` from some harnesses. */
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The transcript of a session that is not in the database yet, found where the
+ * collector looks (`<claudeDir>/projects/<project>/<id>.jsonl`) without reading
+ * any file. Null when no directory holds it, or when `sessionId` is not a plain
+ * id: it is spliced into a glob, and `*` or `../` must match nothing.
+ */
+export function findSessionTranscript(claudeDirs: string[], sessionId: string): string | null {
+  if (!SESSION_ID_PATTERN.test(sessionId)) return null;
+  const glob = new Bun.Glob(`projects/*/${sessionId}.jsonl`);
+  for (const claudeDir of claudeDirs) {
+    if (!existsSync(claudeDir)) continue;
+    for (const relativePath of glob.scanSync({ cwd: claudeDir })) {
+      return join(claudeDir, relativePath);
+    }
+  }
+  return null;
+}
+
 export async function syncOneSessionFile(
   database: Database,
   config: LoadedConfig<"claudeDirs" | "hostSlug">,

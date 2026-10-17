@@ -32,7 +32,11 @@ const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** A collector that has not run for this long is called stale. */
 export const COLLECTOR_STALE_HOURS = 24;
-/** A claimed job still running after this long is called stuck. */
+/**
+ * A claimed job still running after this long is called stuck. Well above the
+ * lease (`JOB_LEASE_MINUTES`): the next `w5 run` reaps a job past its lease, so a
+ * job this old means no runner has started since, or the reaper is not working.
+ */
 const STUCK_JOB_HOURS = 1;
 /** A window that ended this recently belongs to a session the hook is still working on. */
 const IN_FLIGHT_MS = HOUR_MS;
@@ -363,11 +367,15 @@ interface UnknownSessionFailures {
  * out of the window, however often the user runs it.
  */
 function unknownSessionFailures(database: Database, since: string): UnknownSessionFailures {
-  const rows = safely<{ session_id: string; newest: string; total: number }[]>([], () => {
+  const rows = safely<
+    { session_id: string; newest: string; searchedAt: string | null; total: number }[]
+  >([], () => {
     return database
       .query(
         `SELECT j.session_id AS session_id,
                 MAX(COALESCE(j.requested_at, j.finished_at)) AS newest,
+                MAX(CASE WHEN j.error LIKE 'unknown claude session%(no transcript found under CLAUDE_DIRS%'
+                         THEN COALESCE(j.requested_at, j.finished_at) END) AS searchedAt,
                 COUNT(*) AS total
            FROM w5_jobs j
           WHERE j.state = 'failed' AND j.error LIKE 'unknown claude session%'
@@ -375,7 +383,12 @@ function unknownSessionFailures(database: Database, since: string): UnknownSessi
             AND NOT EXISTS (SELECT 1 FROM claude_sessions s WHERE s.id = j.session_id)
           GROUP BY j.session_id`,
       )
-      .all(since) as { session_id: string; newest: string; total: number }[];
+      .all(since) as {
+      session_id: string;
+      newest: string;
+      searchedAt: string | null;
+      total: number;
+    }[];
   });
   const total = safely<{ n: number }>({ n: 0 }, () => {
     return database
@@ -397,7 +410,11 @@ function unknownSessionFailures(database: Database, since: string): UnknownSessi
   let collectable = 0;
   let uncollectable = 0;
   for (const row of rows) {
-    if (lastCollected === null || row.newest > lastCollected) collectable += 1;
+    // The runner collects a session's transcript itself before it fails a job
+    // as unknown, so a failure it words as "no transcript found" already looked
+    // where `sync claude` would look.
+    if (row.searchedAt === row.newest) uncollectable += 1;
+    else if (lastCollected === null || row.newest > lastCollected) collectable += 1;
     else uncollectable += 1;
   }
   return { total, collectable, uncollectable };
@@ -453,6 +470,13 @@ function queueCheck(database: Database, now: Date, home: string): QueueResult {
     status = "warn";
     summary = `${failedLast7Days} failed in the last 7 days, ${stuck} stuck running`;
   }
+  if (stuck > 0) {
+    recommendations.push({
+      id: "w5-reap",
+      command: "tempad w5 run",
+      reason: `${plural(stuck, "job")} claimed over ${STUCK_JOB_HOURS} h ago ${stuck === 1 ? "is" : "are"} still running; \`w5 run\` requeues or fails jobs whose runner died, then drains the queue`,
+    });
+  }
   if (failedLast7Days > 0) {
     recommendations.push({
       id: "w5-log",
@@ -474,7 +498,7 @@ function queueCheck(database: Database, now: Date, home: string): QueueResult {
     }
     if (unknown.total > 0 && unknown.collectable === 0 && unknown.uncollectable === 0) {
       details.push(
-        `all ${unknown.total} \`unknown claude session\` failures are for sessions that are in the database now: the job ran before the session was collected, and the backfill below covers them`,
+        `all ${unknown.total} \`unknown claude session\` failures are for sessions that are in the database now: jobs that ran before the session was collected (\`w5 run\` now collects it itself), and the backfill below covers them`,
       );
     }
   }
