@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigError } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
@@ -757,18 +757,30 @@ describe("schema", () => {
 });
 
 describe("read-only", () => {
-  test("leaves the database file byte for byte as it was and creates no files", async () => {
+  test("leaves the database file byte for byte as it was and creates no file but the reader sidecars", async () => {
     const home = track(
       await makeHealthyHome({ toml: '[sync]\nurl = "libsql://example.invalid"\n' }),
     );
     home.database.close();
     home.database = openDatabase(":memory:");
     const digest = () => createHash("sha256").update(readFileSync(home.databasePath)).digest("hex");
-    const entries = () => readdirSync(home.directory).sort();
+    // A readonly connection to a WAL database opens the `-shm` and `-wal` sidecars like any reader,
+    // and closing it cannot remove them. Whether they exist before depends on whether the closing
+    // writer removed them (Bun 1.4 does, 1.3 left them), so they are not "files scry created": the
+    // main file must be byte-identical, nothing else may appear, and a `-wal` must stay empty.
+    const sidecar = /\.db-(shm|wal)$/;
+    const entries = () =>
+      readdirSync(home.directory)
+        .filter((name) => !sidecar.test(name))
+        .sort();
     const before = { digest: digest(), entries: entries() };
 
     for (const flags of [[], ["--fast"], ["--days", "3"]]) scryJson(home, ...flags);
     expect({ digest: digest(), entries: entries() }).toEqual(before);
+    const walSizes = readdirSync(home.directory)
+      .filter((name) => name.endsWith(".db-wal"))
+      .map((name) => statSync(join(home.directory, name)).size);
+    expect(walSizes.every((size) => size === 0)).toBe(true);
 
     const reopened = new Database(home.databasePath, { readonly: true });
     expect(
