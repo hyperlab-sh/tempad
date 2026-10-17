@@ -7,7 +7,12 @@ import {
   UNSPECIFIED_GUESS,
   validateResult,
 } from "../../src/w5/classifier";
-import { ClassifierResponseError } from "../../src/w5/classifier-shared";
+import {
+  ClassifierResponseError,
+  describeJobFailure,
+  RESPONSE_EXCERPT_LENGTH,
+  RESPONSE_EXCERPT_MARKER,
+} from "../../src/w5/classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
 
 const window: ClassifierWindow = {
@@ -164,6 +169,23 @@ describe("classifier", () => {
       expect(result.segments[0]?.guess).toBe(UNSPECIFIED_GUESS);
       expect(result.guessDefaulted).toBe(1);
     }
+  });
+
+  test("validateResult replaces a whitespace-only guess alongside an unrecognized quest alias", () => {
+    const twoQuestWindow: ClassifierWindow = {
+      ...window,
+      activeQuests: [
+        ...window.activeQuests,
+        { alias: "Q2", title: "Other quest", outcome: "done", plan: [] },
+      ],
+      activeQuestAliases: { ...window.activeQuestAliases, Q2: "01HREALQUESTIDTWO000000000" },
+    };
+    const result = validateResult(
+      { segments: [{ ...good.segments[0], quest: "Q9", belongs: true, guess: "   " }] },
+      twoQuestWindow,
+    );
+    expect(result.segments[0]?.belongs).toBe(false);
+    expect(result.segments[0]?.guess).toBe(UNRECOGNIZED_QUEST_ALIAS_GUESS);
   });
 
   test("validateResult keeps a real guess untouched and counts nothing", () => {
@@ -578,6 +600,127 @@ describe("classifier", () => {
     );
     expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:20:00.000Z");
     expect(result.boundsClamped).toBe(1);
+  });
+
+  test("validateResult drops a tail segment that ends exactly on the first message", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T14:50:00.000Z",
+            endedAt: "2026-09-04T15:00:00.000Z",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.overlapDropped).toBe(1);
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult drops a segment that starts on the last message and runs past it, not a zero-minute trace", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:20:00.000Z",
+            endedAt: "2026-09-04T16:00:00.000Z",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.overlapDropped).toBe(1);
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult keeps a zero-length segment the model sent inside the window", () => {
+    const result = validateResult(good, window);
+    expect(result.segments[1]?.startedAt).toBe(result.segments[1]?.endedAt as string);
+    expect(result.overlapDropped).toBe(0);
+  });
+
+  test("validateResult does not drop a segment whose end precedes its start, it reports it", () => {
+    expect(() =>
+      validateResult(
+        {
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T15:20:00.000Z",
+              endedAt: "2026-09-04T14:55:00.000Z",
+            },
+          ],
+        },
+        window,
+      ),
+    ).toThrow(/outside the window/);
+  });
+
+  test("validateResult does not drop a segment with an offset timestamp that is inside the window by instant, it reports it", () => {
+    // 12:05-03:00 is 15:05Z: inside the window, but not the form the prompt asked for.
+    expect(() =>
+      validateResult(
+        {
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T12:05:00.000-03:00",
+              endedAt: "2026-09-04T12:10:00.000-03:00",
+            },
+          ],
+        },
+        window,
+      ),
+    ).toThrow(/outside the window/);
+  });
+
+  test("validateResult does not drop a segment whose timestamp is not a timestamp, it reports it", () => {
+    expect(() =>
+      validateResult({ segments: [{ ...good.segments[0], endedAt: "1h" }] }, window),
+    ).toThrow(/endedAt/);
+  });
+
+  test("validateResult compares instants: an offset end before the first message is a tail segment", () => {
+    // 11:55-03:00 is 14:55Z, before the window's first message at 15:00Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T11:45:00.000-03:00",
+            endedAt: "2026-09-04T11:55:00.000-03:00",
+          },
+          good.segments[0],
+        ],
+      },
+      window,
+    );
+    expect(result.segments.length).toBe(1);
+    expect(result.overlapDropped).toBe(1);
+  });
+
+  test("validateResult never splits a surrogate pair when it truncates a sessionNote", () => {
+    const note = `${"n".repeat(298)}😀${"tail".repeat(10)}`;
+    const result = validateResult({ ...good, sessionNote: note });
+    expect(result.sessionNote?.isWellFormed()).toBe(true);
+    expect(result.sessionNote).toBe(`${"n".repeat(298)}…`);
+    expect(result.sessionNoteTruncated).toBe(1);
+  });
+
+  test("describeJobFailure never splits a surrogate pair at the excerpt boundary", () => {
+    const raw = `${"x".repeat(RESPONSE_EXCERPT_LENGTH - 1)}😀 and more`;
+    const stored = describeJobFailure(new ClassifierResponseError("bad", raw));
+    const excerpt = stored.split(RESPONSE_EXCERPT_MARKER)[1] as string;
+    expect(excerpt.isWellFormed()).toBe(true);
+    expect(excerpt).toBe("x".repeat(RESPONSE_EXCERPT_LENGTH - 1));
   });
 
   test("validateResult still rejects a segment that starts after the last message", () => {

@@ -1,4 +1,9 @@
-import { type ClassifierResult, type ClassifierWindow, validateResult } from "./classifier";
+import {
+  type ClassifierResult,
+  type ClassifierWindow,
+  cutAtCodePoint,
+  validateResult,
+} from "./classifier";
 
 /**
  * Written between a failed job's message and the start of the response that
@@ -33,7 +38,7 @@ export class ClassifierResponseError extends Error {
 export function describeJobFailure(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   if (!(error instanceof ClassifierResponseError) || error.rawResponse === "") return message;
-  return `${message}${RESPONSE_EXCERPT_MARKER}${error.rawResponse.slice(0, RESPONSE_EXCERPT_LENGTH)}`;
+  return `${message}${RESPONSE_EXCERPT_MARKER}${cutAtCodePoint(error.rawResponse, RESPONSE_EXCERPT_LENGTH)}`;
 }
 
 /** The message half of a stored failure, without the response excerpt. */
