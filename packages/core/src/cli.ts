@@ -28,6 +28,7 @@ import { loadIntentConfig } from "./intent/config.ts";
 import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
+import { runScryCommand } from "./scry/cli.ts";
 import { runSetup } from "./setup/index.ts";
 import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
 import { forgetSync, formatForgetSummary, rejoinServer } from "./sync/forget.ts";
@@ -77,11 +78,12 @@ const USAGE_LINES: string[] = [
   "  tempad w5 context --session <id>",
   "  tempad w5 run [--detached]",
   "  tempad w5 hook install|uninstall [--scope user|project]",
-  "  tempad w5 backfill [--days <n>] [--model <name>] [--force]",
+  "  tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)",
   "  tempad w5 dedupe [--dry-run]",
   "  tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
   "  tempad quiet <2h|30m>",
   "  tempad review [--days <n>]",
+  "  tempad scry [--json] [--days <n>] [--fast]   (read-only health check of the data: Health, Stats, Recommendations; exit 1 when a check fails; --fast skips quick_check and the projection replay)",
   "  tempad skill install [--scope user|project]",
   '  tempad project register <path> --name "<display>" [--org <org>] [--project <slug>] | list | reresolve <path>',
 ];
@@ -601,6 +603,7 @@ const OTHER_COMMANDS = new Set([
   "w5",
   "quiet",
   "review",
+  "scry",
   "skill",
   "project",
 ]);
@@ -641,6 +644,11 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
   }
   if (command === "w5" || command === "quiet" || command === "review") {
     return runW5Dispatch(command, rest);
+  }
+  if (command === "scry") {
+    // Read-only: opens the database itself instead of through `prepareCommand`, which migrates and writes.
+    assertConfigured(tempadHome());
+    return runScryCommand(rest);
   }
   if (command === "skill") {
     return runSkillCommand(rest);

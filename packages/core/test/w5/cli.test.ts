@@ -1196,6 +1196,160 @@ describe("w5 backfill with the api backend reads ANTHROPIC_API_KEY from TEMPAD_H
   });
 });
 
+describe("w5 backfill --from", () => {
+  const DAY = 86_400_000;
+
+  async function run(args: string[], seed?: (database: ReturnType<typeof openDatabase>) => void) {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-cli-test-"));
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seed?.(database);
+    const intentConfig = defaultIntentConfig();
+    // A classifier that always fails: an attempted window shows up as `failed=1`, a skipped one as nothing.
+    intentConfig.w5.claudeCommand = "/usr/bin/false";
+    const output: string[] = [];
+    try {
+      const code = await runW5Command(["backfill", ...args], {
+        database,
+        config: makeConfig(dir),
+        intentConfig,
+        stdout: (line) => output.push(line),
+        spawn: () => {},
+      });
+      return { code, output: output.join("\n") };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function seedSession(database: ReturnType<typeof openDatabase>, endedAt: string) {
+    database
+      .query(
+        `INSERT INTO claude_sessions
+          (id, claude_dir, project_dir, file_path, cwd, org, project, title, git_branch,
+           started_at, ended_at, message_count, tool_call_count, models, host_slug, file_mtime)
+         VALUES ('s1', '/c', 'p', '/c/p/s1.jsonl', '/w/p', 'personal', 'p', 't', 'main', ?, ?, 1, 0, '[]', 'host', ?)`,
+      )
+      .run(endedAt, endedAt, endedAt);
+    database
+      .query(
+        "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES ('m1', 's1', ?, 'user', 0, 'work')",
+      )
+      .run(endedAt);
+  }
+
+  test("a session that ended after --from is classified; one before it is not", async () => {
+    const endedAt = new Date(Date.now() - 2 * DAY).toISOString();
+    const seed = (database: ReturnType<typeof openDatabase>) => seedSession(database, endedAt);
+    const included = await run(["--from", new Date(Date.now() - 3 * DAY).toISOString()], seed);
+    expect(included.output).toContain("failed=1");
+    const excluded = await run(["--from", new Date(Date.now() - DAY).toISOString()], seed);
+    expect(excluded.code).toBe(0);
+    expect(excluded.output).toBe("classified=0 windows=0 failed=0 skipped=0 windows_skipped=0");
+  });
+
+  test("the lower bound is inclusive: a session ending exactly at --from is classified", async () => {
+    const endedAt = new Date(Date.now() - 2 * DAY).toISOString();
+    const result = await run(["--from", endedAt], (database) => seedSession(database, endedAt));
+    expect(result.output).toContain("failed=1");
+  });
+
+  test("--from beats the default 15-day window, which would also have reached the session", async () => {
+    const endedAt = new Date(Date.now() - 2 * DAY).toISOString();
+    const result = await run(["--from", new Date(Date.now() - 1 * DAY).toISOString()], (database) =>
+      seedSession(database, endedAt),
+    );
+    expect(result.output).not.toContain("failed=1");
+  });
+
+  test("an offset timestamp is read as the instant it names", async () => {
+    // 2 days ago, written with a +03:00 offset: the same instant as the session's end.
+    const ended = Date.now() - 2 * DAY;
+    const endedAt = new Date(ended).toISOString();
+    const offset = new Date(ended + 3 * 3_600_000).toISOString().replace("Z", "+03:00");
+    const result = await run(["--from", offset], (database) => seedSession(database, endedAt));
+    expect(result.output).toContain("failed=1");
+  });
+
+  for (const bad of [
+    "yesterday",
+    "",
+    "2026-13-45",
+    "2026-02-30",
+    "2026-02-30T10:00:00Z",
+    "2026-04-31T10:00:00+02:00",
+    "not a date",
+    "1",
+    "Oct 1",
+    "2026-10",
+    "2026-10-01 10:00",
+    "2026-10-01 10:00:00",
+    "2026-10-01T10:00:00",
+    "2026-10-01T10:00:00+0300",
+    "20261001",
+  ]) {
+    test(`--from ${JSON.stringify(bad)} is a usage error (exit 2)`, async () => {
+      const result = await run(["--from", bad]);
+      expect(result.code).toBe(2);
+      expect(result.output).toContain("usage: tempad w5 backfill");
+      expect(result.output).toContain("--from needs an ISO 8601 date or datetime");
+    });
+  }
+
+  for (const good of [
+    "2026-10-01",
+    "2026-10-01T10:00:00Z",
+    "2026-10-01T10:00:00.123Z",
+    "2026-10-01T10:00:00-03:00",
+    "2026-10-01T10:00:00.5+05:30",
+    "2026-10-01T23:30:00-03:00",
+    "2024-02-29T10:00:00Z",
+  ]) {
+    test(`--from ${good} is accepted`, async () => {
+      const result = await run(["--from", good]);
+      expect(result.code).toBe(0);
+    });
+  }
+
+  test("a datetime whose offset moves it to the next UTC day keeps the instant", async () => {
+    // 2026-10-01 23:30 at -03:00 is 2026-10-02 02:30 UTC.
+    const endedAt = "2026-10-02T02:30:00.000Z";
+    const at = await run(["--from", "2026-10-01T23:30:00-03:00"], (database) =>
+      seedSession(database, endedAt),
+    );
+    expect(at.output).toContain("failed=1");
+    const after = await run(["--from", "2026-10-01T23:30:01-03:00"], (database) =>
+      seedSession(database, endedAt),
+    );
+    expect(after.output).not.toContain("failed=1");
+  });
+
+  test("a date-only --from names midnight UTC of that day", async () => {
+    const day = new Date(Date.now() - 2 * DAY).toISOString().slice(0, 10);
+    const endedAt = `${day}T00:00:00.000Z`;
+    const included = await run(["--from", day], (database) => seedSession(database, endedAt));
+    expect(included.output).toContain("failed=1");
+    const next = new Date(Date.parse(endedAt) + DAY).toISOString().slice(0, 10);
+    const excluded = await run(["--from", next], (database) => seedSession(database, endedAt));
+    expect(excluded.output).not.toContain("failed=1");
+  });
+
+  test("--from with --days is a usage error (exit 2), whichever order", async () => {
+    for (const args of [
+      ["--from", "2026-10-01T00:00:00Z", "--days", "5"],
+      ["--days", "5", "--from", "2026-10-01T00:00:00Z"],
+    ]) {
+      const result = await run(args);
+      expect(result.code).toBe(2);
+      expect(result.output).toContain("cannot be combined");
+    }
+  });
+
+  test("--from needs a value", async () => {
+    await expect(run(["--from"])).rejects.toThrow();
+  });
+});
+
 describe("w5 hook install|uninstall with an unparseable settings.json", () => {
   for (const [label, content] of [
     ["invalid JSON", "{ not json"],

@@ -90,7 +90,7 @@ const EVENT_NON_CONTENT = new Set(["id", "uid", "sync_host", "sync_dirty"]);
  * Its value is a fresh token on every set, so a rebuild only clears the
  * marker it saw: one set by a concurrent sync meanwhile survives.
  */
-const REBUILD_PENDING = "rebuild_pending";
+export const REBUILD_PENDING = "rebuild_pending";
 /**
  * Set (to the server id) when the server is found unknown, in the same
  * transaction that resets the pull cursors; cleared only with the
@@ -99,7 +99,7 @@ const REBUILD_PENDING = "rebuild_pending";
  * pushes re-seed, so neither a pull-only run, an interrupted re-seed nor
  * another host's writes can erase the decision.
  */
-const RESEED_PENDING = "reseed_pending";
+export const RESEED_PENDING = "reseed_pending";
 /**
  * Set (to a fresh ULID) whenever the cursors are reset to 0, cleared
  * (compare-and-delete) once a pull has run to the end. While it is set the
@@ -113,12 +113,12 @@ const RESEED_PENDING = "reseed_pending";
  * to a newer local version, and own events dedupe by uid, so the only cost
  * is bandwidth during one full pull.
  */
-const PULL_OWN_PENDING = "pull_own_pending";
+export const PULL_OWN_PENDING = "pull_own_pending";
 /** The last event / mirror row or tombstone this host saw land on the server. */
-const PUSH_PROBE_EVENT = "push_probe_event";
-const PUSH_PROBE_ROW = "push_probe_row";
+export const PUSH_PROBE_EVENT = "push_probe_event";
+export const PUSH_PROBE_ROW = "push_probe_row";
 /** The server identity this database last synced with (stored after a completed re-seed). */
-const SERVER_ID = "server_id";
+export const SERVER_ID = "server_id";
 /**
  * Prefix of the keys that remember every server `tempad sync --forget` left:
  * one `forgotten_server_id:<id>` row per id, written by a forget and deleted

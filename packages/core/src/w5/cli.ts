@@ -549,16 +549,53 @@ function applyHookAction(
   return 2;
 }
 
+/** `YYYY-MM-DD`, or a datetime with `T`, optional fractional seconds and `Z` or `+-HH:MM`. `Date.parse` alone reads `1` as 2001-01-01. */
+const ISO_8601 = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/;
+
+/** The instant `value` names, or null when it is not strict ISO 8601 or its calendar date is not real (`2026-02-30`). */
+function parseIsoInstant(value: string): number | null {
+  if (!ISO_8601.test(value)) return null;
+  const milliseconds = Date.parse(value);
+  if (Number.isNaN(milliseconds)) return null;
+  // `Date.parse` rolls an impossible day over to the next month. Check the written date itself,
+  // not the parsed instant: an offset may legitimately move the instant to another UTC day.
+  const [year, month, day] = value.slice(0, 10).split("-").map(Number);
+  const written = new Date(Date.UTC(year as number, (month as number) - 1, day as number));
+  if (written.toISOString().slice(0, 10) !== value.slice(0, 10)) return null;
+  return milliseconds;
+}
+
+const BACKFILL_USAGE =
+  "usage: tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]";
+
 async function runBackfill(args: string[], context: W5Context): Promise<number> {
   const { values } = parseArgs({
     args,
     options: {
       days: { type: "string" },
+      from: { type: "string" },
       model: { type: "string" },
       force: { type: "boolean", default: false },
     },
     strict: true,
   });
+
+  if (values.days !== undefined && values.from !== undefined) {
+    context.stdout(`${BACKFILL_USAGE}\n--days and --from cannot be combined: pick one lower bound`);
+    return 2;
+  }
+  // An explicit lower bound, normalized to the form `claude_sessions.ended_at` is compared in.
+  let from: string | undefined;
+  if (values.from !== undefined) {
+    const fromMs = parseIsoInstant(values.from);
+    if (fromMs === null) {
+      context.stdout(
+        `${BACKFILL_USAGE}\n--from needs an ISO 8601 date or datetime (2026-10-01, 2026-10-01T10:00:00Z, 2026-10-01T10:00:00-03:00), got "${values.from}"`,
+      );
+      return 2;
+    }
+    from = new Date(fromMs).toISOString();
+  }
 
   const days = values.days
     ? Number.parseInt(values.days, 10)
@@ -577,6 +614,7 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     classifier,
     {
       days,
+      ...(from !== undefined ? { from } : {}),
       now: new Date().toISOString(),
       log: (line) => {
         log(context.config, line);

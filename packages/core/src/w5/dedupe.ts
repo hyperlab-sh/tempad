@@ -22,7 +22,7 @@ interface DuplicateTraceRow {
 /**
  * A duplicate group is traces sharing `(session_id, started_at, ended_at)` --
  * the same backfill window classified more than once by a crashed-then-
- * relaunched run (see `isWindowCovered` in `src/w5/backfill.ts`). Within a
+ * relaunched run (see `planBackfillWindows` in `src/w5/backfill.ts`). Within a
  * group the earliest trace (lowest `trace.recorded` event uid, the replay
  * order every host computes identically -- not the local integer id) is kept;
  * the rest are retracted.
