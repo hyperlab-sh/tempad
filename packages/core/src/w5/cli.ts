@@ -17,6 +17,7 @@ import {
   sessionHasActiveDeclaration,
 } from "../intent/declarations";
 import { isSyncEnabled } from "../sync/config";
+import { usageText } from "../usage";
 import { backfill } from "./backfill";
 import { AnthropicClassifier, type Classifier } from "./classifier";
 import { ClaudeCliClassifier } from "./classifier-cli";
@@ -279,7 +280,7 @@ function runQuiet(args: string[], context: W5Context): number {
 
 const REVIEW_DEFAULT_DAYS = 7;
 
-const REVIEW_USAGE = "usage: tempad review [--days <positive integer>]";
+const REVIEW_USAGE = `usage: ${usageText("review")}`;
 
 function runReview(args: string[], context: W5Context): number {
   let daysValue: string | undefined;
@@ -567,8 +568,7 @@ function parseIsoInstant(value: string): number | null {
   return milliseconds;
 }
 
-const BACKFILL_USAGE =
-  "usage: tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]";
+const BACKFILL_USAGE = `usage: ${usageText("w5 backfill")}`;
 
 async function runBackfill(args: string[], context: W5Context): Promise<number> {
   const { values } = parseArgs({
@@ -653,9 +653,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
   const evalConfig = requireFields("tempad w5 eval", context.config, W5_EVAL_NEEDS);
 
   if (!values.from || !values.to) {
-    context.stdout(
-      "usage: tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
-    );
+    context.stdout(`usage: ${usageText("w5 eval")}`);
     return 2;
   }
 

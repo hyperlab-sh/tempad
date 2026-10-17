@@ -1,0 +1,323 @@
+/**
+ * Every command and the nested paths below it (`w5 hook install`), as `dispatch` accepts them.
+ * `help` and `--help` are answered from this table, and the help tests walk it.
+ */
+export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
+  hero: ["init"],
+  party: ["add", "leave", "list"],
+  client: ["add"],
+  saga: ["add", "reword", "replace", "end", "edit", "list"],
+  quest: [
+    "add",
+    "reword",
+    "replace",
+    "end",
+    "edit",
+    "confirm",
+    "merge",
+    "pause",
+    "resume",
+    "done",
+    "abandon",
+    "branch",
+    "return",
+    "retract",
+    "delete",
+    "list",
+    "declare",
+  ],
+  stint: ["list"],
+  trace: ["list"],
+  impact: ["set", "list", "import"],
+  answer: [],
+  rebuild: [],
+  setup: [],
+  init: [],
+  sync: ["monday", "github", "claude"],
+  report: ["daily", "project", "hourly", "weekly"],
+  w5: [
+    "enqueue",
+    "context",
+    "run",
+    "hook",
+    "hook install",
+    "hook uninstall",
+    "backfill",
+    "dedupe",
+    "eval",
+  ],
+  quiet: [],
+  review: [],
+  scry: [],
+  skill: ["install"],
+  project: ["register", "list", "reresolve"],
+};
+
+interface UsageEntry {
+  /** The command paths this text documents; the first one names the command it is listed under. */
+  paths: readonly string[];
+  text: string;
+}
+
+/**
+ * The one copy of every usage text. The global list, `tempad help <path>` and
+ * `<path> --help` all read it, and the `*_USAGE` constants of the commands derive from it.
+ */
+const USAGE_ENTRIES: readonly UsageEntry[] = [
+  {
+    paths: ["setup", "init"],
+    text: "tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
+  },
+  {
+    paths: ["sync", "sync monday", "sync github", "sync claude"],
+    text: "tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget [--force] | --rejoin <server-id>   (--rejoin: let sync use a server --forget left, accepting overwrites; --forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only; refuses while changes never reached the server unless --force)",
+  },
+  {
+    paths: ["report", "report daily", "report project", "report hourly", "report weekly"],
+    text: "tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
+  },
+  { paths: ["hero init"], text: 'tempad hero init "<name>"' },
+  { paths: ["party add"], text: 'tempad party add <slug> "<name>" [--joined YYYY-MM-DD]' },
+  { paths: ["party leave"], text: 'tempad party leave <slug> --reason "..."' },
+  { paths: ["party list"], text: "tempad party list" },
+  { paths: ["client add"], text: 'tempad client add <slug> "<name>"' },
+  {
+    paths: ["saga add"],
+    text: 'tempad saga add --owner hero|party:<slug> "<title>" [--statement]',
+  },
+  { paths: ["saga reword"], text: 'tempad saga reword <id> "<title>"' },
+  { paths: ["saga replace"], text: 'tempad saga replace <id> "<title>" --reason "..."' },
+  { paths: ["saga end"], text: "tempad saga end <id> --reason ..." },
+  { paths: ["saga list"], text: "tempad saga list [--all] [--as-of <iso>]" },
+  { paths: ["saga edit"], text: 'tempad saga edit <id> "<title>"' },
+  {
+    paths: ["quest add"],
+    text: 'tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment]',
+  },
+  { paths: ["quest reword"], text: 'tempad quest reword <id> "<title>" [--outcome]' },
+  {
+    paths: ["quest replace"],
+    text: 'tempad quest replace <id> "<title>" [--outcome] --reason "..."',
+  },
+  { paths: ["quest end"], text: "tempad quest end <id> --reason ..." },
+  { paths: ["quest edit"], text: 'tempad quest edit <id> "<title>"' },
+  {
+    paths: [
+      "quest confirm",
+      "quest merge",
+      "quest pause",
+      "quest resume",
+      "quest done",
+      "quest abandon",
+      "quest branch",
+      "quest return",
+    ],
+    text: "tempad quest confirm|merge|pause|resume|done|abandon|branch|return <id>",
+  },
+  {
+    paths: ["quest retract", "quest delete"],
+    text: 'tempad quest retract <id> --reason "..." [--force]   (undo a quest created by mistake; alias: delete)',
+  },
+  {
+    paths: ["quest declare"],
+    text: 'tempad quest declare --session <id> (--quest <id> | --new "<title>" --outcome "<text>" | --done <quest>) [--plan "a; b; c"] ...',
+  },
+  {
+    paths: ["quest list"],
+    text: "tempad quest list [--all] [--unconfirmed] [--side] [--as-of <iso>]",
+  },
+  { paths: ["stint list"], text: "tempad stint list [--open] [--quest <id>]" },
+  { paths: ["trace list"], text: "tempad trace list [--since <iso>] [--stint <id>]" },
+  { paths: ["impact set"], text: 'tempad impact set <ref> "<text>" [--theme <t>]' },
+  {
+    paths: ["impact list"],
+    text: "tempad impact list [--project <p>] [--from <date> --to <date>]",
+  },
+  { paths: ["impact import"], text: "tempad impact import <file.json>" },
+  {
+    paths: ["answer"],
+    text: 'tempad answer <question-id> (--belongs | --quest <id|new:"title">) [--why "..."]',
+  },
+  { paths: ["rebuild"], text: "tempad rebuild [--until <iso>]" },
+  { paths: ["w5 enqueue"], text: "tempad w5 enqueue --session <id> [--forced]" },
+  { paths: ["w5 context"], text: "tempad w5 context --session <id>" },
+  { paths: ["w5 run"], text: "tempad w5 run [--detached]" },
+  {
+    paths: ["w5 hook", "w5 hook install", "w5 hook uninstall"],
+    text: "tempad w5 hook install|uninstall [--scope user|project]",
+  },
+  {
+    paths: ["w5 backfill"],
+    text: "tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)",
+  },
+  { paths: ["w5 dedupe"], text: "tempad w5 dedupe [--dry-run]" },
+  {
+    paths: ["w5 eval"],
+    text: "tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
+  },
+  { paths: ["quiet"], text: "tempad quiet <2h|30m>" },
+  { paths: ["review"], text: "tempad review [--days <n>]" },
+  {
+    paths: ["scry"],
+    text: "tempad scry [--json] [--days <n>] [--fast]   (read-only health check of the data: Health, Stats, Recommendations; exit 1 when a check fails; --fast skips quick_check and the projection replay)",
+  },
+  { paths: ["skill", "skill install"], text: "tempad skill install [--scope user|project]" },
+  {
+    paths: ["project register"],
+    text: 'tempad project register <path> --name "<display>" [--org <org>] [--project <slug>]',
+  },
+  { paths: ["project list"], text: "tempad project list" },
+  { paths: ["project reresolve"], text: "tempad project reresolve <path>" },
+];
+
+const HELP_SYNOPSIS = "tempad --help | -h | help [<command> [<subcommand> ...]] | --version";
+const HELP_FOOTER = "Run tempad help <command> for one command.";
+
+/** The usage text for one path (`tempad w5 backfill ...`). The `*_USAGE` constants build on it. */
+export function usageText(path: string): string {
+  const entry = USAGE_ENTRIES.find((candidate) => candidate.paths.includes(path));
+  if (entry === undefined) throw new Error(`no usage text for "${path}"`);
+  return entry.text;
+}
+
+function commandOf(entry: UsageEntry): string {
+  return (entry.paths[0] ?? "").split(" ")[0] ?? "";
+}
+
+function linesFor(entries: readonly UsageEntry[]): string[] {
+  return entries.map((entry) => `  ${entry.text}`);
+}
+
+/** Every command's usage, in table order; what `tempad help` prints. */
+export function globalUsage(): string[] {
+  return ["Usage:", `  ${HELP_SYNOPSIS}`, ...linesFor(USAGE_ENTRIES)];
+}
+
+export function globalHelp(): string[] {
+  return [...globalUsage(), "", HELP_FOOTER];
+}
+
+/** Whether `path` (`w5 hook`) is a node of the tree, a command or a nested path. */
+function isTreePath(path: string[]): boolean {
+  const [command, ...nested] = path;
+  if (command === undefined || !Object.hasOwn(COMMAND_TREE, command)) return false;
+  if (nested.length === 0) return true;
+  const joined = nested.join(" ");
+  return (COMMAND_TREE[command] ?? []).some((candidate) => candidate === joined);
+}
+
+/** The usage of one valid path: a command lists all of its lines, a nested path its own. */
+export function usageForPath(path: string[]): string[] {
+  const [command] = path;
+  const joined = path.join(" ");
+  if (path.length === 1) {
+    const hits = USAGE_ENTRIES.filter(
+      (entry) => commandOf(entry) === command || entry.paths.includes(joined),
+    );
+    return ["Usage:", ...linesFor(hits)];
+  }
+  return ["Usage:", ...linesFor(USAGE_ENTRIES.filter((entry) => entry.paths.includes(joined)))];
+}
+
+export type HelpResolution =
+  | { ok: true; lines: string[] }
+  | { ok: false; message: string; lines: string[] };
+
+/**
+ * Resolves `tempad help <tokens>` strictly: every token must be a known path part, so a
+ * mistyped one is named in `message` and the nearest valid path's usage comes back with it.
+ */
+export function resolveHelp(tokens: string[]): HelpResolution {
+  if (tokens.length === 0) return { ok: true, lines: globalHelp() };
+  const [command] = tokens;
+  if (command === undefined || !isTreePath([command])) {
+    return {
+      ok: false,
+      message: `tempad: unknown command "${command}"`,
+      lines: globalUsage(),
+    };
+  }
+  let valid = [command];
+  for (const token of tokens.slice(1)) {
+    const next = [...valid, token];
+    if (!isTreePath(next) && !hasNestedPrefix(next)) {
+      return {
+        ok: false,
+        message: `tempad: unknown subcommand "${token}" for tempad ${valid.join(" ")}`,
+        lines: usageForPath(valid),
+      };
+    }
+    valid = next;
+  }
+  if (!isTreePath(valid)) {
+    return {
+      ok: false,
+      message: `tempad: "${valid.join(" ")}" needs a subcommand`,
+      lines: usageForPath(valid.slice(0, 1)),
+    };
+  }
+  return { ok: true, lines: usageForPath(valid) };
+}
+
+/** `w5 hook` is a path whose own children (`install`) are listed with the prefix `hook `. */
+function hasNestedPrefix(path: string[]): boolean {
+  const [command, ...nested] = path;
+  if (command === undefined) return false;
+  const joined = nested.join(" ");
+  return (COMMAND_TREE[command] ?? []).some((candidate) => candidate.startsWith(`${joined} `));
+}
+
+export function isCommand(command: string | undefined): command is string {
+  return command !== undefined && isTreePath([command]);
+}
+
+/** The next path tokens `COMMAND_TREE` allows after `path` (empty when `path` is a leaf). */
+function childrenOf(path: string[]): Set<string> {
+  const [command, ...nested] = path;
+  const children = new Set<string>();
+  if (command === undefined) return children;
+  const prefix = nested.length === 0 ? "" : `${nested.join(" ")} `;
+  for (const candidate of COMMAND_TREE[command] ?? []) {
+    if (!candidate.startsWith(prefix)) continue;
+    const next = candidate.slice(prefix.length).split(" ")[0];
+    if (next) children.add(next);
+  }
+  return children;
+}
+
+export type WalkedPath = { ok: true; path: string[] } | Extract<HelpResolution, { ok: false }>;
+
+/**
+ * Walks the arguments after `command` down `COMMAND_TREE` until one is a flag or the path
+ * reaches a leaf. Past a leaf the arguments are positionals and values (`quest merge <id>`,
+ * `quiet 2h`, `scry`), left to the command. An argument that is not a child of a node that
+ * has children is an unknown subcommand, at any depth (`w5 hook bogus`, `sync bogus`), so a
+ * command missing from the table is unreachable rather than silently running.
+ */
+export function walkPath(command: string, args: string[]): WalkedPath {
+  const path = [command];
+  for (const argument of args) {
+    if (argument.startsWith("-")) break;
+    const children = childrenOf(path);
+    if (children.size === 0) break;
+    if (!children.has(argument)) {
+      return {
+        ok: false,
+        message: `tempad: unknown subcommand "${argument}" for tempad ${path.join(" ")}`,
+        lines: usageForPath(path),
+      };
+    }
+    path.push(argument);
+  }
+  return { ok: true, path };
+}
+
+/** Every path of `COMMAND_TREE` and every path a usage entry documents, for the drift test. */
+export function documentedPaths(): { table: string[]; usage: string[] } {
+  const table = Object.entries(COMMAND_TREE).flatMap(([command, nested]) => [
+    command,
+    ...nested.map((path) => `${command} ${path}`),
+  ]);
+  const usage = [...new Set(USAGE_ENTRIES.flatMap((entry) => entry.paths))];
+  return { table, usage };
+}

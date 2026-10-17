@@ -209,6 +209,7 @@ tempad w5 backfill      # classify recent sessions the hook missed (--days <n>, 
 tempad review           # open doubts and unconfirmed quests
 tempad scry             # health check: is the data sound, is a backfill or eval due?
 tempad --help           # every command
+tempad help w5 backfill # usage of one command or subcommand (also: tempad w5 backfill --help)
 ```
 
 `--full` clears a source's last-sync cursor so it rescans back to `SINCE`.

@@ -34,6 +34,16 @@ import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
 import { forgetSync, formatForgetSummary, rejoinServer } from "./sync/forget.ts";
 import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
+  COMMAND_TREE,
+  globalHelp,
+  globalUsage,
+  type HelpResolution,
+  isCommand,
+  resolveHelp,
+  usageForPath,
+  walkPath,
+} from "./usage.ts";
+import {
   planW5Command,
   runQuietCommand,
   runReviewCommand,
@@ -43,62 +53,7 @@ import {
 } from "./w5/cli.ts";
 import { userClaudeDirectory } from "./w5/hooks.ts";
 
-/**
- * Every command and the nested paths below it (`w5 hook install`), as `dispatch` accepts them.
- * `--help`/`-h` is answered from this table, and the help test walks it, so a command that
- * is routed in `dispatch` but missing here gets no `--help` (the test catches that through
- * `USAGE_LINES`).
- */
-export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
-  hero: ["init"],
-  party: ["add", "leave", "list"],
-  client: ["add"],
-  saga: ["add", "reword", "replace", "end", "edit", "list"],
-  quest: [
-    "add",
-    "reword",
-    "replace",
-    "end",
-    "edit",
-    "confirm",
-    "merge",
-    "pause",
-    "resume",
-    "done",
-    "abandon",
-    "branch",
-    "return",
-    "retract",
-    "delete",
-    "list",
-    "declare",
-  ],
-  stint: ["list"],
-  trace: ["list"],
-  impact: ["set", "list", "import"],
-  answer: [],
-  rebuild: [],
-  setup: [],
-  init: [],
-  sync: ["monday", "github", "claude"],
-  report: ["daily", "project", "hourly", "weekly"],
-  w5: [
-    "enqueue",
-    "context",
-    "run",
-    "hook",
-    "hook install",
-    "hook uninstall",
-    "backfill",
-    "dedupe",
-    "eval",
-  ],
-  quiet: [],
-  review: [],
-  scry: [],
-  skill: ["install"],
-  project: ["register", "list", "reresolve"],
-};
+export { COMMAND_TREE };
 
 const INTENT_COMMANDS = new Set([
   "hero",
@@ -113,44 +68,8 @@ const INTENT_COMMANDS = new Set([
   "rebuild",
 ]);
 
-const USAGE_LINES: string[] = [
-  "Usage:",
-  "  tempad --help | -h | help | --version",
-  "  tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
-  "  tempad sync [monday|github|claude] [--full] | --push | --pull | --push --pull | --forget [--force] | --rejoin <server-id>   (--rejoin: let sync use a server --forget left, accepting overwrites; --forget: after removing [sync], drop the sync triggers, tombstones and cursors for good; local only; refuses while changes never reached the server unless --force)",
-  "  tempad report <daily|project|hourly|weekly> --from <date> --to <date> [--org X] [--project Y] [--out path] [--as-of <iso>] [--party <slug>] [--client <slug>] [--pr-date merged|authored]",
-  '  tempad hero init "<name>"',
-  '  tempad party add <slug> "<name>" [--joined YYYY-MM-DD] | leave <slug> --reason "..." | list',
-  '  tempad client add <slug> "<name>"',
-  '  tempad saga add --owner hero|party:<slug> "<title>" [--statement] | reword <id> "<title>" | replace <id> "<title>" --reason "..." | end <id> --reason ... | list [--all] [--as-of <iso>]',
-  '  tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment] | confirm|merge|pause|resume|done|abandon|branch|return <id> | list [--all] [--unconfirmed] [--side] [--as-of <iso>]',
-  '  tempad quest retract <id> --reason "..." [--force]   (undo a quest created by mistake; alias: delete)',
-  '  tempad quest declare --session <id> (--quest <id> | --new "<title>" --outcome "<text>" | --done <quest>) [--plan "a; b; c"] ...',
-  "  tempad stint list [--open] [--quest <id>]",
-  "  tempad trace list [--since <iso>] [--stint <id>]",
-  '  tempad impact set <ref> "<text>" [--theme <t>] | list [--project <p>] [--from <date> --to <date>] | import <file.json>',
-  '  tempad answer <question-id> (--belongs | --quest <id|new:"title">) [--why "..."]',
-  "  tempad rebuild [--until <iso>]",
-  "  tempad w5 enqueue --session <id> [--forced]",
-  "  tempad w5 context --session <id>",
-  "  tempad w5 run [--detached]",
-  "  tempad w5 hook install|uninstall [--scope user|project]",
-  "  tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)",
-  "  tempad w5 dedupe [--dry-run]",
-  "  tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
-  "  tempad quiet <2h|30m>",
-  "  tempad review [--days <n>]",
-  "  tempad scry [--json] [--days <n>] [--fast]   (read-only health check of the data: Health, Stats, Recommendations; exit 1 when a check fails; --fast skips quick_check and the projection replay)",
-  "  tempad skill install [--scope user|project]",
-  '  tempad project register <path> --name "<display>" [--org <org>] [--project <slug>] | list | reresolve <path>',
-];
-
 function printUsage(): void {
-  for (const line of USAGE_LINES) console.error(line);
-}
-
-function printHelp(): void {
-  for (const line of USAGE_LINES) console.log(line);
+  for (const line of globalUsage()) console.error(line);
 }
 
 /**
@@ -652,25 +571,27 @@ async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[])
   return 2;
 }
 
-/** `<command> --help` only applies to a command that exists; an unknown one is a usage error. */
-function isKnownCommand(command: string | undefined): command is string {
-  return command !== undefined && Object.hasOwn(COMMAND_TREE, command);
+/** Usage to stdout and 0, or the error and the nearest usage to stderr and 2. */
+function printResolvedHelp(resolution: HelpResolution): number {
+  if (resolution.ok) {
+    for (const line of resolution.lines) console.log(line);
+    return 0;
+  }
+  console.error(resolution.message);
+  for (const line of resolution.lines) console.error(line);
+  return 2;
 }
 
-/**
- * `--help`/`-h` anywhere before a `--` terminator asks for usage, whatever the nesting
- * (`w5 backfill --help`, `w5 hook install -h`). A nested name the command does not have
- * (`w5 bogus --help`) is still a usage error, so only a known path gets help.
- */
-function wantsHelp(command: string | undefined, rest: string[]): command is string {
-  if (!isKnownCommand(command)) return false;
+/** `--help`/`-h` anywhere before a `--` terminator asks for usage, whatever the nesting. */
+function isHelpFlagRequest(rest: string[]): boolean {
+  return argumentsBeforeTerminator(rest).some(
+    (argument) => argument === "--help" || argument === "-h",
+  );
+}
+
+function argumentsBeforeTerminator(rest: string[]): string[] {
   const terminator = rest.indexOf("--");
-  const flags = terminator === -1 ? rest : rest.slice(0, terminator);
-  if (!flags.some((argument) => argument === "--help" || argument === "-h")) return false;
-  const subcommands = COMMAND_TREE[command] ?? [];
-  const first = rest[0];
-  if (subcommands.length === 0 || first === undefined || first.startsWith("-")) return true;
-  return subcommands.some((path) => path === first || path.startsWith(`${first} `));
+  return terminator === -1 ? rest : rest.slice(0, terminator);
 }
 
 async function dispatch(command: string | undefined, rest: string[]): Promise<number> {
@@ -678,13 +599,19 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     console.log(packageJson.version);
     return 0;
   }
-  if (command === "--help" || command === "-h" || command === "help") {
-    printHelp();
+  if (command === "--help" || command === "-h") {
+    for (const line of globalHelp()) console.log(line);
     return 0;
   }
-  if (wantsHelp(command, rest)) {
-    printHelp();
-    return 0;
+  if (command === "help") return printResolvedHelp(resolveHelp(rest));
+  if (isCommand(command)) {
+    // Also the gate for running: an argument the table does not list under a command with
+    // subcommands is a usage error, so a command missing from `COMMAND_TREE` cannot run.
+    const walked = walkPath(command, rest);
+    if (!walked.ok) return printResolvedHelp(walked);
+    if (isHelpFlagRequest(rest)) {
+      return printResolvedHelp({ ok: true, lines: usageForPath(walked.path) });
+    }
   }
 
   // `setup` needs no configuration and opens no database: it creates them.
