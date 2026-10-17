@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   AnthropicClassifier,
   type ClassifierWindow,
+  cutAtCodePoint,
   DEFAULT_NEW_STINT_REASON,
   UNRECOGNIZED_QUEST_ALIAS_GUESS,
   UNSPECIFIED_GUESS,
@@ -664,16 +665,97 @@ describe("classifier", () => {
     ).toThrow(/outside the window/);
   });
 
-  test("validateResult does not drop a segment with an offset timestamp that is inside the window by instant, it reports it", () => {
-    // 12:05-03:00 is 15:05Z: inside the window, but not the form the prompt asked for.
+  test("validateResult accepts an offset segment inside the window and stores it as canonical UTC", () => {
+    // 12:05-03:00 is 15:05Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T12:05:00.000-03:00",
+            endedAt: "2026-09-04T12:15:00-03:00",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:05:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:15:00.000Z");
+    expect(result.boundsClamped).toBe(0);
+    expect(result.overlapDropped).toBe(0);
+  });
+
+  test("validateResult accepts a segment ending at ...:00Z when the last message is ...:00.000Z", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:00:00Z",
+            endedAt: "2026-09-04T15:20:00Z",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:20:00.000Z");
+    expect(result.boundsClamped).toBe(0);
+  });
+
+  test("validateResult clamps an offset segment that straddles the first message", () => {
+    // 11:55-03:00 is 14:55Z, 12:10-03:00 is 15:10Z.
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T11:55:00.000-03:00",
+            endedAt: "2026-09-04T12:10:00.000-03:00",
+          },
+        ],
+      },
+      window,
+    );
+    expect(result.segments[0]?.startedAt).toBe("2026-09-04T15:00:00.000Z");
+    expect(result.segments[0]?.endedAt).toBe("2026-09-04T15:10:00.000Z");
+    expect(result.boundsClamped).toBe(1);
+  });
+
+  test("validateResult still reports an offset segment that is outside the window by instant", () => {
+    // 13:00-03:00 is 16:00Z, after the last message, though "13:00" sorts before "15:20".
     expect(() =>
       validateResult(
         {
           segments: [
             {
               ...good.segments[0],
-              startedAt: "2026-09-04T12:05:00.000-03:00",
-              endedAt: "2026-09-04T12:10:00.000-03:00",
+              startedAt: "2026-09-04T13:00:00.000-03:00",
+              endedAt: "2026-09-04T13:10:00.000-03:00",
+            },
+          ],
+        },
+        window,
+      ),
+    ).toThrow(/outside the window/);
+  });
+
+  test("validateResult does not read a bare year as a timestamp", () => {
+    // Date.parse("2026") is 2026-01-01T00:00:00Z; as an instant it would be clamped quietly.
+    expect(() =>
+      validateResult({ segments: [{ ...good.segments[0], startedAt: "2026" }] }, window),
+    ).toThrow(/startedAt/);
+  });
+
+  test("validateResult does not silently drop an inverted pair that lies wholly in the tail", () => {
+    expect(() =>
+      validateResult(
+        {
+          segments: [
+            {
+              ...good.segments[0],
+              startedAt: "2026-09-04T14:50:00.000Z",
+              endedAt: "2026-09-04T14:40:00.000Z",
             },
           ],
         },
@@ -713,6 +795,26 @@ describe("classifier", () => {
     expect(result.sessionNote?.isWellFormed()).toBe(true);
     expect(result.sessionNote).toBe(`${"n".repeat(298)}…`);
     expect(result.sessionNoteTruncated).toBe(1);
+  });
+
+  test("validateResult keeps a surrogate pair that ends exactly at the sessionNote cut", () => {
+    const note = `${"n".repeat(297)}😀${"tail".repeat(10)}`;
+    const result = validateResult({ ...good, sessionNote: note });
+    expect(result.sessionNote).toBe(`${"n".repeat(297)}😀…`);
+    expect(result.sessionNote?.isWellFormed()).toBe(true);
+  });
+
+  test("cutAtCodePoint steps back over a high surrogate at either end of the range", () => {
+    // U+10000 starts with D800 and U+10FFFF with DBFF: the first and last high surrogates.
+    for (const character of ["\u{10000}", "\u{10FFFF}"]) {
+      const cut = cutAtCodePoint(`abc${character}def`, 4);
+      expect(cut).toBe("abc");
+      expect(cut.isWellFormed()).toBe(true);
+    }
+    expect(cutAtCodePoint("abc\u{10FFFF}def", 5)).toBe("abc\u{10FFFF}");
+    // A lone low surrogate is not a reason to step back, and neither is a character just below D800.
+    expect(cutAtCodePoint("ab\u{D7FF}cd", 3)).toBe("ab\u{D7FF}");
+    expect(cutAtCodePoint("abc", 0)).toBe("");
   });
 
   test("describeJobFailure never splits a surrogate pair at the excerpt boundary", () => {

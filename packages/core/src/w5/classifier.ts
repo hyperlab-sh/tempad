@@ -279,7 +279,8 @@ export function cutAtCodePoint(text: string, length: number): string {
  * one that runs a moment past the last message ends there; both are counted as
  * clamped, and a clamp that leaves no time (`start >= end`) drops the segment
  * too, since a zero-minute trace would only open a stint or re-ask a question
- * about work already recorded. Instants are compared, not strings.
+ * about work already recorded. Instants are compared, not strings, and a kept
+ * pair is normalized to canonical UTC text.
  *
  * Anything that is not a well-formed pair is left alone for `validateSegment`
  * to report with its retry hint: not an ISO timestamp, an end before its start,
@@ -304,6 +305,13 @@ function repairBounds(
     return "keep";
   }
   if (start > end) return "keep";
+
+  // A well-formed pair is rewritten to canonical UTC (`toISOString`) so that
+  // `validateSegment` and everything after it, which compare and store text,
+  // see the instant the model meant: `12:05-03:00` is `15:05:00.000Z`, and
+  // `15:30:00Z` equals a message at `15:30:00.000Z` instead of sorting after it.
+  segment.startedAt = new Date(start).toISOString();
+  segment.endedAt = new Date(end).toISOString();
 
   if (start < first && end <= first) {
     counters.overlapDropped += 1;
