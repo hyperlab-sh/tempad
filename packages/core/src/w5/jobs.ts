@@ -294,7 +294,10 @@ export function holdsClaim(database: Database, id: number, claim: JobClaim): boo
 }
 
 /**
- * Marks the job done. With a `claim`, the update itself requires the caller to
+ * Marks the job done. `finishedAt` is when the work actually ended (default: the
+ * wall clock now); `now` is the run's own timestamp and only feeds
+ * `w5_runs.last_run_at`, which throttling measures from the start of the run.
+ * Using `now` for `finished_at` made every done job's duration zero. With a `claim`, the update itself requires the caller to
  * still hold it (the same test as `holdsClaim`, in the one statement, so nothing
  * can change between check and write) and nothing is written otherwise; callers
  * that applied a result do both in one transaction, so a reaped runner discards
@@ -307,8 +310,9 @@ export function completeJob(
   now?: string,
   sessionNote?: string | null,
   claim?: JobClaim,
+  finishedAt: string = new Date().toISOString(),
 ): boolean {
-  const finishedAt = now ?? new Date().toISOString();
+  const runAt = now ?? finishedAt;
   const settle = database.transaction((): boolean => {
     const job = database.query("SELECT session_id FROM w5_jobs WHERE id = ?").get(id) as {
       session_id: string;
@@ -334,15 +338,23 @@ export function completeJob(
                                                last_message_ts = excluded.last_message_ts,
                                                session_note = excluded.session_note`,
       )
-      .run(job.session_id, finishedAt, lastMessageTs, sessionNote ?? null);
+      .run(job.session_id, runAt, lastMessageTs, sessionNote ?? null);
     return true;
   });
   return settle();
 }
 
-/** Marks the job failed; with a `claim`, only while the caller still holds it (one statement). */
-export function failJob(database: Database, id: number, error: string, claim?: JobClaim): boolean {
-  const now = new Date().toISOString();
+/**
+ * Marks the job failed at `now` (default: the wall clock); with a `claim`, only
+ * while the caller still holds it (one statement).
+ */
+export function failJob(
+  database: Database,
+  id: number,
+  error: string,
+  claim?: JobClaim,
+  now: string = new Date().toISOString(),
+): boolean {
   const result = claim
     ? database
         .query(
