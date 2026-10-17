@@ -89,7 +89,7 @@ export function checkLock(
 export function clearStaleLock(
   lockPath: string,
   log: (line: string) => void,
-  options: { now?: number; isAlive?: (pid: number) => boolean } = {},
+  options: { now?: number; isAlive?: (pid: number) => boolean; name?: string } = {},
 ): boolean {
   if (!existsSync(lockPath)) return false;
   const { stale, ageMinutes, reason } = checkLock(lockPath, options);
@@ -100,7 +100,9 @@ export function clearStaleLock(
     "runner-gone": "its runner is not running",
     undefined: "stale",
   }[String(reason)];
-  log(`w5.lock is stale (${Math.round(ageMinutes)}m untouched, ${why}), removing`);
+  log(
+    `${options.name ?? "w5.lock"} is stale (${Math.round(ageMinutes)}m untouched, ${why}), removing`,
+  );
   try {
     unlinkSync(lockPath);
   } catch (error) {
