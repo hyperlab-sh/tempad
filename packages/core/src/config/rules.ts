@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as resolvePathname } from "node:path";
+import { describeValue } from "./describe-value";
 
 export interface PathRule {
   pattern?: string;
@@ -121,6 +122,11 @@ function validateEntityRules<T extends Record<string, unknown>>(
   keyField: string,
 ): void {
   rawRules.forEach((rule, index) => {
+    if (typeof rule !== "object" || rule === null) {
+      throw new Error(
+        `${kind} entry at index ${index} must be a table, got ${describeValue(rule)}`,
+      );
+    }
     if (typeof rule[keyField] !== "string" || (rule[keyField] as string).length === 0) {
       throw new Error(`${kind} entry at index ${index} is missing "${keyField}"`);
     }
@@ -137,22 +143,37 @@ function validateEntityRules<T extends Record<string, unknown>>(
   });
 }
 
+/** `[[projects]]` and friends must be arrays of tables; a plain `[projects]` table or a scalar is not. */
+function tableArray<T>(value: unknown, kind: string): T[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `${kind} must be an array of tables ([[${kind}]]), got ${describeValue(value)}`,
+    );
+  }
+  return value as T[];
+}
+
 /**
- * A rule's display `name` is optional: absent is `null`. One of the wrong type
- * (`name = 5`) used to be stored as it was and end up in `project_name`; it is
- * now ignored with a warning, like an unset one.
+ * A string key of a `[[projects]]` entry. Absent and empty are `undefined` (the
+ * caller decides whether that is an error); any other type is not a string, and
+ * for a required key that is an error, for an optional one a warning and `undefined`.
  */
-function displayName(
+function stringKey(
   rule: PathRule,
+  key: "pattern" | "path" | "org" | "project" | "name",
   index: number,
+  required: boolean,
+  tomlPath: string,
   warn: (message: string) => void,
-): string | null {
-  if (rule.name === undefined) return null;
-  if (typeof rule.name === "string") return rule.name;
-  warn(
-    `tempad.toml: projects entry at index ${index}: "name" must be a string, got ${JSON.stringify(rule.name)}; ignoring it. Fix the value.`,
-  );
-  return null;
+): string | undefined {
+  const value = rule[key] as unknown;
+  if (value === undefined || value === "") return undefined;
+  if (typeof value === "string") return value;
+  const where = `projects entry at index ${index}: "${key}" must be a string, got ${describeValue(value)}`;
+  if (required) throw new Error(where);
+  warn(`${tomlPath}: ${where}; ignoring it. Fix the value.`);
+  return undefined;
 }
 
 export function loadRules(
@@ -165,14 +186,19 @@ export function loadRules(
 
   const text = readFileSync(tomlPath, "utf8");
   const parsed = Bun.TOML.parse(text) as {
-    projects?: PathRule[];
-    repositories?: RepositoryRule[];
-    boards?: BoardRule[];
+    projects?: unknown;
+    repositories?: unknown;
+    boards?: unknown;
   };
-  const rawRules = parsed.projects ?? [];
+  const rawRules = tableArray<PathRule>(parsed.projects, "projects");
   const home = homedir();
 
   const projects = rawRules.map((rule, index) => {
+    if (typeof rule !== "object" || rule === null) {
+      throw new Error(
+        `projects entry at index ${index} must be a table, got ${describeValue(rule)}`,
+      );
+    }
     const hasPattern = rule.pattern !== undefined;
     const hasPath = rule.path !== undefined;
 
@@ -182,49 +208,54 @@ export function loadRules(
       );
     }
 
+    // Optional: a display label, and (for a pattern rule) org/project that a named group may supply.
+    const name = stringKey(rule, "name", index, false, tomlPath, warn) ?? null;
+
     if (hasPath) {
-      if (!rule.org || !rule.project) {
+      const path = stringKey(rule, "path", index, true, tomlPath, warn);
+      const org = stringKey(rule, "org", index, true, tomlPath, warn);
+      const project = stringKey(rule, "project", index, true, tomlPath, warn);
+      if (!path) throw new Error(`projects entry at index ${index} has an empty "path"`);
+      if (!org || !project) {
         throw new Error(
-          `projects entry at index ${index} (path "${rule.path}") requires "org" and "project"`,
+          `projects entry at index ${index} (path "${path}") requires "org" and "project"`,
         );
       }
-      const absolutePath = normalizePathForMatch(rule.path as string, home);
       return {
         kind: "path" as const,
-        absolutePath,
-        org: rule.org,
-        project: rule.project,
-        name: displayName(rule, index, warn),
+        absolutePath: normalizePathForMatch(path, home),
+        org,
+        project,
+        name,
       };
     }
 
-    const pathname = expandHome(rule.pattern as string, home);
+    const pattern = stringKey(rule, "pattern", index, true, tomlPath, warn);
+    if (!pattern) throw new Error(`projects entry at index ${index} has an empty "pattern"`);
+    const org = stringKey(rule, "org", index, false, tomlPath, warn);
+    const project = stringKey(rule, "project", index, false, tomlPath, warn);
+
+    const pathname = expandHome(pattern, home);
     const urlPattern = new URLPattern({ pathname });
 
     const groupNames = extractGroupNames(pathname);
     const hasOrgGroup = groupNames.has("org");
     const hasProjectGroup = groupNames.has("project");
 
-    if (!rule.org && !hasOrgGroup) {
-      throw new Error(`Rule at index ${index} (pattern "${rule.pattern}") cannot supply "org"`);
+    if (!org && !hasOrgGroup) {
+      throw new Error(`Rule at index ${index} (pattern "${pattern}") cannot supply "org"`);
     }
-    if (!rule.project && !hasProjectGroup) {
-      throw new Error(`Rule at index ${index} (pattern "${rule.pattern}") cannot supply "project"`);
+    if (!project && !hasProjectGroup) {
+      throw new Error(`Rule at index ${index} (pattern "${pattern}") cannot supply "project"`);
     }
 
-    return {
-      kind: "pattern" as const,
-      urlPattern,
-      org: rule.org,
-      project: rule.project,
-      name: displayName(rule, index, warn),
-    };
+    return { kind: "pattern" as const, urlPattern, org, project, name };
   });
 
-  const repositories = parsed.repositories ?? [];
+  const repositories = tableArray<RepositoryRule>(parsed.repositories, "repositories");
   validateEntityRules(repositories, "repositories", "full_name");
 
-  const boards = parsed.boards ?? [];
+  const boards = tableArray<BoardRule>(parsed.boards, "boards");
   validateEntityRules(boards, "boards", "name");
 
   return { projects, repositories, boards };

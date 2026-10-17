@@ -33,7 +33,7 @@ async function run(toml: string, args: string[]) {
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
-  return { code, stdout, stderr };
+  return { code, stdout, stderr, toml: join(home, "tempad.toml") };
 }
 
 describe("a [w5] key of the wrong type, through the CLI", () => {
@@ -45,8 +45,8 @@ describe("a [w5] key of the wrong type, through the CLI", () => {
     expect(result.code).toBe(0);
     const lines = result.stderr.split("\n").filter((line) => line !== "");
     expect(lines).toEqual([
-      'tempad.toml: [w5].watch_turns must be a number, got "x" (a string); using the default 3. Fix the value.',
-      'tempad.toml: [w5].stint_idle_minutes must be a number, got "abc" (a string); using the default 45. Fix the value.',
+      `${result.toml}: [w5].watch_turns must be a whole number, 0 or more, got "x" (a string); using the default 3. Fix the value.`,
+      `${result.toml}: [w5].stint_idle_minutes must be a number, 0 or more, got "abc" (a string); using the default 45. Fix the value.`,
     ]);
     expect(result.stdout).not.toContain("tempad.toml");
   });
