@@ -823,7 +823,9 @@ describe("sync", () => {
 
 describe("config", () => {
   test("an unreadable tempad.toml fails the config check", () => {
-    const home = track(makeHome({ toml: "[w5\nbroken" }));
+    // Not `[w5\nbroken`: Bun 1.3.14's parser accepts that as `{ w5: {} }` (1.4 throws), so it only
+    // failed on a newer Bun. A doubled `=` is rejected by every version.
+    const home = track(makeHome({ toml: "[w5]\nmodel = = 1\n" }));
     const { code, report } = scryJson(home);
     expect(code).toBe(1);
     expect(checkOf(report, "config").status).toBe("fail");
