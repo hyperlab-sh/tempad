@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -84,6 +85,61 @@ function seedSourceDb(path: string): void {
   database.close();
 }
 
+/**
+ * A hash of everything the database holds (schema and every row of every table), read through
+ * a short-lived read-only connection that sees committed WAL frames. It deliberately ignores the
+ * file's bytes: the source runs in WAL mode, so the main file also changes when SQLite
+ * checkpoints, which a seeding connection does when it is finalized (bun:sqlite defers the real
+ * close while a cached statement is alive, so that moment depends on GC and machine load) and
+ * which says nothing about whether eval wrote to the source.
+ */
+function snapshotContent(path: string): string {
+  const database = new Database(path, { readonly: true });
+  try {
+    const objects = database
+      .query(
+        "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+      )
+      .all() as { type: string; name: string; sql: string | null }[];
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(JSON.stringify(objects));
+    for (const object of objects) {
+      if (object.type !== "table") continue;
+      const rows = database
+        .query(`SELECT rowid AS "rowid", * FROM "${object.name}" ORDER BY rowid`)
+        .all();
+      hasher.update(`${object.name}\n${JSON.stringify(rows)}`);
+    }
+    return hasher.digest("hex");
+  } finally {
+    database.close();
+  }
+}
+
+describe("snapshotContent", () => {
+  test("changes when a row is written, and not when SQLite only checkpoints the WAL", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-eval-snapshot-"));
+    const sourcePath = join(dir, "source.db");
+    seedSourceDb(sourcePath);
+    const before = snapshotContent(sourcePath);
+    expect(snapshotContent(sourcePath)).toBe(before);
+
+    const writer = openDatabase(sourcePath);
+    try {
+      writer.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      expect(snapshotContent(sourcePath)).toBe(before);
+      writer
+        .query(
+          "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES ('m3', 's1', '2026-09-01T10:06:00.000Z', 'user', 0, 'x')",
+        )
+        .run();
+    } finally {
+      writer.close();
+    }
+    expect(snapshotContent(sourcePath)).not.toBe(before);
+  });
+});
+
 describe("validateEvalRange bare-date timezone", () => {
   test("resolves a bare date to the configured TZ's local day", () => {
     const range = validateEvalRange("2026-09-02", "2026-09-02", "America/Sao_Paulo");
@@ -119,7 +175,7 @@ describe("w5 eval", () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-eval-"));
     const sourcePath = join(dir, "source.db");
     seedSourceDb(sourcePath);
-    const sourceBytesBefore = await Bun.file(sourcePath).arrayBuffer();
+    const sourceBefore = snapshotContent(sourcePath);
 
     const metrics = await runEval({
       from: "2026-09-01",
@@ -146,15 +202,14 @@ describe("w5 eval", () => {
     });
     expect(metrics.copiedDbPath).not.toBe(sourcePath);
 
-    const sourceBytesAfter = await Bun.file(sourcePath).arrayBuffer();
-    expect(Buffer.from(sourceBytesAfter).equals(Buffer.from(sourceBytesBefore))).toBe(true);
+    expect(snapshotContent(sourcePath)).toBe(sourceBefore);
   });
 
   test("never opens the source database for writing even when the eval range excludes all sessions", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tempad-eval-empty-"));
     const sourcePath = join(dir, "source.db");
     seedSourceDb(sourcePath);
-    const sourceBytesBefore = await Bun.file(sourcePath).arrayBuffer();
+    const sourceBefore = snapshotContent(sourcePath);
 
     const metrics = await runEval({
       from: "2026-01-01",
@@ -172,8 +227,7 @@ describe("w5 eval", () => {
     expect(metrics.medianStintDurationMinutes).toBe(0);
     expect(metrics.sample.length).toBe(0);
 
-    const sourceBytesAfter = await Bun.file(sourcePath).arrayBuffer();
-    expect(Buffer.from(sourceBytesAfter).equals(Buffer.from(sourceBytesBefore))).toBe(true);
+    expect(snapshotContent(sourcePath)).toBe(sourceBefore);
   });
 
   test("the stints/traces ratio excludes dismissed stints from the denominator", async () => {
@@ -780,7 +834,7 @@ describe("w5 eval", () => {
       .run();
     database.close();
 
-    const sourceBytesBefore = await Bun.file(sourcePath).arrayBuffer();
+    const sourceBefore = snapshotContent(sourcePath);
 
     const metrics = await runEval({
       from: "2026-09-01",
@@ -792,8 +846,7 @@ describe("w5 eval", () => {
       log: () => {},
     });
 
-    const sourceBytesAfter = await Bun.file(sourcePath).arrayBuffer();
-    expect(Buffer.from(sourceBytesAfter).equals(Buffer.from(sourceBytesBefore))).toBe(true);
+    expect(snapshotContent(sourcePath)).toBe(sourceBefore);
 
     expect(metrics.resetTraces).toBe(1);
     expect(metrics.resetStints).toBe(1);
