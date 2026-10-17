@@ -166,6 +166,18 @@ export interface ClassifierResult {
    */
   selectorDefaulted?: number;
   /**
+   * Segments the model placed wholly before the window's first message, i.e. in
+   * the context-only overlap tail, and that validation dropped: that stretch was
+   * already classified by an earlier run, so recording it would double-count.
+   */
+  overlapDropped?: number;
+  /** Segments that partly overlapped the window and had a bound clamped to it. */
+  boundsClamped?: number;
+  /** Segments with `belongs: false` that named no guess and got `UNSPECIFIED_GUESS`. */
+  guessDefaulted?: number;
+  /** 1 when the `sessionNote` was over the limit and cut, else 0. */
+  sessionNoteTruncated?: number;
+  /**
    * Segments that named more than one selector and were narrowed to the first by
    * precedence (matchedStint > continuesStint > newStintReason).
    */
@@ -173,6 +185,14 @@ export interface ClassifierResult {
 }
 
 export const MAX_SESSION_NOTE_LENGTH = 300;
+
+/**
+ * Stands in for the `guess` of a `belongs: false` segment that named none. The
+ * doubt itself is real, only its description is missing; this is the same text
+ * the hand-back falls back to for a question stored with no guess, so the human
+ * reads one wording either way.
+ */
+export const UNSPECIFIED_GUESS = "something else";
 
 /** Stands in for a `newStintReason` the classifier omitted entirely. */
 export const DEFAULT_NEW_STINT_REASON = "classifier gave no reason";
@@ -223,6 +243,51 @@ function requireString(value: unknown, path: string, problems: string[]): value 
 interface SelectorCounters {
   selectorDefaulted: number;
   selectorAmbiguous: number;
+  guessDefaulted: number;
+}
+
+interface RepairCounters {
+  overlapDropped: number;
+  boundsClamped: number;
+}
+
+/**
+ * Brings a segment's timestamps inside the window, or says to drop it.
+ *
+ * The prompt lists an overlap tail as context only, but models classify it
+ * anyway, and a segment that starts in the tail and runs into the window is
+ * ordinary. A segment ending before the window's first message lies wholly in
+ * that tail (it is earlier work an earlier run already recorded) and is dropped.
+ * One that straddles the first message starts there instead, and one that runs
+ * a moment past the last message ends there; both are counted as clamped.
+ * Anything else (not a string, starting after the last message) is left alone
+ * for `validateSegment` to report, since there is nothing true to repair it to.
+ */
+function repairBounds(
+  raw: unknown,
+  bounds: { firstTs: string; lastTs: string },
+  counters: RepairCounters,
+): "keep" | "drop" {
+  if (typeof raw !== "object" || raw === null) return "keep";
+  const segment = raw as Record<string, unknown>;
+  const { startedAt, endedAt } = segment;
+  if (typeof startedAt !== "string" || typeof endedAt !== "string") return "keep";
+
+  if (endedAt < bounds.firstTs) {
+    counters.overlapDropped += 1;
+    return "drop";
+  }
+  let clamped = false;
+  if (startedAt < bounds.firstTs) {
+    segment.startedAt = bounds.firstTs;
+    clamped = true;
+  }
+  if (endedAt > bounds.lastTs && startedAt <= bounds.lastTs) {
+    segment.endedAt = bounds.lastTs;
+    clamped = true;
+  }
+  if (clamped) counters.boundsClamped += 1;
+  return "keep";
 }
 
 interface DeclaredAliases {
@@ -354,10 +419,12 @@ function validateSegment(
     }
 
     if (segment.belongs === false) {
-      // A doubt with nothing to say is useless to the human answering it, so this
-      // is the one new hard requirement rather than a repair.
+      // A doubt with nothing to say is useless to the human answering it, but
+      // the doubt is real: only its description is missing, and failing the
+      // window would lose the stretch of work it describes.
       if (typeof segment.guess !== "string" || segment.guess.trim() === "") {
-        problems.push(`${where}.guess: expected a non-empty string when belongs is false`);
+        segment.guess = UNSPECIFIED_GUESS;
+        counters.guessDefaulted += 1;
       }
       // A segment that serves nothing declared has no quest to name.
       segment.quest = null;
@@ -519,18 +586,31 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
         })()
       : null;
 
-  const counters: SelectorCounters = { selectorDefaulted: 0, selectorAmbiguous: 0 };
-  const segments = (raw as { segments: unknown[] }).segments;
+  const counters: SelectorCounters = {
+    selectorDefaulted: 0,
+    selectorAmbiguous: 0,
+    guessDefaulted: 0,
+  };
+  const repairs: RepairCounters = { overlapDropped: 0, boundsClamped: 0 };
+  const segments =
+    bounds === null
+      ? (raw as { segments: unknown[] }).segments
+      : (raw as { segments: unknown[] }).segments.filter(
+          (segment) => repairBounds(segment, bounds, repairs) === "keep",
+        );
   for (const [index, segment] of segments.entries()) {
     validateSegment(segment, index, problems, bounds, counters, aliases, mode, declaredAliases);
   }
 
-  const sessionNote = (raw as { sessionNote?: unknown }).sessionNote;
-  if (
-    sessionNote !== undefined &&
-    sessionNote !== null &&
-    (typeof sessionNote !== "string" || sessionNote.length > MAX_SESSION_NOTE_LENGTH)
-  ) {
+  let sessionNote = (raw as { sessionNote?: unknown }).sessionNote;
+  let sessionNoteTruncated = 0;
+  if (typeof sessionNote === "string" && sessionNote.length > MAX_SESSION_NOTE_LENGTH) {
+    // A hint for the next run, not a fact: cutting it loses a few words, failing
+    // the window would lose the work classified alongside it.
+    sessionNote = `${sessionNote.slice(0, MAX_SESSION_NOTE_LENGTH - 1)}…`;
+    sessionNoteTruncated = 1;
+  }
+  if (sessionNote !== undefined && sessionNote !== null && typeof sessionNote !== "string") {
     problems.push(
       `sessionNote: expected null or a string of at most ${MAX_SESSION_NOTE_LENGTH} characters`,
     );
@@ -538,12 +618,15 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
   if (problems.length > 0) {
     throw new Error(`classifier result invalid:\n${problems.join("\n")}`);
   }
-  const result = raw as { segments: ClassifierSegment[]; sessionNote?: string | null };
   return {
-    segments: result.segments,
-    sessionNote: result.sessionNote ?? null,
+    segments: segments as ClassifierSegment[],
+    sessionNote: (sessionNote as string | null | undefined) ?? null,
     selectorDefaulted: counters.selectorDefaulted,
     selectorAmbiguous: counters.selectorAmbiguous,
+    guessDefaulted: counters.guessDefaulted,
+    overlapDropped: repairs.overlapDropped,
+    boundsClamped: repairs.boundsClamped,
+    sessionNoteTruncated,
   };
 }
 

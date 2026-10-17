@@ -206,3 +206,47 @@ describe("a window with no active quest and a model that says belongs: true", ()
     expect(result.selectorDefaulted).toBe(0);
   });
 });
+
+describe("a window whose answer lies in the overlap tail", () => {
+  test("validateResult drops the segment, so applying records no trace and asks no declare question", () => {
+    const fixture = seed();
+    // A tail message before the window: the window starts at the next message.
+    fixture.database
+      .query(
+        `INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview)
+         VALUES ('m0', 's1', '2026-09-04T14:50:00.000Z', 'user', 0, 'earlier work')`,
+      )
+      .run();
+    const window = buildWindow(fixture.database, {
+      sessionId: "s1",
+      sinceTs: "2026-09-04T14:50:00.000Z",
+      maxMessages: 50,
+      memoryHours: 8,
+      memoryStints: 10,
+      overlapMessages: 3,
+      windowEnd: WINDOW_END,
+    });
+    expect(window.overlapMessages.length).toBeGreaterThan(0);
+    const answer = modelAnswer(null);
+    answer.segments[0] = {
+      ...answer.segments[0],
+      startedAt: "2026-09-04T14:40:00.000Z",
+      endedAt: "2026-09-04T14:50:00.000Z",
+    } as (typeof answer.segments)[number];
+
+    const result = validateResult(answer, window);
+    const summary = applyResult(fixture.store, fixture.database, window, result, {
+      actor: "hook",
+      askingEnabled: true,
+      now: "2026-09-04T15:30:00.000Z",
+      log: () => {},
+      mode: "declared",
+      stintMinMinutes: 5,
+    });
+
+    expect(result.overlapDropped).toBe(1);
+    expect(summary.traces).toBe(0);
+    expect(fixture.database.query("SELECT 1 FROM traces").all()).toHaveLength(0);
+    expect(fixture.database.query("SELECT 1 FROM questions").all()).toHaveLength(0);
+  });
+});

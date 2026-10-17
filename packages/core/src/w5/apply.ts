@@ -21,7 +21,6 @@ export interface AppliedSummary {
    * two meanings never coexist in the same summary.
    */
   doubts: number;
-  overlapDropped: number;
   unknownStintIds: number;
   /**
    * A matched stint that had no quest, for which the classifier proposed one.
@@ -513,7 +512,6 @@ export function applyResult(
     branches: 0,
     questionsWatching: 0,
     doubts: 0,
-    overlapDropped: 0,
     unknownStintIds: 0,
     questProposedOnMatched: 0,
   };
@@ -545,26 +543,16 @@ export function applyResult(
   // or question was created), so there is no bookkeeping to suppress alongside it.
   const needsDeclaration = declaredMode && Object.keys(questAliases).length === 0;
 
-  const overlapStart = window.overlapMessages[0]?.ts ?? null;
-  const overlapEnd = window.overlapMessages.at(-1)?.ts ?? null;
-  const isOverlapDropped = (segment: ClassifierSegment): boolean =>
-    overlapStart !== null &&
-    overlapEnd !== null &&
-    segment.startedAt >= overlapStart &&
-    segment.endedAt <= overlapEnd;
-
-  // Summed over the same segments the loop below actually records -- an
-  // overlap-dropped segment is context only and must not count toward the
-  // undeclared-time threshold, or the tail alone could trigger a `declare`
+  // Summed over the segments the loop below records. An overlap-tail segment
+  // never gets here: `validateResult` drops one that lies wholly before the
+  // window's first message, so the tail alone cannot trigger a `declare`
   // question for work that was never recorded this window.
   const undeclaredMinutes = needsDeclaration
-    ? result.segments
-        .filter((segment) => !isOverlapDropped(segment))
-        .reduce(
-          (sum, segment) =>
-            sum + (Date.parse(segment.endedAt) - Date.parse(segment.startedAt)) / 60_000,
-          0,
-        )
+    ? result.segments.reduce(
+        (sum, segment) =>
+          sum + (Date.parse(segment.endedAt) - Date.parse(segment.startedAt)) / 60_000,
+        0,
+      )
     : 0;
   const declarationDue = needsDeclaration && undeclaredMinutes >= options.stintMinMinutes;
   let declareAsked = false;
@@ -587,13 +575,6 @@ export function applyResult(
   );
 
   for (const segment of result.segments) {
-    // Belt and braces: the prompt says the overlap tail is context only, but a
-    // model that classifies it anyway must not double-record those minutes.
-    if (isOverlapDropped(segment)) {
-      summary.overlapDropped += 1;
-      continue;
-    }
-
     // A stint opens when the work started, not when the classifier ran. For a
     // live run the two are minutes apart, but backfill classifies history with
     // `now` set to the run's own clock: stamping `opened_at` with it put every

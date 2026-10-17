@@ -262,6 +262,9 @@ export interface EvalMetrics {
   overlapDropped: number;
   questProposedOnMatched: number;
   selectorDefaulted: number;
+  boundsClamped: number;
+  guessDefaulted: number;
+  sessionNoteTruncated: number;
   selectorAmbiguous: number;
   sessionsDeclared: number;
   sessionsInferred: number;
@@ -599,6 +602,9 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
     overlapDropped: backfillResult.overlapDropped,
     questProposedOnMatched: backfillResult.questProposedOnMatched,
     selectorDefaulted: backfillResult.selectorDefaulted,
+    boundsClamped: backfillResult.boundsClamped,
+    guessDefaulted: backfillResult.guessDefaulted,
+    sessionNoteTruncated: backfillResult.sessionNoteTruncated,
     selectorAmbiguous: backfillResult.selectorAmbiguous,
     sessionsDeclared: backfillResult.sessionsDeclared,
     sessionsInferred: backfillResult.sessionsInferred,
