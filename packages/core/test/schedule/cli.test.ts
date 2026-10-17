@@ -31,7 +31,8 @@ describe("tempad schedule (process)", () => {
         expect(result.code).toBe(2);
         expect(result.stderr).toContain("usage: tempad schedule install");
       }
-      expect(readdirSync(home)).toEqual([]);
+      // bun itself may create ~/.bun (its cache) in the fake HOME; tempad must add nothing else.
+      expect(readdirSync(home).filter((name) => name !== ".bun")).toEqual([]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
