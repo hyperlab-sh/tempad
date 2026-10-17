@@ -137,7 +137,28 @@ function validateEntityRules<T extends Record<string, unknown>>(
   });
 }
 
-export function loadRules(tomlPath: string): Rules {
+/**
+ * A rule's display `name` is optional: absent is `null`. One of the wrong type
+ * (`name = 5`) used to be stored as it was and end up in `project_name`; it is
+ * now ignored with a warning, like an unset one.
+ */
+function displayName(
+  rule: PathRule,
+  index: number,
+  warn: (message: string) => void,
+): string | null {
+  if (rule.name === undefined) return null;
+  if (typeof rule.name === "string") return rule.name;
+  warn(
+    `tempad.toml: projects entry at index ${index}: "name" must be a string, got ${JSON.stringify(rule.name)}; ignoring it. Fix the value.`,
+  );
+  return null;
+}
+
+export function loadRules(
+  tomlPath: string,
+  warn: (message: string) => void = (message) => console.warn(message),
+): Rules {
   if (!existsSync(tomlPath)) {
     return { projects: [], repositories: [], boards: [] };
   }
@@ -173,7 +194,7 @@ export function loadRules(tomlPath: string): Rules {
         absolutePath,
         org: rule.org,
         project: rule.project,
-        name: rule.name ?? null,
+        name: displayName(rule, index, warn),
       };
     }
 
@@ -196,7 +217,7 @@ export function loadRules(tomlPath: string): Rules {
       urlPattern,
       org: rule.org,
       project: rule.project,
-      name: rule.name ?? null,
+      name: displayName(rule, index, warn),
     };
   });
 

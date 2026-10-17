@@ -356,3 +356,49 @@ project = "njhcqi"
     expect(() => loadRules(path)).toThrow();
   });
 });
+
+describe("loadRules display name", () => {
+  test("a name of the wrong type is ignored with a warning, on both rule kinds", () => {
+    const path = writeToml(`
+[[projects]]
+path = "/tmp/tempad-name-a"
+org = "a"
+project = "a"
+name = 5
+
+[[projects]]
+pattern = "/tmp/tempad-name-b/:rest*"
+org = "b"
+project = "b"
+name = ["x"]
+
+[[projects]]
+path = "/tmp/tempad-name-c"
+org = "c"
+project = "c"
+name = "Fine"
+`);
+    const warnings: string[] = [];
+    const rules = loadRules(path, (message) => warnings.push(message));
+    expect(rules.projects.map((rule) => rule.name)).toEqual([null, null, "Fine"]);
+    expect(warnings).toEqual([
+      'tempad.toml: projects entry at index 0: "name" must be a string, got 5; ignoring it. Fix the value.',
+      'tempad.toml: projects entry at index 1: "name" must be a string, got ["x"]; ignoring it. Fix the value.',
+    ]);
+  });
+
+  test("an absent or string name warns about nothing", () => {
+    const warnings: string[] = [];
+    loadRules(
+      writeToml(
+        '[[projects]]\npath = "/tmp/tempad-name-d"\norg = "d"\nproject = "d"\nname = "D"\n',
+      ),
+      (message) => warnings.push(message),
+    );
+    loadRules(
+      writeToml('[[projects]]\npath = "/tmp/tempad-name-e"\norg = "e"\nproject = "e"\n'),
+      (message) => warnings.push(message),
+    );
+    expect(warnings).toEqual([]);
+  });
+});

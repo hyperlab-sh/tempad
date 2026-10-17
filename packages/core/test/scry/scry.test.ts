@@ -931,6 +931,38 @@ describe("config", () => {
     const config = checkOf(report, "config");
     expect(config.status).toBe("warn");
     expect(config.details[0]).toContain("memory_stints");
+    expect(config.summary).toBe("1 deprecated setting(s) in tempad.toml");
+  });
+
+  test("a [w5] key of the wrong type warns with the key, the expected type and the value", () => {
+    const home = track(
+      makeHome({ toml: '[w5]\nstint_idle_minutes = "abc"\ninference_fallback = 1\n' }),
+    );
+    const { code, report } = scryJson(home);
+    expect(code).toBe(0);
+    const config = checkOf(report, "config");
+    expect(config.status).toBe("warn");
+    expect(config.summary).toBe("2 setting(s) of the wrong type (default used) in tempad.toml");
+    expect(config.details).toEqual([
+      'tempad.toml: [w5].stint_idle_minutes must be a number, got "abc" (a string); using the default 45. Fix the value.',
+      "tempad.toml: [w5].inference_fallback must be true or false, got 1 (a number); using the default true. Fix the value.",
+    ]);
+    // the run itself carries on with the defaults
+    expect(report.ok).toBe(true);
+  });
+
+  test("a wrong type and a legacy key are both counted in the summary", () => {
+    const home = track(makeHome({ toml: '[w5]\nmemory_activities = 4\nwatch_turns = "x"\n' }));
+    const { report } = scryJson(home);
+    expect(checkOf(report, "config").summary).toBe(
+      "1 setting(s) of the wrong type (default used), 1 deprecated setting(s) in tempad.toml",
+    );
+  });
+
+  test("a clean tempad.toml still reads cleanly", () => {
+    const home = track(makeHome({ toml: "[w5]\nstint_idle_minutes = 30\n" }));
+    const { report } = scryJson(home);
+    expect(checkOf(report, "config").status).toBe("ok");
   });
 });
 

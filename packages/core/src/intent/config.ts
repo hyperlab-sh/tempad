@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 
-export type W5Backend = "claude-cli" | "api";
+const W5_BACKENDS = ["claude-cli", "api"] as const;
+const W5_MODES = ["declared", "inferred"] as const;
+
+export type W5Backend = (typeof W5_BACKENDS)[number];
 
 export interface W5Config {
   model: string;
@@ -18,7 +21,7 @@ export interface W5Config {
   memoryHours: number;
   memoryStints: number;
   overlapMessages: number;
-  mode: "declared" | "inferred";
+  mode: (typeof W5_MODES)[number];
   inferenceFallback: boolean;
 }
 
@@ -55,14 +58,66 @@ export function defaultIntentConfig(): IntentConfig {
   };
 }
 
-function parseBackend(value: unknown, fallback: W5Backend): W5Backend {
-  if (value === "claude-cli" || value === "api") return value;
+/** Why `loadIntentConfig` is warning, so a caller can summarize the two apart. */
+export type ConfigWarningKind = "renamed-key" | "wrong-type";
+
+export type ConfigWarn = (message: string, kind: ConfigWarningKind) => void;
+
+const MAX_SHOWN_VALUE_LENGTH = 60;
+
+/** A TOML value as the operator wrote it, cut short, with its TOML type. */
+function describeValue(value: unknown): string {
+  const type = Array.isArray(value) ? "an array" : `a ${value === null ? "null" : typeof value}`;
+  const text = JSON.stringify(value) ?? String(value);
+  const shown =
+    text.length > MAX_SHOWN_VALUE_LENGTH ? `${text.slice(0, MAX_SHOWN_VALUE_LENGTH - 1)}…` : text;
+  return `${shown} (${type})`;
+}
+
+/** The one wording of "this key has the wrong type; the default stays". */
+function wrongType(
+  warn: ConfigWarn,
+  where: string,
+  expected: string,
+  value: unknown,
+  fallback: unknown,
+): void {
+  warn(
+    `tempad.toml: ${where} must be ${expected}, got ${describeValue(value)}; using the default ${JSON.stringify(fallback)}. Fix the value.`,
+    "wrong-type",
+  );
+}
+
+function parseChoice<T extends string>(
+  value: unknown,
+  choices: readonly T[],
+  fallback: T,
+  where: string,
+  warn: ConfigWarn,
+): T {
+  if (value === undefined) return fallback;
+  if (typeof value === "string" && (choices as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  wrongType(warn, where, `one of ${choices.map((c) => `"${c}"`).join(", ")}`, value, fallback);
   return fallback;
 }
 
-function parseMode(value: unknown, fallback: "declared" | "inferred"): "declared" | "inferred" {
-  if (value === "declared" || value === "inferred") return value;
-  return fallback;
+/** An optional string key: absent is `undefined`, a non-string warns and is `undefined` too. */
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+  where: string,
+  warn: ConfigWarn,
+): string | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  warn(
+    `tempad.toml: ${where}.${key} must be a string, got ${describeValue(value)}; ignoring it. Fix the value.`,
+    "wrong-type",
+  );
+  return undefined;
 }
 
 function requireString(record: Record<string, unknown>, key: string, where: string): string {
@@ -91,7 +146,7 @@ const LEGACY_W5_KEYS: Readonly<Record<string, string>> = {
  */
 function resolveLegacyW5Keys(
   w5: Record<string, unknown>,
-  warn: (message: string) => void,
+  warn: ConfigWarn,
 ): Record<string, unknown> {
   const resolved = { ...w5 };
   for (const [old, current] of Object.entries(LEGACY_W5_KEYS)) {
@@ -99,18 +154,24 @@ function resolveLegacyW5Keys(
     const value = resolved[old];
     delete resolved[old];
     if (current in w5) {
-      warn(`tempad.toml: [w5].${old} is ignored; using [w5].${current}. Remove the old key.`);
+      warn(
+        `tempad.toml: [w5].${old} is ignored; using [w5].${current}. Remove the old key.`,
+        "renamed-key",
+      );
       continue;
     }
     resolved[current] = value;
-    warn(`tempad.toml: [w5].${old} was renamed to [w5].${current}. Update your config.`);
+    warn(
+      `tempad.toml: [w5].${old} was renamed to [w5].${current}. Update your config.`,
+      "renamed-key",
+    );
   }
   return resolved;
 }
 
 export function loadIntentConfig(
   tomlPath: string,
-  warn: (message: string) => void = (message) => console.warn(message),
+  warn: ConfigWarn = (message) => console.warn(message),
 ): IntentConfig {
   if (!existsSync(tomlPath)) {
     return defaultIntentConfig();
@@ -126,8 +187,8 @@ export function loadIntentConfig(
     config.parties.push({
       slug: requireString(raw, "slug", where),
       name: requireString(raw, "name", where),
-      joined: typeof raw.joined === "string" ? raw.joined : undefined,
-      description: typeof raw.description === "string" ? raw.description : undefined,
+      joined: optionalString(raw, "joined", where, warn),
+      description: optionalString(raw, "description", where, warn),
     });
   }
   for (const [index, raw] of (
@@ -139,31 +200,46 @@ export function loadIntentConfig(
       name: requireString(raw, "name", where),
     });
   }
-  const rawW5 = parsed.w5 as Record<string, unknown> | undefined;
-  const w5 = rawW5 ? resolveLegacyW5Keys(rawW5, warn) : undefined;
-  if (w5) {
-    const number = (key: string, fallback: number) =>
-      typeof w5[key] === "number" ? (w5[key] as number) : fallback;
-    const boolean = (key: string, fallback: boolean) =>
-      typeof w5[key] === "boolean" ? (w5[key] as boolean) : fallback;
+  const rawW5 = parsed.w5;
+  if (
+    rawW5 !== undefined &&
+    (typeof rawW5 !== "object" || rawW5 === null || Array.isArray(rawW5))
+  ) {
+    warn(
+      `tempad.toml: [w5] must be a table, got ${describeValue(rawW5)}; using the defaults for every [w5] key. Fix the value.`,
+      "wrong-type",
+    );
+  } else if (rawW5 !== undefined) {
+    const w5 = resolveLegacyW5Keys(rawW5 as Record<string, unknown>, warn);
+    const typed =
+      <T>(expected: string, accepts: (value: unknown) => value is T) =>
+      (key: string, fallback: T): T => {
+        const value = w5[key];
+        if (value === undefined) return fallback;
+        if (accepts(value)) return value;
+        wrongType(warn, `[w5].${key}`, expected, value, fallback);
+        return fallback;
+      };
+    const number = typed("a number", (value): value is number => typeof value === "number");
+    const boolean = typed("true or false", (value): value is boolean => typeof value === "boolean");
+    const string = typed("a string", (value): value is string => typeof value === "string");
     config.w5 = {
-      model: typeof w5.model === "string" ? w5.model : config.w5.model,
+      model: string("model", config.w5.model),
       throttleMinutes: number("throttle_minutes", config.w5.throttleMinutes),
       watchTurns: number("watch_turns", config.w5.watchTurns),
       askMinStintMinutes: number("ask_min_stint_minutes", config.w5.askMinStintMinutes),
       askBudgetMinutes: number("ask_budget_minutes", config.w5.askBudgetMinutes),
       askExpireTurns: number("ask_expire_turns", config.w5.askExpireTurns),
       backfillDays: number("backfill_days", config.w5.backfillDays),
-      backend: parseBackend(w5.backend, config.w5.backend),
-      claudeCommand:
-        typeof w5.claude_command === "string" ? w5.claude_command : config.w5.claudeCommand,
+      backend: parseChoice(w5.backend, W5_BACKENDS, config.w5.backend, "[w5].backend", warn),
+      claudeCommand: string("claude_command", config.w5.claudeCommand),
       timeoutSeconds: number("timeout_seconds", config.w5.timeoutSeconds),
       stintIdleMinutes: number("stint_idle_minutes", config.w5.stintIdleMinutes),
       stintMinMinutes: number("stint_min_minutes", config.w5.stintMinMinutes),
       memoryHours: number("memory_hours", config.w5.memoryHours),
       memoryStints: number("memory_stints", config.w5.memoryStints),
       overlapMessages: number("overlap_messages", config.w5.overlapMessages),
-      mode: parseMode(w5.mode, config.w5.mode),
+      mode: parseChoice(w5.mode, W5_MODES, config.w5.mode, "[w5].mode", warn),
       inferenceFallback: boolean("inference_fallback", config.w5.inferenceFallback),
     };
   }
