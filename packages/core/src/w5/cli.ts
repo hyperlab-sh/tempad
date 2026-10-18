@@ -722,6 +722,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
   context.stdout(`unknown_activity_ids=${metrics.unknownStintIds}`);
   context.stdout(`overlap_dropped=${metrics.overlapDropped}`);
   context.stdout(`quest_proposed_on_matched=${metrics.questProposedOnMatched}`);
+  context.stdout(`quest_attached_on_matched=${metrics.questAttachedOnMatched}`);
   context.stdout(`selector_defaulted=${metrics.selectorDefaulted}`);
   context.stdout(`bounds_clamped=${metrics.boundsClamped}`);
   context.stdout(`guess_defaulted=${metrics.guessDefaulted}`);

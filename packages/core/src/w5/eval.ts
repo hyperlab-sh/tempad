@@ -261,6 +261,7 @@ export interface EvalMetrics {
   unknownStintIds: number;
   overlapDropped: number;
   questProposedOnMatched: number;
+  questAttachedOnMatched: number;
   selectorDefaulted: number;
   boundsClamped: number;
   guessDefaulted: number;
@@ -602,6 +603,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
     unknownStintIds: backfillResult.unknownStintIds,
     overlapDropped: backfillResult.overlapDropped,
     questProposedOnMatched: backfillResult.questProposedOnMatched,
+    questAttachedOnMatched: backfillResult.questAttachedOnMatched,
     selectorDefaulted: backfillResult.selectorDefaulted,
     boundsClamped: backfillResult.boundsClamped,
     guessDefaulted: backfillResult.guessDefaulted,
