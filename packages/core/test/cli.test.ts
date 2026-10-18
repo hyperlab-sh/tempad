@@ -438,16 +438,21 @@ describe("cli --help", () => {
 
 /**
  * Every file and directory under `directory`, relative, sorted: a cheap snapshot to compare.
- * Bun's own cache (`~/Library/Caches/bun` on macOS) is left out, since the runtime fills it
- * whatever the CLI does.
+ * Bun's own cache (`~/Library/Caches/bun` on macOS, `~/.bun/install/cache` on Linux) is left
+ * out, since the runtime fills it whatever the CLI does.
  */
+const BUN_CACHE_PATHS = ["Library/Caches/bun", ".bun/install/cache"];
+
 function listTree(directory: string): string[] {
   return (readdirSync(directory, { recursive: true }) as string[])
     .map(String)
-    .filter(
-      (path) =>
-        !["Library", "Library/Caches"].includes(path) && !path.startsWith("Library/Caches/bun"),
-    )
+    .filter((path) => {
+      if (BUN_CACHE_PATHS.some((cache) => path === cache || path.startsWith(`${cache}/`))) {
+        return false;
+      }
+      // The directories above a cache path exist only because of it.
+      return !BUN_CACHE_PATHS.some((cache) => cache.startsWith(`${path}/`));
+    })
     .sort();
 }
 
