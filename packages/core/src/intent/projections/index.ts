@@ -7,6 +7,13 @@ export interface Projection {
   tables: string[];
   createSql: string;
   apply(database: Database, event: EventRecord): void;
+  /**
+   * Runs inside the rebuild's transaction after the event replay, for the
+   * projections that derive rows from collected facts as well as events (the
+   * session-kind rules): `tempad rebuild` restores their rows without a pass
+   * or a model call. Must not depend on tables other projections own.
+   */
+  afterRebuild?: (database: Database) => void;
 }
 
 const registry = new Map<string, Projection>();
@@ -78,6 +85,7 @@ export function rebuildAll(database: Database, options: RebuildOptions = {}): vo
         )
         .run(projection.name, last);
     }
+    for (const projection of registry.values()) projection.afterRebuild?.(database);
     options.beforeCommit?.(database);
   });
   run.immediate();

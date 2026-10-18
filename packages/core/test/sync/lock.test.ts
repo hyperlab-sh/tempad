@@ -284,7 +284,7 @@ describe("tempad sync while another sync runs", () => {
     const cwd = mkdtempSync(join(tmpdir(), "tempad-synclock-cwd-"));
     directories.push(cwd);
     const proc = Bun.spawn({
-      cmd: ["bun", CLI, ...args],
+      cmd: [process.execPath, "run", CLI, ...args],
       cwd,
       env: { ...process.env, TEMPAD_HOME: home },
       stdout: "pipe",

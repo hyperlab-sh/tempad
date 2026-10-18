@@ -120,7 +120,7 @@ describe("report command default output path", () => {
 
       const proc = Bun.spawn({
         cmd: [
-          "bun",
+          process.execPath,
           "run",
           join(import.meta.dir, "..", "src", "cli.ts"),
           "report",
@@ -135,7 +135,8 @@ describe("report command default output path", () => {
         stderr: "pipe",
       });
 
-      const exitCode = await proc.exited;
+      const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      if (exitCode !== 0) console.error(`report cli failed:\n${stderr}`);
       expect(exitCode).toBe(0);
 
       const outPath = join(dir, "reports", "daily-2026-09-01-2026-09-01.md");
@@ -189,10 +190,14 @@ describe("tempad sync --full", () => {
       setSyncState(database, "claude", future);
       database.close();
 
+      // The kind pass must not reach a model from a collector-only fixture:
+      // the batch is 0 (rules only) and no `claude` can be found on this PATH.
+      await Bun.write(join(dir, "tempad.toml"), "[w5]\nsession_kind_batch = 0\n");
+
       const runCli = (args: string[]) =>
         Bun.spawn({
-          cmd: ["bun", "run", join(import.meta.dir, "..", "src", "cli.ts"), ...args],
-          env: { ...process.env, TEMPAD_HOME: dir },
+          cmd: [process.execPath, "run", join(import.meta.dir, "..", "src", "cli.ts"), ...args],
+          env: { ...process.env, TEMPAD_HOME: dir, PATH: "/usr/bin:/bin" },
           stdout: "pipe",
           stderr: "pipe",
         }).exited;

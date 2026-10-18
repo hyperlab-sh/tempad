@@ -546,7 +546,7 @@ async function commitFromAnotherProcess(
     database.exec("COMMIT");
     database.close();
   `;
-  const child = Bun.spawn(["bun", "-e", code], {
+  const child = Bun.spawn([process.execPath, "-e", code], {
     env: process.env,
     stdout: "pipe",
     stderr: "inherit",

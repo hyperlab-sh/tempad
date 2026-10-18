@@ -1,7 +1,14 @@
 import type { Database } from "bun:sqlite";
 import { readLines } from "../collect/claude";
 import { applyIncremental } from "../intent/projections";
-import { sessionKindProjection } from "../intent/projections/session-kind";
+import {
+  effectiveKindColumns,
+  loadSessions,
+  recomputeSessionKindRules,
+  type SessionRecord,
+  sessionKindProjection,
+  sessionKindSql,
+} from "../intent/projections/session-kind";
 import { EventStore } from "../intent/store";
 import { ClassifierResponseError } from "../w5/classifier-shared";
 import type { SessionKindClassifier } from "./classifier";
@@ -13,168 +20,11 @@ import type { SessionKind } from "./kinds";
  */
 export const SESSION_KIND_CLASSIFIER_VERSION = 1;
 
-/** The entrypoints of Claude's SDKs and of `claude -p`: a program started the session. */
-const AUTOMATION_ENTRYPOINTS = new Set(["sdk-py", "sdk-ts", "sdk-cli"]);
-
-/** What the rules read about one session. */
-export interface SessionFacts {
-  id: string;
-  entrypoint: string | null;
-  titleSource: string | null;
-  /** Any message of the session came from a typed prompt (`origin.kind = "human"`). */
-  hasHumanOrigin: boolean;
-  /** The first user message with text, or null when the session has none. */
-  opener: { uuid: string; text: string; originKind: string | null } | null;
-  /** A `quest.declared` names this session with a parent session. */
-  declaredWithParent: boolean;
-  /** A `quest.declared` names this session as another session's parent. */
-  declaredAsParent: boolean;
-}
-
-export interface RuleHit {
-  kind: SessionKind;
-  /** `rule:<name>`, stored as the cache row's `source`. */
-  source: string;
-  confidence: number;
-}
-
-/**
- * The rules, cheapest first, stopping at the first that fires. Null means no
- * rule knows, and the session is left to the model.
- */
-export function ruleKind(facts: SessionFacts): RuleHit | null {
-  if (
-    facts.entrypoint !== null &&
-    AUTOMATION_ENTRYPOINTS.has(facts.entrypoint) &&
-    !facts.hasHumanOrigin
-  ) {
-    return { kind: "automated", source: "rule:entrypoint", confidence: 1 };
-  }
-  if (facts.opener === null) {
-    return { kind: "automated", source: "rule:no-user-messages", confidence: 1 };
-  }
-  if (facts.declaredWithParent) {
-    return { kind: "subagent", source: "rule:declared-parent", confidence: 1 };
-  }
-  if (facts.titleSource === "agent-name") {
-    return { kind: "subagent", source: "rule:agent-name", confidence: 1 };
-  }
-  // Another Claude session sent the first message (cross-session messaging).
-  if (facts.opener.originKind === "peer") {
-    return { kind: "subagent", source: "rule:peer-opener", confidence: 1 };
-  }
-  if (facts.opener.text.trim().startsWith("You are")) {
-    return { kind: "subagent", source: "rule:you-are", confidence: 0.9 };
-  }
-  if (facts.declaredAsParent) {
-    return { kind: "lead", source: "rule:parent-of", confidence: 1 };
-  }
-  return null;
-}
-
-interface SessionRow {
-  id: string;
-  entrypoint: string | null;
-  title_source: string | null;
-  host_slug: string;
-  started_at: string;
-  file_path: string;
-  has_human_origin: number;
-}
-
-interface OpenerRow {
-  session_id: string;
-  uuid: string;
-  text_preview: string;
-  origin_kind: string | null;
-}
-
-interface SessionRecord {
-  facts: SessionFacts;
-  hostSlug: string;
-  startedAt: string;
-  filePath: string;
-}
-
-/**
- * The first user message of each session. Lines the CLI writes on the user's
- * behalf (`<command-name>`, `<local-command-stdout>`, the `Caveat:` notice) have
- * no origin and sort after real text, so a session opened with `/clear` still
- * opens with what was typed next; a session with nothing else keeps that line.
- */
-const OPENER_SQL = `
-  WITH user_text AS (
-    SELECT session_id, uuid, ts, text_preview, origin_kind,
-           CASE WHEN origin_kind IS NULL
-                     AND (substr(text_preview, 1, 1) = '<' OR substr(text_preview, 1, 7) = 'Caveat:')
-                THEN 1 ELSE 0 END AS meta
-    FROM claude_messages
-    WHERE role = 'user' AND text_preview IS NOT NULL AND tool_name IS NULL AND is_sidechain = 0
-  ),
-  ranked AS (
-    SELECT *, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY meta, ts, uuid) AS position
-    FROM user_text
-  )
-  SELECT session_id, uuid, text_preview, origin_kind FROM ranked WHERE position = 1`;
-
-function loadSessions(database: Database): SessionRecord[] {
-  const sessions = database
-    .query(
-      `SELECT s.id, s.entrypoint, s.title_source, s.host_slug, s.started_at, s.file_path,
-              EXISTS (SELECT 1 FROM claude_messages m
-                      WHERE m.session_id = s.id AND m.origin_kind = 'human') AS has_human_origin
-       FROM claude_sessions s`,
-    )
-    .all() as SessionRow[];
-  const openers = new Map(
-    (database.query(OPENER_SQL).all() as OpenerRow[]).map((row) => [row.session_id, row]),
-  );
-  const withParent = new Set<string>();
-  const asParent = new Set<string>();
-  const declarations = database
-    .query(
-      `SELECT json_extract(payload, '$.session_id') AS session_id,
-              json_extract(payload, '$.parent_session_id') AS parent_session_id
-       FROM events
-       WHERE kind = 'quest.declared' AND json_extract(payload, '$.parent_session_id') IS NOT NULL`,
-    )
-    .all() as { session_id: unknown; parent_session_id: unknown }[];
-  for (const row of declarations) {
-    if (typeof row.session_id === "string") withParent.add(row.session_id);
-    if (typeof row.parent_session_id === "string") asParent.add(row.parent_session_id);
-  }
-  return sessions.map((row) => {
-    const opener = openers.get(row.id);
-    return {
-      facts: {
-        id: row.id,
-        entrypoint: row.entrypoint,
-        titleSource: row.title_source,
-        hasHumanOrigin: row.has_human_origin === 1,
-        opener: opener
-          ? { uuid: opener.uuid, text: opener.text_preview, originKind: opener.origin_kind }
-          : null,
-        declaredWithParent: withParent.has(row.id),
-        declaredAsParent: asParent.has(row.id),
-      },
-      hostSlug: row.host_slug,
-      startedAt: row.started_at,
-      filePath: row.file_path,
-    };
-  });
-}
-
-interface CacheRow {
-  session_id: string;
-  kind: string;
-  source: string;
-  confidence: number;
-  classifier_version: number;
-}
-
 export interface RefreshSessionKindsOptions {
   /** Null runs the rules only. */
   classifier: SessionKindClassifier | null;
+  /** The model the classifier answers for; recorded on each `session.kind_inferred` event. */
+  model: string;
   /** The most sessions sent to the model in this pass. */
   modelLimit: number;
   /** When set, only this host's sessions go to the model (their transcripts are here). */
@@ -184,7 +34,7 @@ export interface RefreshSessionKindsOptions {
 }
 
 export interface RefreshSessionKindsResult {
-  /** Cache rows a rule wrote or changed. */
+  /** Sessions a rule classifies whose rule row changed this pass. */
   ruled: number;
   /** Rule rows removed because their rule no longer fires. */
   cleared: number;
@@ -194,13 +44,20 @@ export interface RefreshSessionKindsResult {
   pending: number;
 }
 
+interface OriginRow {
+  session_id: string;
+  origin: string;
+  classifier_version: number;
+}
+
 /**
- * One pass over every Claude session: the rules refresh the cache for every
+ * One pass over every Claude session: the rules rewrite the rule rows for every
  * session, then the model classifies at most `modelLimit` of the rest, newest
- * first. A session with a manual kind, or a model row of the current
- * classifier version, is never sent. A failed call writes nothing, so the
- * session is tried again on the next pass; a failure that is not a bad answer
- * (the call itself failed) ends the batch.
+ * first, and every answer is recorded as a `session.kind_inferred` event, so a
+ * rebuild replays it instead of calling the model again. A session with a manual
+ * kind, or a model row of the current classifier version, is never sent. A
+ * failed call writes nothing, so the session is tried again on the next pass; a
+ * failure that is not a bad answer (the call itself failed) ends the batch.
  */
 export async function refreshSessionKinds(
   database: Database,
@@ -216,72 +73,36 @@ export async function refreshSessionKinds(
     pending: 0,
   };
   ensureSessionKindTables(database);
-  const sessions = loadSessions(database);
-  const cache = new Map(
+  const rules = recomputeSessionKindRules(database, SESSION_KIND_CLASSIFIER_VERSION);
+  result.ruled = rules.ruled;
+  result.cleared = rules.cleared;
+
+  const rows = database
+    .query("SELECT session_id, origin, classifier_version FROM session_kind")
+    .all() as OriginRow[];
+  const hasManual = new Set<string>();
+  const hasCurrentModel = new Set<string>();
+  for (const row of rows) {
+    if (row.origin === "manual") hasManual.add(row.session_id);
+    else if (row.origin === "model" && row.classifier_version === SESSION_KIND_CLASSIFIER_VERSION)
+      hasCurrentModel.add(row.session_id);
+  }
+  // A rule row means the rules own the session; only their leftovers reach the model.
+  const ruledSessions = new Set(
     (
-      database
-        .query("SELECT session_id, kind, source, confidence, classifier_version FROM session_kind")
-        .all() as CacheRow[]
-    ).map((row) => [row.session_id, row]),
-  );
-  const overridden = new Set(
-    (
-      database.query("SELECT session_id FROM session_kind_overrides").all() as {
+      database.query("SELECT session_id FROM session_kind WHERE origin = 'rule'").all() as {
         session_id: string;
       }[]
     ).map((row) => row.session_id),
   );
-  const upsert = database.query(
-    `INSERT INTO session_kind (session_id, kind, source, confidence, classifier_version, computed_at)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT (session_id) DO UPDATE SET
-       kind = excluded.kind, source = excluded.source, confidence = excluded.confidence,
-       classifier_version = excluded.classifier_version, computed_at = excluded.computed_at`,
-  );
-  const remove = database.query("DELETE FROM session_kind WHERE session_id = ?");
 
   const leftovers: SessionRecord[] = [];
-  database.transaction(() => {
-    const computedAt = now().toISOString();
-    for (const session of sessions) {
-      const id = session.facts.id;
-      const cached = cache.get(id);
-      const hit = ruleKind(session.facts);
-      if (hit) {
-        const same =
-          cached !== undefined &&
-          cached.kind === hit.kind &&
-          cached.source === hit.source &&
-          cached.confidence === hit.confidence &&
-          cached.classifier_version === SESSION_KIND_CLASSIFIER_VERSION;
-        if (!same) {
-          upsert.run(
-            id,
-            hit.kind,
-            hit.source,
-            hit.confidence,
-            SESSION_KIND_CLASSIFIER_VERSION,
-            computedAt,
-          );
-          result.ruled += 1;
-        }
-        continue;
-      }
-      if (cached?.source.startsWith("rule:")) {
-        remove.run(id);
-        result.cleared += 1;
-      }
-      if (overridden.has(id)) continue;
-      if (
-        cached?.source === "model" &&
-        cached.classifier_version === SESSION_KIND_CLASSIFIER_VERSION
-      ) {
-        continue;
-      }
-      if (options.hostSlug !== undefined && session.hostSlug !== options.hostSlug) continue;
-      leftovers.push(session);
-    }
-  })();
+  for (const session of loadSessions(database)) {
+    const id = session.facts.id;
+    if (ruledSessions.has(id) || hasManual.has(id) || hasCurrentModel.has(id)) continue;
+    if (options.hostSlug !== undefined && session.hostSlug !== options.hostSlug) continue;
+    leftovers.push(session);
+  }
 
   leftovers.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
   const batch = options.classifier ? leftovers.slice(0, options.modelLimit) : [];
@@ -292,14 +113,19 @@ export async function refreshSessionKinds(
     const text = (await fullMessageText(session.filePath, opener.uuid)) ?? opener.text;
     try {
       const guess = await options.classifier.classifyOpener(text);
-      upsert.run(
-        session.facts.id,
-        guess.kind,
-        "model",
-        guess.confidence,
-        SESSION_KIND_CLASSIFIER_VERSION,
-        now().toISOString(),
-      );
+      const event = new EventStore(database).append({
+        actor: "hero",
+        kind: "session.kind_inferred",
+        subject: session.facts.id,
+        payload: {
+          kind: guess.kind,
+          confidence: guess.confidence,
+          model: options.model,
+          classifier_version: SESSION_KIND_CLASSIFIER_VERSION,
+          opener_sha256: hashOpener(text),
+        },
+      });
+      applyIncremental(database, event);
       result.modeled += 1;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -314,6 +140,11 @@ export async function refreshSessionKinds(
     }
   }
   return result;
+}
+
+/** A short digest of the first message, so a replayed decision names the text it judged. */
+function hashOpener(text: string): string {
+  return new Bun.CryptoHasher("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 /**
@@ -353,8 +184,8 @@ async function fullMessageText(filePath: string, uuid: string): Promise<string |
 }
 
 /**
- * Creates the manual-kind table when the projections have not been set up on
- * this database yet, so reading a kind never fails on a fresh home.
+ * Creates the kind table when the projections have not been set up on this
+ * database yet, so reading a kind never fails on a fresh home.
  */
 export function ensureSessionKindTables(database: Database): void {
   database.exec(sessionKindProjection.createSql);
@@ -367,31 +198,29 @@ export interface EffectiveSessionKind {
   confidence: number;
 }
 
-/** A manual kind wins, then the cache; null when neither knows the session yet. */
+/**
+ * A manual kind wins, then a rule, then a model decision; null when nothing
+ * knows the session yet.
+ */
 export function effectiveSessionKind(
   database: Database,
   sessionId: string,
 ): EffectiveSessionKind | null {
   ensureSessionKindTables(database);
-  const manual = database
-    .query("SELECT kind FROM session_kind_overrides WHERE session_id = ?")
-    .get(sessionId) as { kind: SessionKind } | null;
-  if (manual) return { kind: manual.kind, source: "manual", confidence: 1 };
-  const cached = database
-    .query("SELECT kind, source, confidence FROM session_kind WHERE session_id = ?")
-    .get(sessionId) as EffectiveSessionKind | null;
-  return cached;
+  return (
+    (database
+      .query(
+        `SELECT kind, source, confidence FROM session_kind
+         WHERE session_id = ?
+         ORDER BY CASE origin WHEN 'manual' THEN 0 WHEN 'rule' THEN 1 ELSE 2 END
+         LIMIT 1`,
+      )
+      .get(sessionId) as EffectiveSessionKind | null) ?? null
+  );
 }
 
-/**
- * The SQL expression for a session's effective kind, given an expression for its
- * id: for a `WHERE <sessionKindSql("t.session_id")> = ?` filter.
- */
-export function sessionKindSql(sessionIdExpression: string): string {
-  return `COALESCE(
-    (SELECT kind FROM session_kind_overrides WHERE session_id = ${sessionIdExpression}),
-    (SELECT kind FROM session_kind WHERE session_id = ${sessionIdExpression}))`;
-}
+export { ruleKind, type SessionFacts } from "../intent/projections/session-kind";
+export { effectiveKindColumns, sessionKindSql };
 
 /**
  * Records a kind given by hand as a `session.kind_set` event, or hands the

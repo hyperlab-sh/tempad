@@ -41,6 +41,7 @@ export const EVENT_KINDS = [
   "window.classified",
   "impact.stated",
   "session.kind_set",
+  "session.kind_inferred",
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 

@@ -57,6 +57,7 @@ export async function runSessionKindPass(context: SessionsContext): Promise<void
         context.classifier !== undefined
           ? context.classifier
           : buildSessionKindClassifier(context.home, context.intentConfig),
+      model: context.intentConfig.w5.sessionKindModel,
       modelLimit: context.intentConfig.w5.sessionKindBatch,
       hostSlug: context.hostSlug,
       log: context.stderr,
@@ -98,15 +99,30 @@ function runList(args: string[], context: SessionsContext): number {
     return 2;
   }
   const days = values.days === undefined ? SESSIONS_DEFAULT_DAYS : Number(values.days);
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  // `Date.now() - days * 86400000` must stay a real instant: an absurd `--days`
+  // (a 20-digit string parses to a float) would throw a RangeError from
+  // `toISOString` instead of answering with usage.
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  if (
+    !Number.isSafeInteger(days) ||
+    !Number.isSafeInteger(sinceMs) ||
+    Math.abs(sinceMs) > 8.64e15
+  ) {
+    context.stderr(usage);
+    return 2;
+  }
+  const since = new Date(sinceMs).toISOString();
   ensureSessionKindTables(context.database);
+  // The effective kind is manual, then rule, then model (see
+  // intent/projections/session-kind.ts); one subquery per column picks it.
   const rows = context.database
     .query(
       `SELECT s.id, s.started_at, s.org, s.project, s.title,
-              o.kind AS manual_kind, k.kind AS inferred_kind, k.source AS source
+              (SELECT kind FROM session_kind WHERE session_id = s.id
+                 ORDER BY CASE origin WHEN 'manual' THEN 0 WHEN 'rule' THEN 1 ELSE 2 END LIMIT 1) AS effective_kind,
+              (SELECT source FROM session_kind WHERE session_id = s.id
+                 ORDER BY CASE origin WHEN 'manual' THEN 0 WHEN 'rule' THEN 1 ELSE 2 END LIMIT 1) AS effective_source
        FROM claude_sessions s
-       LEFT JOIN session_kind_overrides o ON o.session_id = s.id
-       LEFT JOIN session_kind k ON k.session_id = s.id
        WHERE s.started_at >= ?
        ORDER BY s.started_at DESC`,
     )
@@ -116,16 +132,14 @@ function runList(args: string[], context: SessionsContext): number {
     org: string;
     project: string;
     title: string | null;
-    manual_kind: string | null;
-    inferred_kind: string | null;
-    source: string | null;
+    effective_kind: string | null;
+    effective_source: string | null;
   }[];
   for (const row of rows) {
-    const kind = row.manual_kind ?? row.inferred_kind;
+    const kind = row.effective_kind;
     if (values.kind !== undefined && kind !== values.kind) continue;
-    const source = row.manual_kind !== null ? "manual" : (row.source ?? "-");
     context.stdout(
-      `${row.started_at}  ${row.id}  ${kind ?? "unknown"} (${source})  ${row.org}/${row.project}  ${row.title ?? ""}`.trimEnd(),
+      `${row.started_at}  ${row.id}  ${kind ?? "unknown"} (${row.effective_source ?? "-"})  ${row.org}/${row.project}  ${row.title ?? ""}`.trimEnd(),
     );
   }
   return 0;
@@ -177,6 +191,7 @@ async function runKind(args: string[], context: SessionsContext): Promise<number
                 ...context.intentConfig,
                 w5: { ...context.intentConfig.w5, sessionKindBatch: limit },
               }),
+      model: context.intentConfig.w5.sessionKindModel,
       modelLimit: limit,
       hostSlug: context.hostSlug,
       log: context.stderr,

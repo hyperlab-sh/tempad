@@ -48,7 +48,7 @@ async function guardedSync(): Promise<{ code: number; stdout: string; stderr: st
   const env: Record<string, string | undefined> = { ...process.env, TEMPAD_HOME: home };
   delete env.TEMPAD_SYNC_TOKEN;
   const proc = Bun.spawn({
-    cmd: ["bun", "--preload", GUARD, CLI, "sync", "claude"],
+    cmd: [process.execPath, "--preload", GUARD, CLI, "sync", "claude"],
     env,
     stdout: "pipe",
     stderr: "pipe",

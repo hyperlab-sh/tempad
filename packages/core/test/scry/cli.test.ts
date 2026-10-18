@@ -43,7 +43,7 @@ async function tempad(
   const merged: Record<string, string | undefined> = { ...process.env, ...env };
   for (const name of ["HOST_SLUG", "TEMPAD_SYNC_TOKEN"]) if (!(name in env)) delete merged[name];
   const proc = Bun.spawn({
-    cmd: ["bun", ...(preload ? ["--preload", preload] : []), CLI, ...args],
+    cmd: [process.execPath, ...(preload ? ["--preload", preload] : []), CLI, ...args],
     cwd,
     env: merged,
     stdout: "pipe",

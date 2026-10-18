@@ -242,7 +242,11 @@ describe("session kind rules", () => {
         { uuid: "m", ts: "2026-10-02T11:00:01.000Z", text: "<command-name>/clear</command-name>" },
       ],
     });
-    const result = await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    const result = await refreshSessionKinds(database, {
+      classifier: null,
+      modelLimit: 0,
+      model: "fake",
+    });
     const rows = database
       .query("SELECT session_id, kind, source FROM session_kind ORDER BY session_id")
       .all() as { session_id: string; kind: string; source: string }[];
@@ -260,7 +264,7 @@ describe("session kind rules", () => {
         { uuid: "u", ts: "2026-10-03T10:00:01.000Z", text: "You are the dev", originKind: "human" },
       ],
     });
-    await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    await refreshSessionKinds(database, { classifier: null, modelLimit: 0, model: "fake" });
     const s3 = effectiveSessionKind(database, "s3");
     expect(s3?.source).toBe("rule:you-are");
   });
@@ -295,7 +299,7 @@ describe("session kind rules", () => {
       at: new Date().toISOString(),
       heroId: "H",
     });
-    await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    await refreshSessionKinds(database, { classifier: null, modelLimit: 0, model: "fake" });
     expect(effectiveSessionKind(database, "sub")).toEqual({
       kind: "subagent",
       source: "rule:declared-parent",
@@ -339,9 +343,17 @@ describe("refreshSessionKinds", () => {
       id: "s2",
       messages: [{ uuid: "m", ts: "2026-10-02T09:00:00.000Z", text: "hello", originKind: "human" }],
     });
-    const first = await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    const first = await refreshSessionKinds(database, {
+      classifier: null,
+      modelLimit: 0,
+      model: "fake",
+    });
     expect(first.ruled).toBe(1);
-    const second = await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    const second = await refreshSessionKinds(database, {
+      classifier: null,
+      modelLimit: 0,
+      model: "fake",
+    });
     expect(second.ruled).toBe(0);
     expect(second.cleared).toBe(0);
 
@@ -349,7 +361,11 @@ describe("refreshSessionKinds", () => {
     database
       .query("UPDATE claude_messages SET text_preview = 'plain question' WHERE session_id = 's1'")
       .run();
-    const third = await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    const third = await refreshSessionKinds(database, {
+      classifier: null,
+      modelLimit: 0,
+      model: "fake",
+    });
     expect(third.ruled).toBe(0);
     expect(third.cleared).toBe(1);
     expect(effectiveSessionKind(database, "s1")).toBeNull();
@@ -373,7 +389,11 @@ describe("refreshSessionKinds", () => {
       });
     }
     const model = fakeClassifier(() => ({ kind: "human", confidence: 0.8 }));
-    const result = await refreshSessionKinds(database, { classifier: model, modelLimit: 2 });
+    const result = await refreshSessionKinds(database, {
+      classifier: model,
+      modelLimit: 2,
+      model: "fake",
+    });
     expect(result.modeled).toBe(2);
     expect(result.pending).toBe(1);
     expect(
@@ -384,12 +404,20 @@ describe("refreshSessionKinds", () => {
     ).toEqual(["mid", "new"]);
     expect(effectiveSessionKind(database, "old")).toBeNull();
     // A current-version model row is never re-sent; the pending one is.
-    const again = await refreshSessionKinds(database, { classifier: model, modelLimit: 2 });
+    const again = await refreshSessionKinds(database, {
+      classifier: model,
+      modelLimit: 2,
+      model: "fake",
+    });
     expect(again.modeled).toBe(1);
     expect(again.pending).toBe(0);
     // A version bump re-sends everything the model classified.
     database.query("UPDATE session_kind SET classifier_version = 0").run();
-    const bumped = await refreshSessionKinds(database, { classifier: model, modelLimit: 10 });
+    const bumped = await refreshSessionKinds(database, {
+      classifier: model,
+      modelLimit: 10,
+      model: "fake",
+    });
     expect(bumped.modeled).toBe(3);
   });
 
@@ -406,7 +434,11 @@ describe("refreshSessionKinds", () => {
     const model = fakeClassifier(() => {
       throw new Error("must not be called");
     });
-    const result = await refreshSessionKinds(database, { classifier: model, modelLimit: 10 });
+    const result = await refreshSessionKinds(database, {
+      classifier: model,
+      modelLimit: 10,
+      model: "fake",
+    });
     expect(result.pending).toBe(0);
     expect(effectiveSessionKind(database, "s1")).toEqual({
       kind: "lead",
@@ -434,6 +466,7 @@ describe("refreshSessionKinds", () => {
     const result = await refreshSessionKinds(database, {
       classifier: model,
       modelLimit: 10,
+      model: "fake",
       hostSlug: "this-host",
     });
     expect(result.modeled).toBe(1);
@@ -469,6 +502,7 @@ describe("refreshSessionKinds", () => {
     const result = await refreshSessionKinds(database, {
       classifier: model,
       modelLimit: 10,
+      model: "fake",
       log: (line) => logs.push(line),
     });
     expect(result.modeled).toBe(0);
@@ -504,7 +538,7 @@ describe("refreshSessionKinds", () => {
         return { kind: "human" as SessionKind, confidence: 1 };
       },
     };
-    await refreshSessionKinds(database, { classifier: model, modelLimit: 1 });
+    await refreshSessionKinds(database, { classifier: model, modelLimit: 1, model: "fake" });
     expect(seen[0]?.length).toBe(600);
 
     // A missing transcript falls back to the preview text.
@@ -515,7 +549,7 @@ describe("refreshSessionKinds", () => {
         { uuid: "m2", ts: "2026-10-03T10:00:00.000Z", text: "preview only", originKind: "human" },
       ],
     });
-    await refreshSessionKinds(database, { classifier: model, modelLimit: 1 });
+    await refreshSessionKinds(database, { classifier: model, modelLimit: 1, model: "fake" });
     expect(seen[1]).toBe("preview only");
   });
 });
@@ -538,9 +572,14 @@ describe("manual session kind", () => {
     });
     rebuildAll(database);
     expect(effectiveSessionKind(database, "s1")?.kind).toBe("lead");
-    // Clearing appends a kind-less event: inference takes over again.
+    // Clearing appends a kind-less event: inference takes over again — here
+    // the rebuild's rule pass (the opener starts with "You are"), not a model.
     setSessionKind(database, "s1", null);
-    expect(effectiveSessionKind(database, "s1")).toBeNull();
+    expect(effectiveSessionKind(database, "s1")).toEqual({
+      kind: "subagent",
+      source: "rule:you-are",
+      confidence: 0.9,
+    });
     const events = database
       .query("SELECT payload FROM events WHERE kind = 'session.kind_set' ORDER BY id")
       .all() as { payload: string }[];
@@ -565,7 +604,7 @@ describe("sessions cli", () => {
       messages: [{ uuid: "m", ts: recent, text: "hello", originKind: "human" }],
     });
     setSessionKind(database, "s2", "lead");
-    await refreshSessionKinds(database, { classifier: null, modelLimit: 0 });
+    await refreshSessionKinds(database, { classifier: null, modelLimit: 0, model: "fake" });
     const made = makeContext(database);
     const { context, stdout } = made;
     await runSessionsCommand([], context);
@@ -581,6 +620,10 @@ describe("sessions cli", () => {
     // A bad kind is a usage error.
     const { context: bad } = makeContext(database);
     expect(await runSessionsCommand(["--kind", "robot"], bad)).toBe(2);
+    // An absurd --days is too: it must answer with usage, not a RangeError.
+    const { context: huge, stderr: hugeErr } = makeContext(database);
+    expect(await runSessionsCommand(["--days", "99999999999999999999"], huge)).toBe(2);
+    expect(hugeErr.some((line) => line.includes("tempad sessions"))).toBe(true);
   });
 
   test("kind --set/--clear/--refresh", async () => {
@@ -673,7 +716,7 @@ describe("review --kind", () => {
     // s2 is inferred human; s1 is manually overridden to lead.
     database
       .query(
-        "INSERT INTO session_kind (session_id, kind, source, confidence, classifier_version, computed_at) VALUES ('s2', 'human', 'model', 0.9, 1, ?)",
+        "INSERT INTO session_kind (session_id, origin, kind, source, confidence, classifier_version, set_at, event_uid) VALUES ('s2', 'model', 'human', 'model', 0.9, 1, ?, 'e-s2')",
       )
       .run(now);
     setSessionKind(database, "s1", "lead");
@@ -712,5 +755,192 @@ describe("review --kind", () => {
       stdout: (line: string) => all.push(line),
     });
     expect(all.some((line) => line.includes("T1") || line.includes("T2"))).toBe(false);
+  });
+});
+
+describe("session kind events: ordering and replay", () => {
+  function appendKindEvent(
+    database: ReturnType<typeof openDatabase>,
+    input: {
+      kind: "session.kind_set" | "session.kind_inferred";
+      sessionId: string;
+      at: string;
+      payload: Record<string, unknown>;
+    },
+  ): void {
+    const { applyIncremental } = require("../../src/intent/projections");
+    const event = new EventStore(database).append({
+      actor: "hero",
+      kind: input.kind,
+      subject: input.sessionId,
+      at: input.at,
+      payload: input.payload,
+    });
+    applyIncremental(database, event);
+  }
+
+  test("a model decision is an event: replay rebuilds it without the model", async () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      startedAt: "2026-10-02T10:00:00.000Z",
+      messages: [
+        {
+          uuid: "m",
+          ts: "2026-10-02T10:00:01.000Z",
+          text: "dispatch agents for the release",
+          originKind: "human",
+        },
+      ],
+    });
+    // No rule fires for a plain human opener, so the model answers; the answer
+    // lands as a session.kind_inferred event, not a cache write.
+    const result = await refreshSessionKinds(database, {
+      classifier: { classifyOpener: async () => ({ kind: "lead", confidence: 0.8 }) },
+      model: "haiku",
+      modelLimit: 1,
+    });
+    expect(result.modeled).toBe(1);
+    const events = database
+      .query("SELECT kind FROM events WHERE kind = 'session.kind_inferred'")
+      .all() as { kind: string }[];
+    expect(events).toHaveLength(1);
+    expect(effectiveSessionKind(database, "s1")).toEqual({
+      kind: "lead",
+      source: "model",
+      confidence: 0.8,
+    });
+    // A rebuild replays the event: the kind survives with no model call and no
+    // pending leftover (the model row is current, so the pass would skip it).
+    rebuildAll(database);
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("lead");
+    const again = await refreshSessionKinds(database, {
+      classifier: {
+        classifyOpener: async () => {
+          throw new Error("must not be called");
+        },
+      },
+      model: "haiku",
+      modelLimit: 10,
+    });
+    expect(again.modeled).toBe(0);
+    expect(again.pending).toBe(0);
+  });
+
+  test("a manual kind always beats an inferred one, whatever their at's", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      messages: [{ uuid: "m", ts: "2026-10-02T10:00:00.000Z", text: "plain", originKind: "human" }],
+    });
+    // The model decision is newer than the set below; manual still wins.
+    appendKindEvent(database, {
+      kind: "session.kind_inferred",
+      sessionId: "s1",
+      at: "2026-10-05T00:00:00.000Z",
+      payload: { kind: "human", confidence: 0.9, model: "haiku", classifier_version: 1 },
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-01T00:00:00.000Z",
+      payload: { kind: "lead" },
+    });
+    expect(effectiveSessionKind(database, "s1")).toEqual({
+      kind: "lead",
+      source: "manual",
+      confidence: 1,
+    });
+  });
+
+  test("a later-arriving event with an earlier at does not overwrite a newer decision", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      messages: [{ uuid: "m", ts: "2026-10-02T10:00:00.000Z", text: "plain", originKind: "human" }],
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-05T00:00:00.000Z",
+      payload: { kind: "lead" },
+    });
+    // Arrives later, but `at` is older: the newer set survives.
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-04T00:00:00.000Z",
+      payload: { kind: "human" },
+    });
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("lead");
+    rebuildAll(database);
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("lead");
+  });
+
+  test("an older clear does not erase a newer set; a newer clear does", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      messages: [{ uuid: "m", ts: "2026-10-02T10:00:00.000Z", text: "plain", originKind: "human" }],
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-05T00:00:00.000Z",
+      payload: { kind: "lead" },
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-04T00:00:00.000Z",
+      payload: { kind: null },
+    });
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("lead");
+    // A clear at the newest instant removes the set.
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-06T00:00:00.000Z",
+      payload: { kind: null },
+    });
+    expect(effectiveSessionKind(database, "s1")).toBeNull();
+    // A set after that clear wins again, even applied out of order.
+    appendKindEvent(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-05T12:00:00.000Z",
+      payload: { kind: "human" },
+    });
+    expect(effectiveSessionKind(database, "s1")).toBeNull();
+    rebuildAll(database);
+    expect(effectiveSessionKind(database, "s1")).toBeNull();
+  });
+
+  test("out-of-order inferred events: the latest at wins, and rebuild agrees", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      messages: [{ uuid: "m", ts: "2026-10-02T10:00:00.000Z", text: "plain", originKind: "human" }],
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_inferred",
+      sessionId: "s1",
+      at: "2026-10-05T00:00:00.000Z",
+      payload: { kind: "human", confidence: 0.9, model: "haiku", classifier_version: 1 },
+    });
+    appendKindEvent(database, {
+      kind: "session.kind_inferred",
+      sessionId: "s1",
+      at: "2026-10-04T00:00:00.000Z",
+      payload: { kind: "automated", confidence: 0.9, model: "haiku", classifier_version: 1 },
+    });
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("human");
+    rebuildAll(database);
+    expect(effectiveSessionKind(database, "s1")?.kind).toBe("human");
   });
 });
