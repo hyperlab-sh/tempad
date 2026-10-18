@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import type { HomeConfig } from "../config/env";
-import { commandUsageText, usageText } from "../usage";
+import { commandUsageText, usageBlock, usageText } from "../usage";
 import { answerQuestion, assignStint, stateImpact, THEME_PATTERN } from "./api";
 import type { IntentConfig } from "./config";
 import {
@@ -1597,7 +1597,7 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
     allowPositionals: true,
   });
   const questionId = positionals[0];
-  const usage = `usage: ${usageText("answer")}`;
+  const usage = usageBlock("answer");
   // Exactly one of the two: `--belongs` confirms the declared quest, `--quest`
   // moves the trace somewhere else. Both together says nothing coherent.
   if (!questionId || (values.belongs ? values.quest !== undefined : !values.quest)) {

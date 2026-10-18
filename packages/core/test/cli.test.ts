@@ -17,12 +17,15 @@ import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
 import {
   ANSWER_BELONGS_FORM,
-  ANSWER_QUEST_FORM,
+  ANSWER_EXISTING_QUEST_FORM,
+  ANSWER_NEW_QUEST_FORM,
   BOOLEAN_FLAGS,
   checkPositionals,
-  DECLARE_QUEST_FORM,
+  DECLARE_EXISTING_QUEST_FORM,
+  DECLARE_NEW_QUEST_FORM,
   documentedPaths,
   POSITIONAL_LIMITS,
+  usageBlock,
   usageForPath,
   usageText,
   walkPath,
@@ -630,18 +633,39 @@ describe("cli --help on every command and subcommand", () => {
     }
   });
 
-  test("each hand-back form uses only flags its command's usage entry documents", () => {
+  test("each hand-back form uses only flags its command's usage entry documents, and has no pipe outside <...>", () => {
     for (const [form, path] of [
       [ANSWER_BELONGS_FORM, "answer"],
-      [ANSWER_QUEST_FORM, "answer"],
-      [DECLARE_QUEST_FORM, "quest declare"],
+      [ANSWER_EXISTING_QUEST_FORM, "answer"],
+      [ANSWER_NEW_QUEST_FORM, "answer"],
+      [DECLARE_EXISTING_QUEST_FORM, "quest declare"],
+      [DECLARE_NEW_QUEST_FORM, "quest declare"],
     ] as const) {
       const documented = usageText(path);
       expect(form.startsWith(`tempad ${path} `)).toBe(true);
       for (const flag of form.match(/--[\w-]+/g) ?? []) {
-        expect(documented, `${flag} in ${form}`).toContain(flag);
+        expect(documented, `${flag} in ${form}`).toMatch(new RegExp(`${flag}(?![\\w-])`));
       }
+      // A `|` outside `<...>` and quotes would be a shell pipe when the line is copied.
+      expect(form.replace(/"[^"]*"/g, "").replace(/<[^>]*>/g, ""), form).not.toContain("|");
     }
+  });
+
+  test("the answer usage lists each form on its own line, --origin only with a new quest", () => {
+    const lines = usageText("answer")
+      .split("\n")
+      .map((line) => line.trim());
+    expect(lines).toHaveLength(3);
+    // The error block: `usage:` alone, then every form indented the same.
+    expect(usageBlock("answer").split("\n")).toEqual([
+      "usage:",
+      ...usageText("answer")
+        .split("\n")
+        .map((line) => `  ${line.trim()}`),
+    ]);
+    expect(lines.filter((line) => line.includes("--origin"))).toEqual([
+      expect.stringContaining('--quest new:"<title>"'),
+    ]);
   });
 
   test("one maximal valid invocation per path is accepted", () => {

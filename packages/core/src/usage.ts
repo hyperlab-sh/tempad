@@ -138,7 +138,11 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
   { paths: ["impact import"], text: "tempad impact import <file.json>" },
   {
     paths: ["answer"],
-    text: 'tempad answer <question-id> --belongs | --quest <id|new:"title"> [--why "..."] [--origin current --trigger "..." --kind waiting|blocker|curiosity|unknown]',
+    text: [
+      'tempad answer <question-id> --belongs [--why "..."]',
+      'tempad answer <question-id> --quest <quest-id> [--why "..."]',
+      'tempad answer <question-id> --quest new:"<title>" [--why "..."] [--origin current --trigger "..." --kind waiting|blocker|curiosity|unknown]',
+    ].join("\n  "),
   },
   { paths: ["rebuild"], text: "tempad rebuild [--until <iso>]" },
   { paths: ["w5 enqueue"], text: "tempad w5 enqueue --session <id> [--forced]" },
@@ -188,13 +192,20 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
  * The commands a hand-back asks an agent to run, one runnable form each: the hooks and
  * `tempad review` print them as shown, so no form carries a flag that is invalid for the
  * question it answers (`--belongs` is only valid on a belongs-kind question). The flags of
- * each are a subset of the entry of the command they belong to (a test checks it).
+ * each are a subset of the entry of the command they belong to (a test checks it). No form
+ * has a `|` outside `<...>` (in brackets or bare), which a shell would read as a pipe when the
+ * line is copied; each alternative is its own form, printed on its own line, and a choice of
+ * values is a placeholder, `<waiting|blocker|curiosity|unknown>`.
  */
 export const ANSWER_BELONGS_FORM = 'tempad answer <question-id> --belongs --why "<reason>"';
-export const ANSWER_QUEST_FORM =
-  'tempad answer <question-id> --quest <id>|new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]';
-export const DECLARE_QUEST_FORM =
-  'tempad quest declare --session <id> --quest <id>|--new "<title>" --outcome "<text>" --by agent';
+export const ANSWER_EXISTING_QUEST_FORM =
+  'tempad answer <question-id> --quest <quest-id> --why "<reason>"';
+export const ANSWER_NEW_QUEST_FORM =
+  'tempad answer <question-id> --quest new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind <waiting|blocker|curiosity|unknown>]';
+export const DECLARE_EXISTING_QUEST_FORM =
+  "tempad quest declare --session <id> --quest <quest-id> --by agent";
+export const DECLARE_NEW_QUEST_FORM =
+  'tempad quest declare --session <id> --new "<title>" --outcome "<text>" --by agent';
 
 /** A hand-back form with the question's or session's id in place of its placeholder. */
 export function handbackForm(form: string, placeholder: string, value: string): string {
@@ -209,6 +220,14 @@ export function usageText(path: string): string {
   const entry = USAGE_ENTRIES.find((candidate) => candidate.paths.includes(path));
   if (entry === undefined) throw new Error(`no usage text for "${path}"`);
   return entry.text;
+}
+
+/** `usage:` on its own line, then every line of one path's text indented alike. */
+export function usageBlock(path: string): string {
+  const lines = usageText(path)
+    .split("\n")
+    .map((line) => `  ${line.trim()}`);
+  return ["usage:", ...lines].join("\n");
 }
 
 /** `usage:` followed by every usage line of a command, for the group-level usage errors. */
