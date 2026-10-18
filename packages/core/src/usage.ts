@@ -49,6 +49,7 @@ export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
   quiet: [],
   review: [],
   scry: [],
+  schedule: ["install", "remove", "status"],
   skill: ["install"],
   project: ["register", "list", "reresolve"],
 };
@@ -161,6 +162,18 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
   {
     paths: ["scry"],
     text: "tempad scry [--json] [--days <n>] [--fast]   (read-only health check of the data: Health, Stats, Recommendations; exit 1 when a check fails; --fast skips quick_check and the projection replay)",
+  },
+  {
+    paths: ["schedule", "schedule install"],
+    text: "tempad schedule install   (write and load an hourly per-user `tempad sync`: a LaunchAgent on macOS, a systemd user timer on Linux; running it again rewrites and reloads; logs to TEMPAD_HOME/logs/sync.log)",
+  },
+  {
+    paths: ["schedule remove"],
+    text: "tempad schedule remove   (unload and delete the scheduled sync; fine when none is installed)",
+  },
+  {
+    paths: ["schedule status"],
+    text: "tempad schedule status [--json]   (installed, loaded, last run and its exit code; exit 1 unless installed, loaded and healthy)",
   },
   { paths: ["skill", "skill install"], text: "tempad skill install [--scope user|project]" },
   {

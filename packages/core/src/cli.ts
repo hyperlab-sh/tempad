@@ -28,10 +28,12 @@ import { loadIntentConfig } from "./intent/config.ts";
 import { ensureTables } from "./intent/projections";
 import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
+import { runScheduleCommand } from "./schedule/index.ts";
 import { runScryCommand } from "./scry/cli.ts";
 import { runSetup } from "./setup/index.ts";
 import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
 import { forgetSync, formatForgetSummary, rejoinServer } from "./sync/forget.ts";
+import { acquireSyncLock, SYNC_BUSY_MESSAGE } from "./sync/lock.ts";
 import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
   COMMAND_TREE,
@@ -269,6 +271,14 @@ async function runSyncCommand(args: string[]): Promise<number> {
       return 1;
     }
     return runRejoinCommand(values.rejoin);
+  }
+  // One collecting sync at a time: a scheduled run that overlaps a manual one skips. A plain
+  // sync exits 0 (nothing is wrong, the other run is doing the work); `--push`/`--pull` exit 75
+  // (EX_TEMPFAIL) because a script that asked for exactly that push got nothing.
+  using syncLock = acquireSyncLock(tempadHome());
+  if (!syncLock.held) {
+    console.error(SYNC_BUSY_MESSAGE);
+    return directional ? 75 : 0;
   }
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   // Push sync needs the host tag and the server token, and only when [sync] is enabled:
@@ -637,6 +647,9 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     // Read-only: opens the database itself instead of through `prepareCommand`, which migrates and writes.
     assertConfigured(tempadHome());
     return runScryCommand(rest);
+  }
+  if (command === "schedule") {
+    return runScheduleCommand(rest);
   }
   if (command === "skill") {
     return runSkillCommand(rest);

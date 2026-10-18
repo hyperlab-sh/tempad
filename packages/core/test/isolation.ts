@@ -7,7 +7,7 @@ import { ENV_VARS } from "../src/config/env.ts";
  * Every variable the code under test reads from the environment and that names something of
  * the developer's: where their files live, or a credential. `src/` reads the `ENV_VARS` table
  * (secrets included), `ANTHROPIC_API_KEY`, `TEMPAD_HOME`, `TEMPAD_HOOK_SOURCE`, `HOME`, and
- * `CLAUDE_CONFIG_DIR` (settings.json and the skills directory); the hook scripts add
+ * `CLAUDE_CONFIG_DIR` (settings.json and the skills directory), `XDG_CONFIG_HOME` (the systemd user units `tempad schedule` writes), `PROTO_HOME` (the Bun shim it looks for); the hook scripts add
  * `CLAUDE_PROJECT_DIR`, `TEMPAD_BIN` and `HOME`. A new `process.env` read in `src/` that names a
  * user-scoped location must be listed here; `test/isolation.test.ts` pins the list against `ENV_VARS`.
  */
@@ -18,6 +18,8 @@ export const USER_SCOPED_VARIABLES: readonly string[] = [
   "CLAUDE_PROJECT_DIR",
   "CLAUDE_PLUGIN_ROOT",
   "TEMPAD_BIN",
+  "XDG_CONFIG_HOME",
+  "PROTO_HOME",
   "TEMPAD_HOME",
   "TEMPAD_HOOK_SOURCE",
   "GIT_AUTHOR_NAME",
