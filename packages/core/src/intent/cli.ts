@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import type { HomeConfig } from "../config/env";
+import { commandUsageText, usageText } from "../usage";
 import { answerQuestion, assignStint, stateImpact, THEME_PATTERN } from "./api";
 import type { IntentConfig } from "./config";
 import {
@@ -58,7 +59,7 @@ function runHeroCommand(args: string[], context: IntentContext): number {
   if (subcommand === "init") {
     const name = rest[0];
     if (!name) {
-      console.error('usage: tempad hero init "<name>"');
+      console.error(`usage: ${usageText("hero init")}`);
       return 2;
     }
     const existing = currentHeroId(context.database);
@@ -76,7 +77,7 @@ function runHeroCommand(args: string[], context: IntentContext): number {
     applyIncremental(context.database, event);
     return 0;
   }
-  console.error('usage: tempad hero init "<name>"');
+  console.error(`usage: ${usageText("hero init")}`);
   return 2;
 }
 
@@ -93,7 +94,7 @@ function runPartyCommand(args: string[], context: IntentContext): number {
     });
     const [slug, name] = positionals;
     if (!slug || !name) {
-      console.error('usage: tempad party add <slug> "<name>" [--joined YYYY-MM-DD]');
+      console.error(`usage: ${usageText("party add")}`);
       return 2;
     }
     if (findPartyBySlug(context.database, slug)) {
@@ -134,7 +135,7 @@ function runPartyCommand(args: string[], context: IntentContext): number {
     });
     const slug = positionals[0];
     if (!slug) {
-      console.error('usage: tempad party leave <slug> --reason "..."');
+      console.error(`usage: ${usageText("party leave")}`);
       return 2;
     }
     const party = findPartyBySlug(context.database, slug);
@@ -177,7 +178,7 @@ function runPartyCommand(args: string[], context: IntentContext): number {
     return 0;
   }
 
-  console.error("usage: tempad party add|leave|list ...");
+  console.error(`usage: ${commandUsageText("party")}`);
   return 2;
 }
 
@@ -186,7 +187,7 @@ function runClientCommand(args: string[], context: IntentContext): number {
   if (subcommand === "add") {
     const [slug, name] = rest;
     if (!slug || !name) {
-      console.error('usage: tempad client add <slug> "<name>"');
+      console.error(`usage: ${usageText("client add")}`);
       return 2;
     }
     const existing = context.database.query("SELECT id FROM clients WHERE slug = ?").get(slug);
@@ -206,7 +207,7 @@ function runClientCommand(args: string[], context: IntentContext): number {
     );
     return 0;
   }
-  console.error('usage: tempad client add <slug> "<name>"');
+  console.error(`usage: ${usageText("client add")}`);
   return 2;
 }
 
@@ -232,9 +233,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     });
     const title = positionals[0];
     if (!title) {
-      console.error(
-        'usage: tempad saga add --owner hero|party:<slug> "<title>" [--statement "..."]',
-      );
+      console.error(`usage: ${usageText("saga add")}`);
       return 2;
     }
     const owner = parseOwnerFlag(context.database, values);
@@ -259,7 +258,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     });
     const [id, title] = positionals;
     if (!id || !title) {
-      console.error('usage: tempad saga reword <id> "<title>" [--statement]');
+      console.error(`usage: ${usageText("saga reword")}`);
       return 2;
     }
     assertEditIntent(context.database, "saga", id, "reword");
@@ -284,7 +283,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     });
     const [id, title] = positionals;
     if (!id || !title || !values.reason) {
-      console.error('usage: tempad saga replace <id> "<title>" [--statement] --reason "..."');
+      console.error(`usage: ${usageText("saga replace")}`);
       return 2;
     }
     const old = context.database
@@ -330,7 +329,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id || !values.reason) {
-      console.error("usage: tempad saga end <id> --reason achieved|abandoned");
+      console.error(`usage: ${usageText("saga end")}`);
       return 2;
     }
     applyIncremental(
@@ -348,7 +347,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
   if (subcommand === "edit") {
     const [id, title] = rest;
     if (!id || !title) {
-      console.error('usage: tempad saga edit <id> "<title>"');
+      console.error(`usage: ${usageText("saga edit")}`);
       return 2;
     }
     assertEditIntent(context.database, "saga", id, undefined);
@@ -384,7 +383,7 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     return 0;
   }
 
-  console.error("usage: tempad saga add|reword|replace|end|edit|list ...");
+  console.error(`usage: ${commandUsageText("saga")}`);
   return 2;
 }
 
@@ -617,9 +616,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const title = positionals[0];
     if (!title) {
-      console.error(
-        'usage: tempad quest add --owner hero|party:<slug> [--serves <id>] "<title>" ...',
-      );
+      console.error(`usage: ${usageText("quest add")}`);
       return 2;
     }
     const owner = parseOwnerFlag(context.database, values);
@@ -655,7 +652,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const [id, title] = positionals;
     if (!id || !title) {
-      console.error('usage: tempad quest reword <id> "<title>" [--outcome]');
+      console.error(`usage: ${usageText("quest reword")}`);
       return 2;
     }
     if (refuseRetractedQuest(context.database, id)) return 1;
@@ -681,7 +678,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const [id, title] = positionals;
     if (!id || !title || !values.reason) {
-      console.error('usage: tempad quest replace <id> "<title>" [--outcome] --reason "..."');
+      console.error(`usage: ${usageText("quest replace")}`);
       return 2;
     }
     const old = findQuest(context.database, id);
@@ -727,7 +724,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id || !values.reason) {
-      console.error("usage: tempad quest end <id> --reason ...");
+      console.error(`usage: ${usageText("quest end")}`);
       return 2;
     }
     if (refuseRetractedQuest(context.database, id)) return 1;
@@ -746,7 +743,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
   if (subcommand === "edit") {
     const [id, title] = rest;
     if (!id || !title) {
-      console.error('usage: tempad quest edit <id> "<title>"');
+      console.error(`usage: ${usageText("quest edit")}`);
       return 2;
     }
     if (refuseRetractedQuest(context.database, id)) return 1;
@@ -761,7 +758,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
   if (subcommand === "confirm") {
     const id = rest[0];
     if (!id) {
-      console.error("usage: tempad quest confirm <id>");
+      console.error(`usage: ${usageText("quest confirm")}`);
       return 2;
     }
     const resolved = resolveExistingQuest(context.database, id);
@@ -790,7 +787,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id || !values.into) {
-      console.error("usage: tempad quest merge <id> --into <id>");
+      console.error(`usage: ${usageText("quest merge")}`);
       return 2;
     }
     const source = resolveExistingQuest(context.database, id);
@@ -828,7 +825,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id) {
-      console.error(`usage: tempad quest ${subcommand} <id> [--reason]`);
+      console.error(`usage: ${usageText(`quest ${subcommand}`)}`);
       return 2;
     }
     const resolved = resolveExistingQuest(context.database, id);
@@ -868,9 +865,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id || !values["deviates-from"] || !values.trigger) {
-      console.error(
-        'usage: tempad quest branch <id> --deviates-from <quest-id|stint-id> --trigger "..." [--kind ...] [--at <iso>]',
-      );
+      console.error(`usage: ${usageText("quest branch")}`);
       return 2;
     }
     const at = normalizeAt(values.at);
@@ -938,7 +933,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     });
     const id = positionals[0];
     if (!id || !values.to) {
-      console.error("usage: tempad quest return <id> --to <quest-id>");
+      console.error(`usage: ${usageText("quest return")}`);
       return 2;
     }
     const resolved = resolveExistingQuest(context.database, id);
@@ -973,7 +968,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     const id = positionals[0];
     const reason = values.reason?.trim();
     if (!id || !reason) {
-      console.error(`usage: tempad quest ${subcommand} <id> --reason "..." [--force]`);
+      console.error(`usage: ${usageText(`quest ${subcommand}`)}`);
       return 2;
     }
     // The id is taken exactly as named, not followed through `merged_into`:
@@ -1104,8 +1099,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       strict: true,
     });
 
-    const usage =
-      'usage: tempad quest declare --session <id> [--parent <id>] (--quest <id> | --new "<title>" --outcome "<text>" [--commitment promised|personal|exploratory] [--project <slug>] [--serves <saga id>] [--advances <quest id> | --deviates-from <quest id> --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown] [--origin <quest id> --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown] | --done <quest>) [--plan "a; b; c"] [--by agent|hero] [--at <iso>]';
+    const usage = `usage: ${usageText("quest declare")}`;
 
     if (!values.session) {
       console.error(usage);
@@ -1279,9 +1273,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     return 0;
   }
 
-  console.error(
-    "usage: tempad quest add|reword|replace|end|edit|confirm|merge|pause|resume|done|abandon|branch|return|retract|delete|list|declare ...",
-  );
+  console.error(`usage: ${commandUsageText("quest")}`);
   return 2;
 }
 
@@ -1317,7 +1309,7 @@ function runStintCommand(args: string[], context: IntentContext): number {
     }
     return 0;
   }
-  console.error("usage: tempad stint list [--open] [--quest <id>]");
+  console.error(`usage: ${usageText("stint list")}`);
   return 2;
 }
 
@@ -1356,7 +1348,7 @@ function runTraceCommand(args: string[], context: IntentContext): number {
     }
     return 0;
   }
-  console.error("usage: tempad trace list [--since <iso>] [--stint <id>]");
+  console.error(`usage: ${usageText("trace list")}`);
   return 2;
 }
 
@@ -1416,7 +1408,7 @@ function runImpactCommand(args: string[], context: IntentContext): number {
     });
     const [ref, text] = positionals;
     if (!ref || !text) {
-      console.error(`usage: tempad impact set <ref> "<text>" [--theme <t>]`);
+      console.error(`usage: ${usageText("impact set")}`);
       console.error(`accepted ref shapes: ${EVIDENCE_REF_SHAPES}`);
       return 2;
     }
@@ -1467,7 +1459,7 @@ function runImpactCommand(args: string[], context: IntentContext): number {
   if (subcommand === "import") {
     const file = rest[0];
     if (!file) {
-      console.error("usage: tempad impact import <file.json>");
+      console.error(`usage: ${usageText("impact import")}`);
       return 2;
     }
 
@@ -1538,7 +1530,7 @@ function runImpactCommand(args: string[], context: IntentContext): number {
     return 0;
   }
 
-  console.error("usage: tempad impact set|list|import ...");
+  console.error(`usage: ${commandUsageText("impact")}`);
   return 2;
 }
 
@@ -1605,8 +1597,7 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
     allowPositionals: true,
   });
   const questionId = positionals[0];
-  const usage =
-    'usage: tempad answer <question-id> --belongs | --quest <id|new:"title"> [--why "..."] [--origin current --trigger "..." --kind waiting|blocker|curiosity|unknown]';
+  const usage = `usage: ${usageText("answer")}`;
   // Exactly one of the two: `--belongs` confirms the declared quest, `--quest`
   // moves the trace somewhere else. Both together says nothing coherent.
   if (!questionId || (values.belongs ? values.quest !== undefined : !values.quest)) {

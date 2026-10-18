@@ -6,12 +6,12 @@ import { loadConfig, tempadHome } from "../config/env";
 import { loadRules } from "../config/rules";
 import { defaultIntentConfig, loadIntentConfig } from "../intent/config";
 import { isSyncEnabled, loadSyncConfig, SyncConfigError } from "../sync/config";
+import { usageText } from "../usage";
 import { scry } from "./collect";
 import { formatReport } from "./format";
 import type { Check, Recommendation, ScryReport } from "./types";
 
-export const SCRY_USAGE =
-  "usage: tempad scry [--json] [--days <n>] [--fast]   (read-only health check: Health, Stats, Recommendations; exit 1 when a check fails)";
+export const SCRY_USAGE = `usage: ${usageText("scry")}`;
 
 /** About ten years: far enough back for any real history, and `now - days` stays a valid date. */
 export const MAX_DAYS = 3650;

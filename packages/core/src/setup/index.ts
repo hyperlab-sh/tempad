@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { childEnvironment } from "../config/child-env.ts";
 import { ENV_VARS, type EnvVar, readDotEnv, SETUP_VARS } from "../config/env.ts";
+import { usageText } from "../usage.ts";
 import { hasTempadHooks, settingsPathFor } from "../w5/hooks.ts";
 import { flagNameFor, renderEnvFile } from "./env-file.ts";
 import {
@@ -27,8 +28,7 @@ import {
 const CHECK_TIMEOUT_MS = 5000;
 const DETECT_TIMEOUT_MS = 3000;
 
-export const SETUP_USAGE =
-  "tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]";
+export const SETUP_USAGE = usageText("setup");
 
 /** Everything `runSetup` touches outside the file system, injectable so tests never hit the network. */
 export interface SetupDeps {
