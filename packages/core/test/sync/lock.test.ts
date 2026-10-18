@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireSyncLock, SYNC_BUSY_MESSAGE } from "../../src/sync/lock";
+import { acquireSyncLock, SYNC_BUSY_MESSAGE, SYNC_CLEARING_FILE } from "../../src/sync/lock";
 
 const CLI = join(import.meta.dir, "..", "..", "src", "cli.ts");
 const directories: string[] = [];
@@ -96,6 +96,67 @@ describe("acquireSyncLock", () => {
     writeFileSync(join(home, "sync.lock"), String(process.pid));
     using lock = acquireSyncLock(home);
     expect(lock.held).toBe(false);
+  });
+
+  test("the own-pid guard holds even when liveness says dead: a lock with this pid is never cleared", () => {
+    const home = configuredHome();
+    writeFileSync(join(home, "sync.lock"), String(process.pid));
+    using lock = acquireSyncLock(home, undefined, { isAlive: () => false });
+    expect(lock.held).toBe(false);
+    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
+  });
+
+  test("a run that judged the lock dead does not remove a live lock another run took in between", async () => {
+    const home = configuredHome();
+    const lockPath = join(home, "sync.lock");
+    writeFileSync(lockPath, String(await deadPid()));
+    const sleeper = Bun.spawn(["sleep", "60"]);
+    try {
+      using lock = acquireSyncLock(home, undefined, {
+        // Another run clears the dead lock and takes its own, after this run read the dead pid.
+        afterJudgedDead: () => {
+          rmSync(lockPath);
+          writeFileSync(lockPath, String(sleeper.pid));
+        },
+      });
+      expect(lock.held).toBe(false);
+      expect(readFileSync(lockPath, "utf8")).toBe(String(sleeper.pid));
+      expect(existsSync(join(home, SYNC_CLEARING_FILE))).toBe(false);
+    } finally {
+      sleeper.kill("SIGKILL");
+    }
+  });
+
+  test("a run that finds another run clearing skips and leaves the dead lock to it", async () => {
+    const home = configuredHome();
+    const deadLock = String(await deadPid());
+    writeFileSync(join(home, "sync.lock"), deadLock);
+    writeFileSync(join(home, SYNC_CLEARING_FILE), String(process.pid));
+    using lock = acquireSyncLock(home);
+    expect(lock.held).toBe(false);
+    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(deadLock);
+    expect(readFileSync(join(home, SYNC_CLEARING_FILE), "utf8")).toBe(String(process.pid));
+  });
+
+  test("a clearing lock left by a clearer that died is removed, that run skips, the next one proceeds", async () => {
+    const home = configuredHome();
+    writeFileSync(join(home, "sync.lock"), String(await deadPid()));
+    writeFileSync(join(home, SYNC_CLEARING_FILE), String(await deadPid()));
+    {
+      using first = acquireSyncLock(home);
+      expect(first.held).toBe(false);
+    }
+    expect(existsSync(join(home, SYNC_CLEARING_FILE))).toBe(false);
+    using second = acquireSyncLock(home);
+    expect(second.held).toBe(true);
+  });
+
+  test("the clearing lock is released after a clear", async () => {
+    const home = configuredHome();
+    writeFileSync(join(home, "sync.lock"), String(await deadPid()));
+    using lock = acquireSyncLock(home);
+    expect(lock.held).toBe(true);
+    expect(existsSync(join(home, SYNC_CLEARING_FILE))).toBe(false);
   });
 
   test("an old lock whose pid is alive is kept", () => {

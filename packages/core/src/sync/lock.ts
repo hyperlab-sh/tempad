@@ -16,9 +16,18 @@ import { acquireLock, clearStaleLock, lockPid, pidIsAlive, releaseLock } from ".
  * minute grace: a lock whose pid is gone (and is not ours) is cleared at once, because a sync
  * killed by SIGINT/SIGTERM leaves one behind and every run in the next half hour would falsely
  * report "already running". A lock with no pid yet (the holder created it a moment ago and has
- * not written its pid) is left alone. A reused pid can keep a dead run's lock for up to the 6 h
- * ceiling, and two runs that both find the same dead lock may both clear it; the lock saves
- * work and guards no data, so neither matters.
+ * not written its pid) is left alone.
+ *
+ * Clearing a dead lock is itself serialized by `sync.lock.clearing`, taken with `O_EXCL` and
+ * held only while the dead lock is re-read and unlinked. Without it, two runs that both judged
+ * the lock dead could interleave (one unlinks and takes a fresh lock, the other then unlinks that
+ * live lock). With it the unlink happens only inside the critical section, after re-reading the
+ * pid, and nothing can replace a lock file that exists: `O_EXCL` creation fails while it does,
+ * and its dead holder cannot release it. A run that finds the clearing lock taken skips (it
+ * returns `held: false`) instead of waiting. A clearing lock left by a clearer that died inside
+ * that microsecond window is removed by the next run (and that run skips); two runs removing it
+ * at once is the one remaining race, and it needs a crash in the critical section first. A reused
+ * live pid can keep a dead run's lock until the 6 h ceiling.
  */
 export interface SyncLock {
   /** False when another sync holds the lock; the caller skips its run. */
@@ -28,16 +37,26 @@ export interface SyncLock {
 
 export const SYNC_LOCK_FILE = "sync.lock";
 
+export const SYNC_CLEARING_FILE = "sync.lock.clearing";
+
+/** Test seams: what runs between a run judging the lock dead and clearing it, and the liveness check. */
+export interface SyncLockHooks {
+  afterJudgedDead?: () => void;
+  isAlive?: (pid: number) => boolean;
+}
+
 export function acquireSyncLock(
   home: string,
   log: (line: string) => void = (line) => console.error(line),
+  hooks: SyncLockHooks = {},
 ): SyncLock {
   const lockPath = join(home, SYNC_LOCK_FILE);
+  const busy: SyncLock = { held: false, [Symbol.dispose]() {} };
   // An unconfigured home gets nothing created: the command fails on its own, right after this.
   if (!isConfigured(home) || !existsSync(home)) return { held: true, [Symbol.dispose]() {} };
-  clearDeadHolderLock(lockPath, log);
+  if (!clearDeadHolderLock(lockPath, log, hooks)) return busy;
   clearStaleLock(lockPath, log, { name: SYNC_LOCK_FILE });
-  if (!acquireLock(lockPath)) return { held: false, [Symbol.dispose]() {} };
+  if (!acquireLock(lockPath)) return busy;
   return {
     held: true,
     [Symbol.dispose]() {
@@ -46,15 +65,42 @@ export function acquireSyncLock(
   };
 }
 
-/** Removes the lock when its holder's pid is not running and is not this process. */
-function clearDeadHolderLock(lockPath: string, log: (line: string) => void): void {
+/**
+ * Removes the lock when its holder's pid is not running and is not this process. Returns false
+ * when another run is clearing it right now (the caller skips).
+ */
+function clearDeadHolderLock(
+  lockPath: string,
+  log: (line: string) => void,
+  hooks: SyncLockHooks,
+): boolean {
+  const isAlive = hooks.isAlive ?? pidIsAlive;
   const pid = lockPid(lockPath);
-  if (pid === null || pid === process.pid || pidIsAlive(pid)) return;
-  // Re-read just before unlinking, so a holder that replaced it in between is not removed.
-  if (lockPid(lockPath) !== pid) return;
-  log(`${SYNC_LOCK_FILE} was left by a sync that is gone (pid ${pid}), removing`);
+  if (pid === null || pid === process.pid || isAlive(pid)) return true;
+  hooks.afterJudgedDead?.();
+
+  const clearingPath = `${lockPath}.clearing`;
+  if (!acquireLock(clearingPath)) {
+    // Taken: another run is clearing. Taken by a clearer that died: remove it, skip this run.
+    const clearer = lockPid(clearingPath);
+    if (clearer !== null && clearer !== process.pid && !isAlive(clearer))
+      removeIfPresent(clearingPath);
+    return false;
+  }
   try {
-    unlinkSync(lockPath);
+    // Under the clearing lock: only a lock still held by the dead pid we judged is removed.
+    if (lockPid(lockPath) !== pid) return true;
+    log(`${SYNC_LOCK_FILE} was left by a sync that is gone (pid ${pid}), removing`);
+    removeIfPresent(lockPath);
+  } finally {
+    releaseLock(clearingPath);
+  }
+  return true;
+}
+
+function removeIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
