@@ -36,6 +36,12 @@ export interface BackfillOptions {
    * host-local"). Unset: every session, regardless of host.
    */
   hostSlug?: string;
+  /**
+   * When set, only these sessions are classified, of the ones the range selects.
+   * `w5 backfill --reclassify` passes the sessions it reset, so a protected one
+   * (declared, or touched by a person) is not classified on top of what it holds.
+   */
+  sessionIds?: ReadonlySet<string>;
 }
 
 export interface BackfillResult {
@@ -241,7 +247,7 @@ export async function backfill(
     cutoff,
     to: options.to,
     hostSlug: options.hostSlug,
-  });
+  }).filter((session) => options.sessionIds === undefined || options.sessionIds.has(session.id));
 
   let sessionsClassified = 0;
   let sessionsSkipped = 0;

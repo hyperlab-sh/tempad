@@ -41,6 +41,7 @@ import {
 import { enqueueJob } from "./jobs";
 import { acquireLock, clearStaleLock, releaseLock, touchLock } from "./lock";
 import type { QuestionRow } from "./questions";
+import { BackupError, backupDatabase, planReclassify, reclassify } from "./reclassify";
 import { drain } from "./runner";
 
 export interface SpawnOptions {
@@ -580,9 +581,30 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
       from: { type: "string" },
       model: { type: "string" },
       force: { type: "boolean", default: false },
+      reclassify: { type: "boolean", default: false },
+      to: { type: "string" },
+      "dry-run": { type: "boolean", default: false },
+      backup: { type: "string" },
     },
     strict: true,
   });
+
+  if (!values.reclassify) {
+    for (const flag of ["to", "dry-run", "backup"] as const) {
+      if (values[flag] !== undefined && values[flag] !== false) {
+        context.stdout(`${BACKFILL_USAGE}\n--${flag} is only valid with --reclassify`);
+        return 2;
+      }
+    }
+  } else if (values.force || values.days !== undefined) {
+    context.stdout(
+      `${BACKFILL_USAGE}\n--reclassify names its own range with --from/--to: it cannot be combined with --force or --days`,
+    );
+    return 2;
+  } else if (values.from === undefined) {
+    context.stdout(`${BACKFILL_USAGE}\n--reclassify needs --from <iso>`);
+    return 2;
+  }
 
   if (values.days !== undefined && values.from !== undefined) {
     context.stdout(`${BACKFILL_USAGE}\n--days and --from cannot be combined: pick one lower bound`);
@@ -600,6 +622,21 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     }
     from = new Date(fromMs).toISOString();
   }
+  let to: string | undefined;
+  if (values.to !== undefined) {
+    const toMs = parseIsoInstant(values.to);
+    if (toMs === null) {
+      context.stdout(
+        `${BACKFILL_USAGE}\n--to needs an ISO 8601 date or datetime (2026-10-01, 2026-10-01T10:00:00Z, 2026-10-01T10:00:00-03:00), got "${values.to}"`,
+      );
+      return 2;
+    }
+    to = new Date(toMs).toISOString();
+    if (from !== undefined && to <= from) {
+      context.stdout(`${BACKFILL_USAGE}\n--to must be after --from`);
+      return 2;
+    }
+  }
 
   const days = values.days
     ? Number.parseInt(values.days, 10)
@@ -610,6 +647,15 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     return 1;
   }
   const classifier = buildClassifier(context.config, context.intentConfig, values.model);
+
+  if (values.reclassify && from !== undefined) {
+    return runReclassify(context, classifier, {
+      from,
+      ...(to !== undefined ? { to } : {}),
+      dryRun: values["dry-run"] === true,
+      backup: values.backup,
+    });
+  }
 
   const result = await backfill(
     context.database,
@@ -638,6 +684,86 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
   const attemptedWindows = result.windowsClassified + result.windowsFailed;
   if (attemptedWindows > 0 && result.windowsClassified === 0) return 1;
   return 0;
+}
+
+/**
+ * `w5 backfill --reclassify --from <iso> [--to <iso>] [--dry-run] [--backup <path>]`:
+ * the supported way to redo a range on the real database. It retracts (by events)
+ * what w5 inferred for the sessions in range and classifies them again. It writes
+ * to the database, so it refuses without `--backup <path>` (which it takes itself,
+ * checked, before the first write) unless it is a `--dry-run`.
+ */
+async function runReclassify(
+  context: W5Context,
+  classifier: Classifier,
+  input: { from: string; to?: string; dryRun: boolean; backup: string | undefined },
+): Promise<number> {
+  const range = {
+    from: input.from,
+    ...(input.to !== undefined ? { to: input.to } : {}),
+    ...(isSyncEnabled(context.config.home) ? { hostSlug: context.config.hostSlug } : {}),
+  };
+
+  if (input.dryRun) {
+    const plan = planReclassify(context.database, range);
+    context.stdout(
+      `reclassify (dry run): sessions=${plan.sessions.length} protected=${plan.protectedSessions.length} would retract traces=${plan.reset.traces.length} stints=${plan.reset.stintIds.length} quests=${plan.reset.questIds.length}`,
+    );
+    for (const entry of plan.protectedSessions) {
+      context.stdout(`reclassify: protected ${entry.sessionId} (${entry.reason})`);
+    }
+    return 0;
+  }
+
+  if (input.backup === undefined) {
+    const suggestion = join(context.config.home, "backups", `tempad-${Date.now()}.db`);
+    context.stdout(
+      [
+        "reclassify retracts traces, stints and quests in this database; take a backup first.",
+        `  tempad w5 backfill --reclassify --from ${input.from}${input.to !== undefined ? ` --to ${input.to}` : ""} --backup ${suggestion}`,
+        `or by hand: sqlite3 ${join(context.config.home, "tempad.db")} "VACUUM INTO '${suggestion}'"`,
+        "Add --dry-run to see what it would do without writing.",
+      ].join("\n"),
+    );
+    return 1;
+  }
+  try {
+    mkdirSync(dirname(input.backup), { recursive: true });
+    backupDatabase(context.database, input.backup);
+  } catch (error) {
+    if (error instanceof BackupError) {
+      context.stdout(`reclassify: backup failed: ${error.message}; nothing was changed`);
+      return 1;
+    }
+    throw error;
+  }
+  context.stdout(`reclassify: backup written to ${input.backup}`);
+
+  const result = await reclassify(
+    context.database,
+    context.config,
+    context.intentConfig.w5,
+    classifier,
+    {
+      ...range,
+      now: new Date().toISOString(),
+      log: (line) => {
+        log(context.config, line);
+        context.stdout(line);
+      },
+    },
+  );
+  for (const entry of result.plan.protectedSessions) {
+    context.stdout(`reclassify: protected ${entry.sessionId} (${entry.reason})`);
+  }
+  context.stdout(
+    `reclassify: sessions=${result.plan.sessions.length} protected=${result.plan.protectedSessions.length} retracted traces=${result.reset.traces} stints=${result.reset.stints} quests=${result.reset.quests}`,
+  );
+  context.stdout(
+    `classified=${result.backfill.sessionsClassified} windows=${result.backfill.windowsClassified} failed=${result.backfill.windowsFailed} skipped=${result.backfill.sessionsSkipped} windows_skipped=${result.backfill.windowsSkipped}`,
+  );
+  const attempted = result.backfill.windowsClassified + result.backfill.windowsFailed;
+  return attempted > 0 && result.backfill.windowsClassified === 0 ? 1 : 0;
 }
 
 async function runEvalCommand(args: string[], context: W5Context): Promise<number> {
