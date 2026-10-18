@@ -11,7 +11,7 @@ type PromptMode = "declared" | "inferred";
  */
 function buildInferredSystemPrompt(): string {
   return [
-    "You are w5, an assistant that helps a developer notice what they are working on.",
+    "You are w5, an assistant that helps a developer notice what they work on.",
     "Nothing you produce is shared without their review.",
     "",
     "Split the window of Claude Code messages into segments and classify each one.",
@@ -22,10 +22,10 @@ function buildInferredSystemPrompt(): string {
     '  "endedAt": string (ISO timestamp within the window),',
     '  "what": string (short description of the work),',
     '  "why": string (the saga it serves, or "unknown"),',
-    '  "matchedQuest": string | null (id of an open quest this continues),',
+    '  "matchedQuest": string | null (id of an open quest it continues, or "segment:N"),',
     '  "proposedQuest": {"title": string, "outcome": string, "commitment": "promised" | "personal" | "exploratory"} | null,',
-    '  "matchedStint": string | null (id of an open stint listed below this continues),',
-    '  "continuesStint": string | null (id of a closed stint listed below this resumes),',
+    '  "matchedStint": string | null (id of an open stint below it continues, or "segment:N"),',
+    '  "continuesStint": string | null (id of a closed stint below it resumes),',
     '  "newStintReason": string | null (why no listed stint fits),',
     '  "isSwitch": boolean (the outcome changed versus the previous segment),',
     '  "trigger": string | null (transcript text that caused the switch),',
@@ -34,6 +34,7 @@ function buildInferredSystemPrompt(): string {
     '}], "sessionNote": string | null (at most 300 characters on where the session is heading)}',
     "",
     "Reusing a stint is the default: prefer matchedStint, else continuesStint.",
+    '"segment:N" means the stint or quest of segment N (1-based) of this response.',
     "Opening a new stint needs a reason: newStintReason says why no candidate fits.",
     "Set exactly one of matchedStint, continuesStint, newStintReason per segment; never zero, never two.",
     "A stint is one outcome pursued in a session over a span; several may be open at once, so match the one the segment actually belongs to.",

@@ -11,6 +11,7 @@ import {
   type ClassifierSegment,
   type ClassifierWindow,
   DEFAULT_NEW_STINT_REASON,
+  parseSegmentReference,
 } from "./classifier";
 import { openStintContinuing } from "./lifecycle";
 
@@ -42,6 +43,13 @@ export interface AppliedSummary {
    * quest the window offered, now attached to it.
    */
   questAttachedOnMatched: number;
+  /**
+   * Inference mode: segments that landed on a stint or quest an earlier segment
+   * of the same window opened or reached, through a `"segment:<n>"` reference,
+   * the same-outcome rule (`isSwitch: false` with no stint named) or a repeated
+   * proposed quest title (`resolveWithinWindow`).
+   */
+  sameWindowReuse: number;
 }
 
 export interface ApplyOptions {
@@ -409,6 +417,122 @@ function normalizeInferredSelectors(
   };
 }
 
+/** Where each earlier segment of this window landed, and the quests it proposed. */
+interface WindowLedger {
+  landed: { stintId: string; questId: string | null }[];
+  /** Quests this window created from `proposedQuest`, by normalized title. */
+  proposedQuests: Map<string, string>;
+}
+
+/**
+ * Inference mode lists only rows that existed before the window, by id, so a
+ * stint or quest opened by segment 1 has no id segment 2 could name. The model
+ * then had nothing to say "still the same stretch" with: on 2026-10-04 one window
+ * of e854515d came back as four segments that all named the same quest, set
+ * `isSwitch: false`, and explained in `newStintReason` that "review feedback is
+ * part of the same brief execution; no separate stint needed", and each opened
+ * its own stint; in another run segment 1 proposed the quest and segments 2-7
+ * each opened a stint with none. This rewrites a segment, before
+ * `normalizeInferredSelectors` and `resolveStintForSegment` see it, so that it
+ * can reach what the earlier segments landed on:
+ *
+ * - `"segment:<n>"` (renumbered by `validateResult`) becomes segment n's stint
+ *   in a stint slot, and that stint's quest in `matchedQuest`; the rest of the
+ *   path then treats it like any listed id (open through the segment's end is
+ *   reused, closed is continued).
+ * - a `proposedQuest` whose title an earlier segment of this window already
+ *   proposed becomes that quest in `matchedQuest`, not a second quest.
+ * - a segment with `isSwitch: false` ("the outcome did not change versus the
+ *   previous segment") that names no stint stays on the previous segment's stint,
+ *   since a stint is one outcome; only when its quest agrees: the same quest, no
+ *   opinion, or a quest for a stint that has none and that this segment may
+ *   attach one to. A different quest is a different outcome, whatever `isSwitch`
+ *   says, and opens its own stint as before.
+ *
+ * None of this reaches beyond the window: every id it hands on was resolved by
+ * an earlier segment of the same window, so #75's guard against crossed and
+ * garbled ids is untouched.
+ */
+function resolveWithinWindow(
+  segment: ClassifierSegment,
+  index: number,
+  ledger: WindowLedger,
+  attachable: AttachTargets,
+): { segment: ClassifierSegment; reuses: string[] } {
+  const reuses: string[] = [];
+  // `undefined` when the value is no reference at all. A reference past the
+  // segments applied so far names nothing: `validateResult` never lets one
+  // through, but a hand-built result could.
+  const landedAt = (value: string | null | undefined) => {
+    const position = parseSegmentReference(value);
+    if (position === null) return undefined;
+    reuses.push(`named segment ${position}`);
+    return position >= 1 && position <= index ? (ledger.landed[position - 1] ?? null) : null;
+  };
+  const stintSlot = (value: string | null | undefined): string | null => {
+    const landed = landedAt(value);
+    return landed === undefined ? (value ?? null) : (landed?.stintId ?? null);
+  };
+  const questSlot = (value: string | null | undefined): string | null => {
+    const landed = landedAt(value);
+    return landed === undefined ? (value ?? null) : (landed?.questId ?? null);
+  };
+
+  let rewritten: ClassifierSegment = {
+    ...segment,
+    matchedStint: stintSlot(segment.matchedStint),
+    continuesStint: stintSlot(segment.continuesStint),
+    matchedQuest: questSlot(segment.matchedQuest),
+  };
+  if (
+    rewritten.matchedStint === null &&
+    rewritten.continuesStint === null &&
+    (rewritten.newStintReason ?? null) === null
+  ) {
+    rewritten.newStintReason = DEFAULT_NEW_STINT_REASON;
+  }
+
+  const proposed = rewritten.proposedQuest ?? null;
+  const proposedBefore =
+    proposed === null ? undefined : ledger.proposedQuests.get(normalizeOutcome(proposed.title));
+  if (rewritten.matchedQuest === null && proposedBefore !== undefined) {
+    rewritten = { ...rewritten, matchedQuest: proposedBefore, proposedQuest: null };
+    reuses.push(`proposed quest ${proposedBefore} again`);
+  }
+
+  const previous = ledger.landed[index - 1];
+  if (
+    previous !== undefined &&
+    !rewritten.isSwitch &&
+    rewritten.matchedStint === null &&
+    rewritten.continuesStint === null &&
+    questAgrees(rewritten, previous, attachable)
+  ) {
+    rewritten = { ...rewritten, matchedStint: previous.stintId, newStintReason: null };
+    reuses.push(`same outcome as segment ${index}`);
+  }
+
+  return { segment: reuses.length === 0 ? segment : rewritten, reuses };
+}
+
+/** Whether a segment may land on `stint` without disputing or taking its quest. */
+function questAgrees(
+  segment: ClassifierSegment,
+  stint: { stintId: string; questId: string | null },
+  attachable: AttachTargets,
+): boolean {
+  const matchedQuest = segment.matchedQuest ?? null;
+  const proposed = segment.proposedQuest ?? null;
+  if (matchedQuest === null && proposed === null) return true;
+  if (stint.questId !== null) return matchedQuest === stint.questId;
+  // The stint has no quest: landing on it attaches this one, which reaches every
+  // earlier trace of the stint, so only where `reuseStint` would allow it.
+  return (
+    attachable.stintIds.has(stint.stintId) &&
+    (matchedQuest === null || attachable.questIds.has(matchedQuest))
+  );
+}
+
 function resolveStintForSegment(
   store: EventStore,
   database: Database,
@@ -722,6 +846,7 @@ export function applyResult(
     selectorRepaired: 0,
     questProposedOnMatched: 0,
     questAttachedOnMatched: 0,
+    sameWindowReuse: 0,
   };
 
   // Which quest a segment serves is now the model's per-segment call, resolved
@@ -782,20 +907,34 @@ export function applyResult(
       .filter((questId): questId is string => questId !== null),
   );
 
-  // The open quests the window offered: the only ones a matched stint with no
-  // quest may be attached to when the classifier names one.
+  // The open quests and this session's open stints the window offered: the only
+  // ones a matched stint with no quest may be attached to when the classifier
+  // names one. The quests and stints this window opens join them as it goes:
+  // they are this session's own, as much as the ones it was offered.
+  const attachableQuestIds = new Set((window.openQuests ?? []).map((quest) => quest.id));
+  const attachableStintIds = new Set(window.sessionOpenStints.map((stint) => stint.stintId));
   const attachable: AttachTargets = {
-    questIds: new Set((window.openQuests ?? []).map((quest) => quest.id)),
-    stintIds: new Set(window.sessionOpenStints.map((stint) => stint.stintId)),
+    questIds: attachableQuestIds,
+    stintIds: attachableStintIds,
   };
+  const ledger: WindowLedger = { landed: [], proposedQuests: new Map() };
 
-  for (const classified of result.segments) {
-    const { segment, repairs } = declaredMode
-      ? { segment: classified, repairs: [] as string[] }
-      : normalizeInferredSelectors(window, classified);
-    if (repairs.length > 0) summary.selectorRepaired += 1;
-    for (const repair of repairs) {
-      options.log(`w5 stint selector repaired: session ${window.sessionId}, ${repair}`);
+  for (const [index, classified] of result.segments.entries()) {
+    let segment = classified;
+    if (!declaredMode) {
+      const within = resolveWithinWindow(classified, index, ledger, attachable);
+      if (within.reuses.length > 0) summary.sameWindowReuse += 1;
+      for (const reuse of within.reuses) {
+        options.log(
+          `w5 stint resolved within window: session ${window.sessionId}, segment ${index + 1} ${reuse}`,
+        );
+      }
+      const normalized = normalizeInferredSelectors(window, within.segment);
+      if (normalized.repairs.length > 0) summary.selectorRepaired += 1;
+      for (const repair of normalized.repairs) {
+        options.log(`w5 stint selector repaired: session ${window.sessionId}, ${repair}`);
+      }
+      segment = normalized.segment;
     }
     // A stint opens when the work started, not when the classifier ran. For a
     // live run the two are minutes apart, but backfill classifies history with
@@ -829,6 +968,19 @@ export function applyResult(
 
     if (stintOpened) summary.stintsOpened += 1;
     if (questCreated) summary.questsProposed += 1;
+    if (!declaredMode) {
+      if (stintOpened) attachableStintIds.add(stintId);
+      if (questCreated && questId !== null) {
+        attachableQuestIds.add(questId);
+        const title = segment.proposedQuest?.title;
+        if (title !== undefined) ledger.proposedQuests.set(normalizeOutcome(title), questId);
+      }
+      // A quest attached now reaches every segment that landed on the stint.
+      for (const landed of ledger.landed) {
+        if (landed.stintId === stintId) landed.questId = questId;
+      }
+      ledger.landed.push({ stintId, questId });
+    }
     if (unknownStintId) {
       summary.unknownStintIds += 1;
       options.log(
