@@ -1022,6 +1022,7 @@ describe("backfill with a classifier that mixes up the ids it is offered", () =>
 
     expect(result.windowsClassified).toBe(2);
     expect(result.unknownStintIds).toBe(0);
+    expect(result.selectorRepaired).toBe(1);
     expect(result.doubts).toBe(0);
     expect(logs.filter((line) => line.includes("unknown stint id"))).toEqual([]);
     const stints = database.query("SELECT id FROM stints").all() as { id: string }[];

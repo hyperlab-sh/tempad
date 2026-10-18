@@ -6,10 +6,11 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import { applyResult } from "../../src/w5/apply";
-import type {
-  ClassifierResult,
-  ClassifierSegment,
-  ClassifierWindow,
+import {
+  type ClassifierResult,
+  type ClassifierSegment,
+  type ClassifierWindow,
+  DEFAULT_NEW_STINT_REASON,
 } from "../../src/w5/classifier";
 import { openStintContinuing } from "../../src/w5/lifecycle";
 
@@ -820,73 +821,205 @@ describe("applyResult", () => {
       mode: "inferred" as const,
     };
 
+    const stintSlice = (id: string, questId: string | null, closedAt: string | null = null) => ({
+      stintId: id,
+      what: "work",
+      why: "ship",
+      questId,
+      questTitle: null,
+      openedAt: "2026-09-04T13:00:00.000Z",
+      lastTraceEndedAt: "2026-09-04T13:30:00.000Z",
+      closedAt,
+      closeReason: closedAt === null ? null : "idle",
+    });
+    const closedA1 = stintSlice("A1", "Q1", "2026-09-04T14:40:00.000Z");
+    /** The seed's A1 is closed: it is no longer open, only a recent candidate. */
+    const closedWindow: ClassifierWindow = {
+      ...window,
+      sessionOpenStints: [],
+      recentStints: [closedA1],
+    };
+
     function run(
       database: ReturnType<typeof openDatabase>,
       store: EventStore,
       segment: Partial<ClassifierSegment>,
+      candidates: ClassifierWindow = window,
+      options: Partial<Parameters<typeof applyResult>[4]> = {},
     ) {
       const logs: string[] = [];
       const summary = applyResult(
         store,
         database,
-        window,
+        candidates,
         { segments: [{ ...baseMatched, ...segment }], sessionNote: null },
-        { ...inferred, log: (line) => logs.push(line) },
+        { ...inferred, log: (line) => logs.push(line), ...options },
       );
       return { summary, logs };
     }
 
-    test("a quest id in matchedStint reuses the session's open stint of that quest", () => {
+    const closeA1 = (database: ReturnType<typeof openDatabase>) =>
+      database
+        .query("UPDATE stints SET closed_at = '2026-09-04T14:40:00.000Z', close_reason = 'idle'")
+        .run();
+
+    const newStints = (database: ReturnType<typeof openDatabase>) =>
+      database
+        .query(
+          "SELECT id, continues, quest_id as questId FROM stints WHERE id NOT IN ('A1', 'B1', 'A-future', 'A-other')",
+        )
+        .all() as { id: string; continues: string | null; questId: string | null }[];
+
+    const tracesOn = (database: ReturnType<typeof openDatabase>, stint: string) =>
+      (
+        database.query("SELECT COUNT(*) as count FROM traces WHERE stint_id = ?").get(stint) as {
+          count: number;
+        }
+      ).count;
+
+    test("a quest id in matchedStint reuses the open stint of that quest, counts a repair, caps confidence", () => {
       const database = openDatabase(":memory:");
       const { store } = seed(database);
 
       const { summary, logs } = run(database, store, { matchedStint: "Q1", matchedQuest: null });
 
       expect(summary.unknownStintIds).toBe(0);
+      expect(summary.selectorRepaired).toBe(1);
       expect(summary.stintsOpened).toBe(0);
       expect(summary.doubts).toBe(0);
-      expect(logs.filter((line) => line.includes("unknown stint id"))).toEqual([]);
       expect(logs.some((line) => line.includes("stint selector named quest Q1"))).toBe(true);
-      const count = database
-        .query("SELECT COUNT(*) as count FROM traces WHERE stint_id = 'A1'")
-        .get() as { count: number };
-      expect(count.count).toBe(2);
+      expect(tracesOn(database, "A1")).toBe(2);
+      const confidence = database.query("SELECT confidence FROM traces WHERE id != 'T0'").get() as {
+        confidence: number;
+      };
+      expect(confidence.confidence).toBe(0.5);
     });
 
-    test("a quest id in continuesStint continues the session's closed stint of that quest", () => {
+    test("an unrepaired segment is counted as none and keeps its confidence", () => {
       const database = openDatabase(":memory:");
       const { store } = seed(database);
-      database
-        .query("UPDATE stints SET closed_at = '2026-09-04T14:40:00.000Z', close_reason = 'idle'")
-        .run();
 
-      const { summary } = run(database, store, {
-        matchedStint: null,
-        continuesStint: "Q1",
-        matchedQuest: null,
-        newStintReason: null,
-      });
+      const { summary } = run(database, store, {});
+
+      expect(summary.selectorRepaired).toBe(0);
+      const confidence = database.query("SELECT confidence FROM traces WHERE id != 'T0'").get() as {
+        confidence: number;
+      };
+      expect(confidence.confidence).toBe(0.9);
+    });
+
+    test("a quest id in continuesStint continues the closed stint of that quest", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      closeA1(database);
+
+      const { summary } = run(
+        database,
+        store,
+        { matchedStint: null, continuesStint: "Q1", matchedQuest: null, newStintReason: null },
+        closedWindow,
+      );
 
       expect(summary.unknownStintIds).toBe(0);
       expect(summary.stintsOpened).toBe(1);
-      const opened = database
-        .query("SELECT continues, quest_id as questId FROM stints WHERE id != 'A1'")
-        .get() as { continues: string | null; questId: string | null };
-      expect(opened).toEqual({ continues: "A1", questId: "Q1" });
+      expect(newStints(database)).toEqual([
+        { id: expect.any(String), continues: "A1", questId: "Q1" },
+      ]);
     });
 
-    test("a quest id with no stint of it in the session opens a new stint under that quest", () => {
+    test("a quest id with no stint of it among the candidates opens a new stint under that quest", () => {
       const database = openDatabase(":memory:");
       const { store } = seed(database);
-      database.query("UPDATE traces SET session_id = 'other'").run();
 
-      const { summary } = run(database, store, { matchedStint: "Q1", matchedQuest: null });
+      const { summary } = run(
+        database,
+        store,
+        { matchedStint: "Q1", matchedQuest: null },
+        { ...window, sessionOpenStints: [], recentStints: [] },
+      );
 
       expect(summary.unknownStintIds).toBe(0);
-      const opened = database
-        .query("SELECT continues, quest_id as questId FROM stints WHERE id != 'A1'")
-        .get() as { continues: string | null; questId: string | null };
-      expect(opened).toEqual({ continues: null, questId: "Q1" });
+      expect(newStints(database)).toEqual([
+        { id: expect.any(String), continues: null, questId: "Q1" },
+      ]);
+    });
+
+    test("a stint opened after the segment is never the target of a repair", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      // Opened 09-06 with a trace of this session, but absent from the window
+      // because buildWindow bounds candidates by windowEnd.
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('A-future', 'Q1', 'later work', '2026-09-06T10:00:00.000Z', 1)",
+        )
+        .run();
+      database
+        .query(
+          `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
+           VALUES ('T-future', 'A-future', 'claude-code', 'marko-ui', 'session', '2026-09-06T10:00:00.000Z', '2026-09-06T10:30:00.000Z', 'hero', 'later', 'ship', 'personal/marko-ui', 'claude-code', 0.9, 'assistant', 's1', '2026-09-06T10:30:00.000Z')`,
+        )
+        .run();
+
+      run(database, store, { matchedStint: "Q1", matchedQuest: null });
+      expect(tracesOn(database, "A1")).toBe(2);
+      expect(tracesOn(database, "A-future")).toBe(1);
+
+      // The same holds for a closed A1: the new stint continues it, not A-future.
+      const second = openDatabase(":memory:");
+      const { store: secondStore } = seed(second);
+      closeA1(second);
+      second
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('A-future', 'Q1', 'later work', '2026-09-06T10:00:00.000Z', 1)",
+        )
+        .run();
+      run(
+        second,
+        secondStore,
+        { matchedStint: null, continuesStint: "Q1", matchedQuest: null, newStintReason: null },
+        closedWindow,
+      );
+      expect(newStints(second).map((stint) => stint.continues)).toEqual(["A1"]);
+    });
+
+    test("a quest that is not an open candidate is not revived", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('Q-abandoned', 'hero', 'H', 'Dropped', 'x', 1, 1, 'abandoned', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run();
+      database.query("UPDATE stints SET quest_id = 'Q-abandoned' WHERE id = 'A1'").run();
+
+      const { summary } = run(database, store, { matchedStint: "Q-abandoned", matchedQuest: null });
+
+      expect(summary.unknownStintIds).toBe(1);
+      expect(summary.selectorRepaired).toBe(0);
+    });
+
+    test("another session's open stint is not reused through its quest", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('A-other', 'Q1', 'elsewhere', '2026-09-04T13:00:00.000Z', 1)",
+        )
+        .run();
+
+      run(
+        database,
+        store,
+        { matchedStint: "Q1", matchedQuest: null },
+        { ...window, sessionOpenStints: [], recentStints: [stintSlice("A-other", "Q1")] },
+      );
+
+      expect(tracesOn(database, "A-other")).toBe(0);
+      expect(newStints(database)).toEqual([
+        { id: expect.any(String), continues: null, questId: "Q1" },
+      ]);
     });
 
     test("a stint id in matchedQuest next to the right matchedStint is no conflict", () => {
@@ -898,24 +1031,99 @@ describe("applyResult", () => {
       expect(summary.doubts).toBe(0);
       expect(summary.unknownStintIds).toBe(0);
       expect(summary.stintsOpened).toBe(0);
+      expect(summary.selectorRepaired).toBe(1);
     });
 
-    test("a stint id in matchedQuest alone is read as the stint selector", () => {
+    test("two valid selectors that disagree still count a conflict", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+
+      // matchedStint A1 belongs to Q1, matchedQuest names B1, a stint of Q2.
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('Q2', 'hero', 'H', 'Other', 'y', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run();
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES ('B1', 'Q2', 'other work', '2026-09-04T13:00:00.000Z', '2026-09-04T14:00:00.000Z', 'idle', 1)",
+        )
+        .run();
+      const { summary, logs } = run(
+        database,
+        store,
+        { matchedStint: "A1", matchedQuest: "B1" },
+        { ...window, recentStints: [stintSlice("B1", "Q2", "2026-09-04T14:00:00.000Z")] },
+      );
+
+      expect(summary.doubts).toBe(1);
+      expect(logs.some((line) => line.includes("w5 quest conflict"))).toBe(true);
+      expect(tracesOn(database, "A1")).toBe(2);
+    });
+
+    test("a stint id in matchedQuest with no selector and the defaulted reason is the selector", () => {
       const database = openDatabase(":memory:");
       const { store } = seed(database);
 
       const { summary } = run(database, store, {
         matchedStint: null,
         matchedQuest: "A1",
-        newStintReason: "nothing fits",
+        newStintReason: DEFAULT_NEW_STINT_REASON,
       });
 
       expect(summary.doubts).toBe(0);
       expect(summary.stintsOpened).toBe(0);
-      const count = database
-        .query("SELECT COUNT(*) as count FROM traces WHERE stint_id = 'A1'")
-        .get() as { count: number };
-      expect(count.count).toBe(2);
+      expect(tracesOn(database, "A1")).toBe(2);
+    });
+
+    test("a stint id in matchedQuest does not override an explicit newStintReason", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+
+      const { summary } = run(database, store, {
+        matchedStint: null,
+        matchedQuest: "A1",
+        newStintReason: "a comparison unrelated to the walk order work",
+      });
+
+      expect(summary.stintsOpened).toBe(1);
+      expect(summary.doubts).toBe(0);
+      expect(tracesOn(database, "A1")).toBe(1);
+      // matchedQuest stands for A1's quest, so the new stint belongs to it.
+      expect(newStints(database)).toEqual([
+        { id: expect.any(String), continues: null, questId: "Q1" },
+      ]);
+    });
+
+    test("a quest id in the stint slot never links across quests when matchedQuest names another", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      closeA1(database);
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('Q2', 'hero', 'H', 'Other', 'y', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run();
+
+      const { summary } = run(
+        database,
+        store,
+        { matchedStint: null, continuesStint: "Q1", matchedQuest: "Q2", newStintReason: null },
+        {
+          ...closedWindow,
+          openQuests: [
+            ...(window.openQuests ?? []),
+            { id: "Q2", title: "Other", outcome: "y", lastStintAt: null },
+          ],
+        },
+      );
+
+      expect(summary.unknownStintIds).toBe(0);
+      expect(newStints(database)).toEqual([
+        { id: expect.any(String), continues: null, questId: "Q2" },
+      ]);
     });
 
     test("an id that is neither a stint nor a quest stays unknown", () => {
@@ -926,6 +1134,28 @@ describe("applyResult", () => {
 
       expect(summary.unknownStintIds).toBe(1);
       expect(summary.stintsOpened).toBe(1);
+      expect(summary.selectorRepaired).toBe(0);
+    });
+
+    test("declared mode is untouched: no repair, no counter, no confidence cap", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+
+      const { summary, logs } = run(
+        database,
+        store,
+        { stint: "S1", matchedStint: "Q1", matchedQuest: "A1" },
+        window,
+        { mode: "declared" },
+      );
+
+      expect(summary.selectorRepaired).toBe(0);
+      expect(logs.filter((line) => line.includes("repaired"))).toEqual([]);
+      expect(tracesOn(database, "A1")).toBe(2);
+      const confidence = database.query("SELECT confidence FROM traces WHERE id != 'T0'").get() as {
+        confidence: number;
+      };
+      expect(confidence.confidence).toBe(0.9);
     });
   });
 

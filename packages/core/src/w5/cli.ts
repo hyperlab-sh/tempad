@@ -725,6 +725,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
   context.stdout(`guess_defaulted=${metrics.guessDefaulted}`);
   context.stdout(`session_note_truncated=${metrics.sessionNoteTruncated}`);
   context.stdout(`selector_ambiguous=${metrics.selectorAmbiguous}`);
+  context.stdout(`selector_repaired=${metrics.selectorRepaired}`);
   context.stdout(`sessions_declared=${metrics.sessionsDeclared}`);
   context.stdout(`sessions_inferred=${metrics.sessionsInferred}`);
   context.stdout(`stints_dismissed=${metrics.stintsDismissed}`);

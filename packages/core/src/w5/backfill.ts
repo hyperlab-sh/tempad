@@ -53,6 +53,7 @@ export interface BackfillResult {
   guessDefaulted: number;
   sessionNoteTruncated: number;
   selectorAmbiguous: number;
+  selectorRepaired: number;
   /** Sessions classified this run whose `modeFor` was `"declared"`. */
   sessionsDeclared: number;
   /** Sessions classified this run whose `modeFor` was `"inferred"`. */
@@ -255,6 +256,7 @@ export async function backfill(
   let guessDefaulted = 0;
   let sessionNoteTruncated = 0;
   let selectorAmbiguous = 0;
+  let selectorRepaired = 0;
   const windowMinutes = backfillWindowMinutes(intentConfig);
 
   // Windows are classified in chronological order *across* sessions, not
@@ -390,6 +392,7 @@ export async function backfill(
       guessDefaulted += result.guessDefaulted ?? 0;
       sessionNoteTruncated += result.sessionNoteTruncated ?? 0;
       selectorAmbiguous += result.selectorAmbiguous ?? 0;
+      selectorRepaired += applied.selectorRepaired;
       writeSessionNote(database, session.id, result.sessionNote, options.now);
       applyIncremental(
         database,
@@ -439,6 +442,7 @@ export async function backfill(
     guessDefaulted,
     sessionNoteTruncated,
     selectorAmbiguous,
+    selectorRepaired,
     sessionsDeclared,
     sessionsInferred,
   };
