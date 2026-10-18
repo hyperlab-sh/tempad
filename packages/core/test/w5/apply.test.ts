@@ -1054,7 +1054,14 @@ describe("applyResult", () => {
         database,
         store,
         { matchedStint: "A1", matchedQuest: "B1" },
-        { ...window, recentStints: [stintSlice("B1", "Q2", "2026-09-04T14:00:00.000Z")] },
+        {
+          ...window,
+          openQuests: [
+            ...(window.openQuests ?? []),
+            { id: "Q2", title: "Other", outcome: "y", lastStintAt: null },
+          ],
+          recentStints: [stintSlice("B1", "Q2", "2026-09-04T14:00:00.000Z")],
+        },
       );
 
       expect(summary.doubts).toBe(1);
@@ -1124,6 +1131,44 @@ describe("applyResult", () => {
       expect(newStints(database)).toEqual([
         { id: expect.any(String), continues: null, questId: "Q2" },
       ]);
+    });
+
+    test("a stint id in matchedQuest does not put back the quest of its abandoned quest", () => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('QD', 'hero', 'H', 'Dropped', 'x', 1, 1, 'abandoned', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run();
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES ('SD', 'QD', 'old work', '2026-09-04T10:00:00.000Z', '2026-09-04T11:00:00.000Z', 'idle', 1)",
+        )
+        .run();
+
+      // QD is not an open quest in the window, so SD standing for it must not revive it.
+      run(
+        database,
+        store,
+        {
+          matchedStint: null,
+          matchedQuest: "SD",
+          newStintReason: "a comparison unrelated to the walk order work",
+        },
+        { ...window, recentStints: [stintSlice("SD", "QD", "2026-09-04T11:00:00.000Z")] },
+      );
+
+      expect(
+        (
+          database
+            .query("SELECT quest_id as questId FROM stints WHERE id NOT IN ('A1', 'SD')")
+            .all() as {
+            questId: string | null;
+          }[]
+        ).map((row) => row.questId),
+      ).toEqual([null]);
     });
 
     test("an id that is neither a stint nor a quest stays unknown", () => {

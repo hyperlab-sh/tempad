@@ -236,7 +236,12 @@ function reuseStint(
   };
 }
 
-/** A repaired segment is a guess about what the model meant, so it is reported as less sure. */
+/**
+ * A repaired segment is a guess about what the model meant, so its confidence is
+ * capped. The cap is bookkeeping, not a signal: the low-confidence list in
+ * reports uses `< 0.5`, so a capped segment never appears in it, and nothing else
+ * reads `confidence`. `selectorRepaired` is the signal that repairs happened.
+ */
 const REPAIRED_CONFIDENCE_CAP = 0.5;
 
 /**
@@ -255,9 +260,10 @@ const REPAIRED_CONFIDENCE_CAP = 0.5;
  * unknown.
  *
  * - A quest named in `matchedStint`/`continuesStint` is read as "this quest's
- *   work continues": the session's open stint of that quest is reused, else its
- *   most recent closed one in `recentStints` is continued, else a new stint is
- *   opened. The quest becomes `matchedQuest` when none was given. When
+ *   work continues": the session's open stint of that quest is reused, else
+ *   the most recent closed stint of that quest in `recentStints` (the project's,
+ *   so possibly another session's: the prompt offers those to resume too) is
+ *   continued, else a new stint is opened. The quest becomes `matchedQuest` when none was given. When
  *   `matchedQuest` names a *different* quest the segment keeps that one and the
  *   stint slot is dropped, so a new stint never links across quests.
  * - A stint named in `matchedQuest` stands for that stint's quest, so the normal
@@ -296,7 +302,10 @@ function normalizeInferredSelectors(
       else continuesStint = named;
       newStintReason = null;
     }
-    matchedQuest = stintQuest(named) ?? null;
+    // The stint's quest stands in only while it is an open candidate: a closed
+    // stint of an abandoned or merged quest must not put that quest back.
+    const namedQuestId = stintQuest(named) ?? null;
+    matchedQuest = namedQuestId !== null && openQuestIds.has(namedQuestId) ? namedQuestId : null;
     repairs.push(`matchedQuest named stint ${named}`);
   }
 
