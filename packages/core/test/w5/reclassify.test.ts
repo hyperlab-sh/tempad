@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config/env";
@@ -1101,5 +1101,52 @@ describe("w5 backfill --reclassify, the lock and the flags", () => {
     const run = await runCli(["--reclassify", "--from", FROM, "--dry-run"], { lock: true });
     expect(run.code).toBe(0);
     expect(run.lockLeft).toBe(true);
+  });
+
+  test("it refreshes the runner lock before every window, so a run past the 6 h ceiling keeps it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-reclassify-touch-"));
+    try {
+      const lockPath = join(dir, "w5.lock");
+      const agesPath = join(dir, "ages.txt");
+      // A stand-in `claude`: records how old the lock looks when a window is classified,
+      // answers with an empty (valid) result, then makes the lock look 7 hours untouched,
+      // as it would be after a long window.
+      const script = join(dir, "fake-claude");
+      writeFileSync(
+        script,
+        `#!/usr/bin/env bun
+import { appendFileSync, statSync, utimesSync } from "node:fs";
+const lock = ${JSON.stringify(lockPath)};
+appendFileSync(${JSON.stringify(agesPath)}, String((Date.now() - statSync(lock).mtimeMs) / 3_600_000) + "\\n");
+const old = new Date(Date.now() - 7 * 3_600_000);
+utimesSync(lock, old, old);
+console.log(JSON.stringify({ result: JSON.stringify({ segments: [], sessionNote: null }) }));
+`,
+      );
+      chmodSync(script, 0o755);
+      const database = openDatabase(":memory:");
+      seedWorld(database, new EventStore(database));
+      const intentConfig = defaultIntentConfig();
+      intentConfig.w5.claudeCommand = script;
+
+      const code = await runW5Command(
+        ["backfill", "--reclassify", "--from", FROM, "--backup", join(dir, "before.db")],
+        {
+          database,
+          config: makeConfig(dir),
+          intentConfig,
+          stdout: () => {},
+          spawn: () => {},
+        },
+      );
+
+      expect(code).toBe(0);
+      const ages = readFileSync(agesPath, "utf8").trim().split("\n").map(Number);
+      // Two windows (the two reclassified sessions), each seeing a freshly touched lock.
+      expect(ages.length).toBe(2);
+      for (const age of ages) expect(age).toBeLessThan(0.1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

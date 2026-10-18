@@ -761,7 +761,7 @@ async function runReclassify(
     return 1;
   }
   try {
-    return await runReclassifyLocked(context, classifier, input);
+    return await runReclassifyLocked(context, classifier, input, () => touchLock(lockPath));
   } finally {
     releaseLock(lockPath);
   }
@@ -771,6 +771,7 @@ async function runReclassifyLocked(
   context: W5Context,
   classifier: Classifier,
   input: { from: string; to?: string; backup: string },
+  refreshLock: () => void,
 ): Promise<number> {
   const range = reclassifyRange(context, input);
   try {
@@ -784,6 +785,9 @@ async function runReclassifyLocked(
     throw error;
   }
   context.stdout(`reclassify: backup written to ${input.backup}`);
+  context.stdout(
+    "reclassify: holding the w5 runner lock until it ends; live sessions are not classified meanwhile (their jobs stay queued and run afterwards)",
+  );
 
   const result = await reclassify(
     context.database,
@@ -792,6 +796,7 @@ async function runReclassifyLocked(
     classifier,
     {
       ...range,
+      beforeWindow: refreshLock,
       log: (line) => {
         log(context.config, line);
         context.stdout(line);

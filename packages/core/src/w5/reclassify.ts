@@ -197,6 +197,8 @@ export function planReclassify(database: Database, range: ReclassifyRange): Recl
 }
 
 export interface ReclassifyOptions extends ReclassifyRange {
+  /** Called before every window; the CLI refreshes the runner lock here. */
+  beforeWindow?: () => void;
   log: (line: string) => void;
 }
 
@@ -241,6 +243,7 @@ export async function reclassify(
     ...(options.to !== undefined ? { to: options.to } : {}),
     ...(options.hostSlug !== undefined ? { hostSlug: options.hostSlug } : {}),
     sessionIds: new Set(plan.sessions.map((session) => session.id)),
+    ...(options.beforeWindow !== undefined ? { beforeWindow: options.beforeWindow } : {}),
   });
   return { plan, reset, backfill: result };
 }

@@ -154,7 +154,7 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
   },
   {
     paths: ["w5 backfill"],
-    text: "tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)\ntempad w5 backfill --reclassify --from <iso> [--to <iso>] [--backup <path> | --dry-run] [--model <name>]   (retract what w5 inferred for those sessions, then classify them again)",
+    text: "tempad w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]   (--from: classify sessions that ended at or after that time)\ntempad w5 backfill --reclassify --from <iso> [--to <iso>] [--backup <path> | --dry-run] [--model <name>]   (retract what w5 inferred for those sessions, then classify them again; live sessions are not classified until it ends)",
   },
   { paths: ["w5 dedupe"], text: "tempad w5 dedupe [--dry-run]" },
   {
