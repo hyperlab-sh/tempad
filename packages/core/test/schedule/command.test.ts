@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,14 +13,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { LAUNCHD_LABEL } from "../../src/schedule/definitions";
 import {
   type CommandResult,
   type CommandRunner,
   probeSchedule,
+  readBunPin,
   resolveInvokedEntry,
   resolveRuntime,
+  runCommand,
   runScheduleCommand,
   type ScheduleContext,
   schedulePaths,
@@ -505,7 +508,10 @@ describe("status on macOS", () => {
 
     const scripted = runner({ "launchctl print": { stdout: LAUNCHD_PRINT } });
     const result = schedule(box, "darwin", ["status", "--json"], scripted);
-    expect(scripted.calls).toEqual([`launchctl print gui/501/${LAUNCHD_LABEL}`]);
+    expect(scripted.calls).toEqual([
+      `${box.runtime} --version`,
+      `launchctl print gui/501/${LAUNCHD_LABEL}`,
+    ]);
     expect(result.code).toBe(0);
     expect(JSON.parse(result.out.join("\n"))).toEqual({
       manager: "launchd",
@@ -520,6 +526,8 @@ describe("status on macOS", () => {
       intervalSeconds: 3600,
       definition: [plistPath(box)],
       command: [box.runtime, "--no-env-file", box.script, "sync"],
+      bunVersion: null,
+      bunPinned: null,
       logPath: log,
       problems: [],
     });
@@ -794,6 +802,7 @@ describe("resolveInvokedEntry", () => {
     expect(entry).toEqual({
       runtime: box.runtime,
       script: join(statRealpath(box.script)),
+      bunPin: null,
       warnings: [],
     });
   });
@@ -1065,5 +1074,371 @@ describe("install warnings and TEMPAD_HOME", () => {
     } finally {
       rmSync(absolute, { recursive: true, force: true });
     }
+  });
+});
+
+describe("the Bun version a scheduled job runs", () => {
+  /** Writes a `.prototools` with the given body. */
+  function prototools(directory: string, body: string): string {
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, ".prototools");
+    writeFileSync(path, body);
+    return path;
+  }
+
+  describe("readBunPin", () => {
+    test("reads bun from the nearest .prototools above the script, not a hardcoded version", () => {
+      const box = sandbox();
+      const source = prototools(join(box.root, "checkout"), 'bun = "1.7.3"\ngo = "1.26.6"\n');
+      expect(readBunPin(box.script)).toEqual({ version: "1.7.3", source });
+    });
+
+    test("a nearer file with a pin overrides one further up; one without a bun key lets the search continue", () => {
+      const box = sandbox();
+      prototools(box.root, 'bun = "1.0.0"\n');
+      expect(readBunPin(box.script)?.version).toBe("1.0.0");
+      const nearer = prototools(join(box.root, "checkout"), 'go = "1.26.6"\n');
+      expect(readBunPin(box.script)?.version).toBe("1.0.0");
+      writeFileSync(nearer, 'bun = "1.2.3"\n');
+      expect(readBunPin(box.script)?.version).toBe("1.2.3");
+    });
+
+    test("no .prototools, a malformed one, and a non-string bun pin nothing", () => {
+      const box = sandbox();
+      expect(readBunPin(box.script)).toBeNull();
+      const file = prototools(join(box.root, "checkout"), "bun = = 1");
+      expect(readBunPin(box.script)).toBeNull();
+      writeFileSync(file, "bun = 1\n");
+      expect(readBunPin(box.script)).toBeNull();
+      writeFileSync(file, 'bun = " "\n');
+      expect(readBunPin(box.script)).toBeNull();
+    });
+
+    test("the pin passes through as written, so a range or alias reaches proto unchanged", () => {
+      const box = sandbox();
+      prototools(join(box.root, "checkout"), 'bun = "1.4"\n');
+      expect(readBunPin(box.script)?.version).toBe("1.4");
+    });
+  });
+
+  describe("resolveInvokedEntry reads the pin only for the proto shim", () => {
+    function shimBox(pin: string | null, installed: string[] = []) {
+      const box = sandbox();
+      const shims = join(box.home, ".proto", "shims");
+      mkdirSync(shims, { recursive: true });
+      writeFileSync(join(shims, "bun"), "");
+      for (const version of installed) {
+        mkdirSync(join(box.home, ".proto", "tools", "bun", version), { recursive: true });
+      }
+      const source =
+        pin === null ? null : prototools(join(box.root, "checkout"), `bun = "${pin}"\n`);
+      const environment = { HOME: box.home, PATH: shims };
+      return { box, shim: join(shims, "bun"), source, environment };
+    }
+
+    test("a shim runtime with a pinned checkout carries the pin", () => {
+      const { box, shim, source, environment } = shimBox("1.4.2", ["1.4.2"]);
+      const entry = resolveInvokedEntry(["bun", box.script], "/x/bun", () => false, environment);
+      expect(entry).toEqual({
+        runtime: shim,
+        script: realpathSync(box.script),
+        // the entry is resolved through symlinks first (macOS's /var is /private/var), and so is the pin's file
+        bunPin: {
+          version: "1.4.2",
+          source: join(realpathSync(dirname(source as string)), ".prototools"),
+        },
+        warnings: [],
+      });
+    });
+
+    test("a pinned version proto has not installed is a warning naming the fix, install still goes ahead", () => {
+      const { box, environment } = shimBox("1.4.2", ["1.3.14"]);
+      const entry = resolveInvokedEntry(["bun", box.script], "/x/bun", () => false, environment);
+      expect(entry.bunPin?.version).toBe("1.4.2");
+      expect(entry.warnings).toHaveLength(1);
+      expect(entry.warnings?.[0]).toContain("pins Bun 1.4.2, which proto has not installed");
+      expect(entry.warnings?.[0]).toContain("proto install bun 1.4.2");
+    });
+
+    test("a range or alias is not checked against the installed directories", () => {
+      const { box, environment } = shimBox("1.4", []);
+      const entry = resolveInvokedEntry(["bun", box.script], "/x/bun", () => false, environment);
+      expect(entry.bunPin?.version).toBe("1.4");
+      expect(entry.warnings).toEqual([]);
+    });
+
+    test("a shim with no pin above the script carries none: proto's default stays in charge", () => {
+      const { box, environment } = shimBox(null);
+      const entry = resolveInvokedEntry(["bun", box.script], "/x/bun", () => false, environment);
+      expect(entry.bunPin).toBeNull();
+    });
+
+    test("PROTO_HOME relocates both the shim and the installed-version check", () => {
+      const box = sandbox();
+      const protoHome = join(box.root, "elsewhere");
+      const tools = join(protoHome, "tools", "bun", "1.4.2");
+      mkdirSync(join(protoHome, "shims"), { recursive: true });
+      writeFileSync(join(protoHome, "shims", "bun"), "");
+      mkdirSync(tools, { recursive: true });
+      writeFileSync(join(tools, "bun"), "");
+      prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+      // Run by the versioned binary, as under the shim: resolveRuntime falls back to $PROTO_HOME/shims/bun.
+      const entry = resolveInvokedEntry(["bun", box.script], join(tools, "bun"), () => false, {
+        HOME: box.home,
+        PROTO_HOME: protoHome,
+        PATH: tools,
+      });
+      expect(entry.runtime).toBe(join(protoHome, "shims", "bun"));
+      expect(entry.bunPin?.version).toBe("1.4.2");
+      expect(entry.warnings).toEqual([]);
+    });
+
+    test("a runtime that is not the shim ignores the pin: PROTO_BUN_VERSION would do nothing for it", () => {
+      const box = sandbox();
+      prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+      const entry = resolveInvokedEntry(
+        ["bun", box.script],
+        box.runtime,
+        () => false,
+        noBunOnPath(box),
+      );
+      expect(entry.runtime).toBe(box.runtime);
+      expect(entry.bunPin).toBeNull();
+    });
+  });
+
+  describe("install carries the pin into the definition", () => {
+    const pin = { version: "1.4.2", source: "/work/tempad/.prototools" };
+
+    test("macOS: PROTO_BUN_VERSION is in the plist's environment and install says where it came from", () => {
+      const box = sandbox();
+      const result = schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      expect(result.code).toBe(0);
+      const plist = readFileSync(plistPath(box), "utf8");
+      expect(plist).toContain("<key>PROTO_BUN_VERSION</key>\n    <string>1.4.2</string>");
+      expect(result.out.join("\n")).toContain(
+        "bun: 1.4.2, pinned in /work/tempad/.prototools and carried as PROTO_BUN_VERSION",
+      );
+    });
+
+    test("Linux: PROTO_BUN_VERSION is an Environment= line of the service", () => {
+      const box = sandbox();
+      schedule(box, "linux", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      const service = readFileSync(join(unitDirectory(box), "tempad-sync.service"), "utf8");
+      expect(service).toContain('Environment="PROTO_BUN_VERSION=1.4.2"');
+    });
+
+    test("without a pin nothing about proto is written", () => {
+      const box = sandbox();
+      const result = schedule(box, "darwin", ["install"], runner());
+      expect(readFileSync(plistPath(box), "utf8")).not.toContain("PROTO_BUN_VERSION");
+      expect(result.out.join("\n")).not.toContain("PROTO_BUN_VERSION");
+      schedule(box, "linux", ["install"], runner());
+      expect(readFileSync(join(unitDirectory(box), "tempad-sync.service"), "utf8")).not.toContain(
+        "PROTO_BUN_VERSION",
+      );
+    });
+
+    test("reinstalling after the pin moved replaces the old version", () => {
+      const box = sandbox();
+      const first = { version: "1.3.14", source: "/a/.prototools" };
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: first }),
+      });
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      const plist = readFileSync(plistPath(box), "utf8");
+      expect(plist).toContain("<string>1.4.2</string>");
+      expect(plist).not.toContain("1.3.14");
+    });
+  });
+
+  describe("status shows the version the job will use", () => {
+    const pin = { version: "1.4.2", source: "/work/tempad/.prototools" };
+
+    /** Records the options each command ran with; answers `--version` calls from `bun`. */
+    function recording(
+      bun: Partial<CommandResult>,
+      answers: Record<string, Partial<CommandResult>> = {},
+    ) {
+      const options: { command: string; env?: NodeJS.ProcessEnv; cwd?: string }[] = [];
+      const base = runner(answers);
+      const run: CommandRunner = (command, args, option) => {
+        if (args[0] === "--version") {
+          options.push({ command, env: option?.env, cwd: option?.cwd });
+          return { status: 0, stdout: "", stderr: "", ...bun };
+        }
+        return base.run(command, args, option);
+      };
+      return { run, options };
+    }
+
+    test("asks the job's runtime for --version with the job's environment and working directory, and never lets proto install", () => {
+      const box = sandbox({ explicitHome: true });
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      const asked = recording(
+        { stdout: "1.4.2\n" },
+        { "launchctl print": { stdout: LAUNCHD_PRINT } },
+      );
+      const result = schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run });
+      expect(result.code).toBe(0);
+      expect(asked.options).toHaveLength(1);
+      const [call] = asked.options;
+      expect(call?.command).toBe(box.runtime);
+      expect(call?.cwd).toBe(box.tempadHome);
+      expect(call?.env).toMatchObject({
+        HOME: box.home,
+        TEMPAD_HOME: box.tempadHome,
+        PROTO_BUN_VERSION: "1.4.2",
+        PROTO_AUTO_INSTALL: "false",
+      });
+      expect(call?.env?.PATH).toBe(readPath(readFileSync(plistPath(box), "utf8")));
+      expect(JSON.parse(result.out.join("\n"))).toMatchObject({
+        bunVersion: "1.4.2",
+        bunPinned: "1.4.2",
+      });
+    });
+
+    function readPath(plist: string): string | undefined {
+      return /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(plist)?.[1];
+    }
+
+    test("plain output: pinned, unpinned proto shim, and a plain binary", () => {
+      const box = sandbox();
+      const shims = join(box.home, ".proto", "shims");
+      mkdirSync(shims, { recursive: true });
+      const shim = join(shims, "bun");
+      writeFileSync(shim, "");
+
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: shim, script: box.script, bunPin: pin }),
+      });
+      const printed = { "launchctl print": { stdout: LAUNCHD_PRINT } };
+      const pinned = schedule(box, "darwin", ["status"], {
+        calls: [],
+        run: recording({ stdout: "1.4.2\n" }, printed).run,
+      });
+      expect(pinned.out.join("\n")).toContain("bun: 1.4.2 (pinned by PROTO_BUN_VERSION=1.4.2)");
+
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: shim, script: box.script }),
+      });
+      const unpinned = schedule(box, "darwin", ["status"], {
+        calls: [],
+        run: recording({ stdout: "1.3.14\n" }, printed).run,
+      });
+      expect(unpinned.out.join("\n")).toContain(
+        "bun: 1.3.14 (proto shim, no pin: proto's default decides)",
+      );
+
+      schedule(box, "darwin", ["install"], runner());
+      const plain = schedule(box, "darwin", ["status"], {
+        calls: [],
+        run: recording({ stdout: "1.4.2\n" }, printed).run,
+      });
+      expect(plain.out.join("\n")).toContain("bun: 1.4.2\n");
+    });
+
+    test("Linux reads the pin back from the service's Environment= lines", () => {
+      const box = sandbox();
+      schedule(box, "linux", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      const asked = recording(
+        { stdout: "1.4.2\n" },
+        {
+          "systemctl --user show tempad-sync.timer": {
+            stdout: "ActiveState=active\nSubState=waiting\n",
+          },
+        },
+      );
+      const result = schedule(box, "linux", ["status", "--json"], { calls: [], run: asked.run });
+      expect(asked.options[0]?.env).toMatchObject({ PROTO_BUN_VERSION: "1.4.2" });
+      expect(JSON.parse(result.out.join("\n"))).toMatchObject({
+        bunVersion: "1.4.2",
+        bunPinned: "1.4.2",
+      });
+    });
+
+    test("a pinned Bun proto cannot start is a problem with proto's own message, and exits 1", () => {
+      const box = sandbox();
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: box.runtime, script: box.script, bunPin: pin }),
+      });
+      const failing = recording(
+        {
+          status: 1,
+          stderr:
+            '{"type":"error","code":"proto::commands::run::missing_tool","message":"This project requires Bun 1.4.2, but this version has not been installed."}\n',
+        },
+        { "launchctl print": { stdout: LAUNCHD_PRINT } },
+      );
+      const result = schedule(box, "darwin", ["status"], { calls: [], run: failing.run });
+      expect(result.code).toBe(1);
+      const text = result.out.join("\n");
+      expect(text).toContain("problem: the job's Bun");
+      expect(text).toContain("does not start (exit 1: This project requires Bun 1.4.2");
+      expect(text).toContain("it is pinned to 1.4.2");
+      expect(text).toContain("bun: pinned to 1.4.2 (PROTO_BUN_VERSION)");
+    });
+
+    test("a runtime that no longer exists is not run, and the missing file is the one problem", () => {
+      const box = sandbox();
+      schedule(box, "darwin", ["install"], runner());
+      rmSync(box.runtime);
+      const asked = recording(
+        { stdout: "1.4.2\n" },
+        { "launchctl print": { stdout: LAUNCHD_PRINT } },
+      );
+      const result = schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run });
+      expect(asked.options).toEqual([]);
+      const parsed = JSON.parse(result.out.join("\n"));
+      expect(parsed.bunVersion).toBeNull();
+      expect(parsed.problems).toHaveLength(1);
+      expect(parsed.problems[0]).toContain("is missing");
+    });
+
+    test("not installed: nothing is run", () => {
+      const box = sandbox();
+      const asked = recording({ stdout: "1.4.2\n" });
+      schedule(box, "darwin", ["status"], { calls: [], run: asked.run });
+      expect(asked.options).toEqual([]);
+    });
+
+    test("end to end with a real child process: the shim sees the pin, the job's directory and no auto-install", () => {
+      const box = sandbox({ explicitHome: true });
+      const shims = join(box.home, ".proto", "shims");
+      mkdirSync(shims, { recursive: true });
+      const shim = join(shims, "bun");
+      // Stands in for proto's shim: reports the environment and directory it was started in.
+      writeFileSync(shim, '#!/bin/sh\necho "$PROTO_BUN_VERSION $PROTO_AUTO_INSTALL $(pwd -P)"\n');
+      chmodSync(shim, 0o755);
+      schedule(box, "darwin", ["install"], runner(), {
+        resolveEntry: () => ({ runtime: shim, script: box.script, bunPin: pin }),
+      });
+      const printed = runner({ "launchctl print": { stdout: LAUNCHD_PRINT } });
+      const result = schedule(
+        box,
+        "darwin",
+        ["status", "--json"],
+        { calls: [], run: printed.run },
+        {
+          run: (command, args, options) =>
+            command === "launchctl"
+              ? printed.run(command, args, options)
+              : runCommand(command, args, options),
+        },
+      );
+      expect(JSON.parse(result.out.join("\n")).bunVersion).toBe(
+        `1.4.2 false ${realpathSync(box.tempadHome)}`,
+      );
+    });
   });
 });
