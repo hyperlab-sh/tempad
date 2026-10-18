@@ -39,13 +39,6 @@ export interface ResetPlan {
 
 export interface ResetOptions {
   reason: string;
-  /**
-   * Whether to delete the `w5_windows` rows of the touched sessions. `w5_windows`
-   * is a projection of `window.classified` events, so a delete is not an event:
-   * a `tempad rebuild` (or `scry`'s projection check) replays the deleted rows
-   * back. Only a throwaway copy may do it, which is what `w5 eval` runs on.
-   */
-  clearWindowCoverage: boolean;
 }
 
 /** Questions about these traces that were never answered (a person's answer or the context's). */
@@ -131,13 +124,15 @@ export function planReset(database: Database, traces: ResetTrace[]): ResetPlan {
 /**
  * Appends one `retracted` event per row of the plan, in one transaction (events
  * stay append-only: nothing is deleted or edited), and clears the session note
- * of every touched session (and, for a throwaway copy only, its `w5_windows`
- * coverage: see `clearWindowCoverage`).
+ * of every touched session and deletes its `w5_windows` rows. That delete is not
+ * an event: `w5_windows` is a projection of `window.classified` events, so a
+ * `tempad rebuild` (or `scry`'s projection check) would replay the rows back.
+ * Only a throwaway copy may be reset, which is what `w5 eval` runs on.
  */
 export function applyReset(
   database: Database,
   plan: ResetPlan,
-  options: Pick<ResetOptions, "reason" | "clearWindowCoverage">,
+  options: ResetOptions,
 ): ResetResult {
   const store = new EventStore(database);
   const retract = (subject: string) =>
@@ -181,9 +176,7 @@ export function applyReset(
     }
     for (const sessionId of plan.sessionIds) {
       database.query("UPDATE w5_runs SET session_note = NULL WHERE session_id = ?").run(sessionId);
-      if (options.clearWindowCoverage) {
-        database.query("DELETE FROM w5_windows WHERE session_id = ?").run(sessionId);
-      }
+      database.query("DELETE FROM w5_windows WHERE session_id = ?").run(sessionId);
     }
   })();
 

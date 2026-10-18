@@ -298,10 +298,7 @@ function resetRange(database: Database, from: string, to: string): EvalResetResu
        WHERE retracted_at IS NULL AND started_at >= ? AND started_at < ?`,
     )
     .all(from, to) as ResetTrace[];
-  return applyReset(database, planReset(database, traces), {
-    reason: RESET_REASON,
-    clearWindowCoverage: true,
-  });
+  return applyReset(database, planReset(database, traces), { reason: RESET_REASON });
 }
 
 function median(values: number[]): number {

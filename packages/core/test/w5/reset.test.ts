@@ -196,17 +196,46 @@ const liveIds = (database: TestDatabase, table: "traces" | "stints" | "quests") 
     }[]
   ).map((row) => row.id);
 
-/** Retracts the live traces of `sessionId` through the shared cascade, as `w5 eval`'s reset does for a range. */
+/** Retracts the live traces of `sessionId` through the shared cascade (`w5 eval` selects by date range instead). */
 function resetSession(database: TestDatabase, sessionId = "s-inferred") {
   const traces = database
     .query(
       "SELECT id, stint_id, session_id FROM traces WHERE retracted_at IS NULL AND session_id = ?",
     )
     .all(sessionId) as { id: string; stint_id: string; session_id: string | null }[];
-  return applyReset(database, planReset(database, traces), {
-    reason: RESET_REASON,
-    clearWindowCoverage: false,
-  });
+  return applyReset(database, planReset(database, traces), { reason: RESET_REASON });
+}
+
+/** One more live trace on an existing stint, recorded in `sessionId`. */
+function seedTrace(
+  database: TestDatabase,
+  store: EventStore,
+  input: { id: string; stintId: string; sessionId: string; at: string },
+) {
+  applyIncremental(
+    database,
+    store.append({
+      actor: "backfill",
+      kind: "trace.recorded",
+      subject: input.id,
+      sessionId: input.sessionId,
+      payload: {
+        stint: input.stintId,
+        tool: "claude-code",
+        place: "personal/p",
+        source: "session",
+        started_at: input.at,
+        ended_at: input.at,
+        who: "hero",
+        what: "w",
+        why: "w",
+        where: "personal/p",
+        how: "claude-code",
+        confidence: 0.9,
+        classified_by: "assistant",
+      },
+    }),
+  );
 }
 
 describe("questions about retracted traces", () => {
@@ -416,7 +445,7 @@ describe("applyReset", () => {
       { id: "T-s-inferred", stint_id: "A-s-inferred", session_id: "s-inferred" },
     ]);
 
-    applyReset(database, plan, { reason: RESET_REASON, clearWindowCoverage: false });
+    applyReset(database, plan, { reason: RESET_REASON });
 
     expect(
       database.query("SELECT session_id, session_note FROM w5_runs ORDER BY session_id").all(),
@@ -424,5 +453,103 @@ describe("applyReset", () => {
       { session_id: "s-inferred", session_note: null },
       { session_id: "s-other", session_note: "a note" },
     ]);
+    // The throwaway copy loses the coverage of the touched session only.
+    expect(
+      database.query("SELECT DISTINCT session_id FROM w5_windows ORDER BY session_id").all(),
+    ).toEqual([{ session_id: "s-other" }]);
+  });
+});
+
+describe("the cascade", () => {
+  function seedBase() {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    return { database, store };
+  }
+
+  test("a stint with a live trace outside the selection stays, and so does its quest", () => {
+    const { database, store } = seedBase();
+    seedInferred(database, store, "s-inferred");
+    // Another session's live trace sits on the same stint.
+    seedSession(database, "s-other", "2026-09-04T16:00:00.000Z");
+    seedTrace(database, store, {
+      id: "T-shared",
+      stintId: "A-s-inferred",
+      sessionId: "s-other",
+      at: "2026-09-04T16:00:00.000Z",
+    });
+
+    const result = resetSession(database);
+
+    expect(result).toMatchObject({ traces: 1, stints: 0, quests: 0 });
+    expect(liveIds(database, "traces")).toEqual(["T-shared"]);
+    expect(liveIds(database, "stints")).toEqual(["A-s-inferred"]);
+    expect(liveIds(database, "quests")).toEqual(["Q-s-inferred"]);
+  });
+
+  test("a confirmed quest left with no live stint is kept, an unconfirmed one is retracted", () => {
+    const { database, store } = seedBase();
+    seedInferred(database, store, "s-confirmed", { confirmedQuest: true });
+    seedInferred(database, store, "s-unconfirmed");
+
+    const plan = planReset(
+      database,
+      database
+        .query("SELECT id, stint_id, session_id FROM traces WHERE retracted_at IS NULL")
+        .all() as { id: string; stint_id: string; session_id: string | null }[],
+    );
+    const result = applyReset(database, plan, { reason: RESET_REASON });
+
+    expect(plan.stintIds.sort()).toEqual(["A-s-confirmed", "A-s-unconfirmed"]);
+    expect(plan.questIds).toEqual(["Q-s-unconfirmed"]);
+    expect(result).toMatchObject({ traces: 2, stints: 2, quests: 1 });
+    expect(liveIds(database, "quests")).toEqual(["Q-s-confirmed"]);
+  });
+
+  test("resetting again retracts the previous run's rows and never retracts a row twice", () => {
+    const { database, store } = seedBase();
+    seedInferred(database, store, "s-inferred");
+
+    expect(resetSession(database)).toMatchObject({ traces: 1, stints: 1, quests: 1 });
+    // A re-run of the session records a new cohort under the same session.
+    append(database, store, "hook", "quest.created", "Q-rerun", {
+      owner: { kind: "hero", id: "H1" },
+      title: "rerun quest",
+      outcome: "o",
+      commitment: "focused",
+      confirmed: false,
+    });
+    append(database, store, "hook", "stint.opened", "A-rerun", {
+      outcome: "redone work",
+      quest: "Q-rerun",
+    });
+    seedTrace(database, store, {
+      id: "T-rerun",
+      stintId: "A-rerun",
+      sessionId: "s-inferred",
+      at: "2026-09-04T15:30:00.000Z",
+    });
+    const events = () =>
+      (database.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+
+    expect(resetSession(database)).toMatchObject({ traces: 1, stints: 1, quests: 1 });
+    const afterSecond = events();
+    // Nothing is live any more, so a third reset has nothing to retract and writes nothing.
+    expect(resetSession(database)).toEqual({
+      traces: 0,
+      stints: 0,
+      quests: 0,
+      questions: 0,
+      continuations: 0,
+    });
+    expect(events()).toBe(afterSecond);
+    expect(counts(database)).toMatchObject({ traces: 0, stints: 0, quests: 0 });
+    const retractions = database
+      .query("SELECT subject, COUNT(*) AS n FROM events WHERE kind = 'retracted' GROUP BY subject")
+      .all() as { subject: string; n: number }[];
+    expect(retractions.every((row) => row.n === 1)).toBe(true);
+    expect(retractions).toHaveLength(6);
   });
 });
