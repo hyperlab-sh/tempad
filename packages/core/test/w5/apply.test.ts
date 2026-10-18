@@ -3722,7 +3722,193 @@ describe("applyResult in declared mode", () => {
     expect(summary.sameWindowReuse).toBe(0);
   });
 
-  test("a new: whose text matches an earlier segment's outcome ignoring punctuation reuses its stint", () => {
+  test("a null selector with a switch opens its own stint even on the same quest", () => {
+    const database = openDatabase(":memory:");
+    const { store, questId } = seedDeclared(database);
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: chase the flaky rerun",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: null,
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    // `isSwitch` is an outcome boundary even within one quest: the switch
+    // stops the same-outcome continuation, so the segment opens its own stint.
+    expect(summary.stintsOpened).toBe(2);
+    expect(summary.sameWindowReuse).toBe(0);
+    const traces = database
+      .query("SELECT stint_id as stintId FROM traces WHERE stint_id != 'A1'")
+      .all() as { stintId: string }[];
+    expect(new Set(traces.map((trace) => trace.stintId)).size).toBe(2);
+    const quests = database
+      .query("SELECT quest_id as questId FROM stints WHERE id != 'A1' ORDER BY opened_at ASC")
+      .all() as { questId: string | null }[];
+    expect(quests.map((stint) => stint.questId)).toEqual([questId, questId]);
+  });
+
+  test("a null selector naming a different quest opens its own stint even without a switch", () => {
+    const database = openDatabase(":memory:");
+    const { store, heroId, questId } = seedDeclared(database);
+    database
+      .query(
+        `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+         VALUES ('Q2', 'hero', ?, 'Fix the flake', 'green suite', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+      )
+      .run(heroId);
+    declareQuest(store, database, {
+      sessionId: "s1",
+      questId: "Q2",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T13:30:00.000Z",
+      heroId,
+    });
+
+    const summary = applyResult(
+      store,
+      database,
+      {
+        ...declaredWindow,
+        activeQuests: [
+          { alias: "Q1", title: "Ship marko-ui", outcome: "86 components", plan: [] },
+          { alias: "Q2", title: "Fix the flake", outcome: "green suite", plan: [] },
+        ],
+        activeQuestAliases: { Q1: questId, Q2: "Q2" },
+      },
+      {
+        segments: [
+          segment({ quest: "Q1", stint: "new: chase the walk order bug" }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            quest: "Q2",
+            stint: null,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    // The quest changed, so the unchanged-quest gate stops the continuation.
+    expect(summary.stintsOpened).toBe(2);
+    expect(summary.sameWindowReuse).toBe(0);
+    const opened = database
+      .query("SELECT quest_id as questId FROM stints WHERE id != 'A1' ORDER BY opened_at ASC")
+      .all() as { questId: string | null }[];
+    expect(opened.map((stint) => stint.questId)).toEqual([questId, "Q2"]);
+  });
+
+  test("punctuation runs and path-like outcomes never fold, keeping quests apart", () => {
+    const database = openDatabase(":memory:");
+    const { store, heroId, questId } = seedDeclared(database);
+    database
+      .query(
+        `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+         VALUES ('Q2', 'hero', ?, 'Fix the flake', 'green suite', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+      )
+      .run(heroId);
+    declareQuest(store, database, {
+      sessionId: "s1",
+      questId: "Q2",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T13:30:00.000Z",
+      heroId,
+    });
+
+    const twoQuestWindow: ClassifierWindow = {
+      ...declaredWindow,
+      activeQuests: [
+        { alias: "Q1", title: "Ship marko-ui", outcome: "86 components", plan: [] },
+        { alias: "Q2", title: "Fix the flake", outcome: "green suite", plan: [] },
+      ],
+      activeQuestAliases: { Q1: questId, Q2: "Q2" },
+    };
+
+    // `Resolve path .` and `Resolve path ..` are different technical tokens:
+    // a run of dots is not sentence punctuation, so the Q2 segment keeps its
+    // own stint (and quest) instead of folding onto Q1's (r1 review).
+    const runSummary = applyResult(
+      store,
+      database,
+      twoQuestWindow,
+      {
+        segments: [
+          segment({ quest: "Q1", stint: "new: Resolve path ." }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            quest: "Q2",
+            stint: "new: Resolve path ..",
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    expect(runSummary.stintsOpened).toBe(2);
+    expect(runSummary.sameWindowReuse).toBe(0);
+    const runOpened = database
+      .query(
+        "SELECT quest_id as questId, outcome FROM stints WHERE id != 'A1' ORDER BY opened_at ASC",
+      )
+      .all() as { questId: string | null; outcome: string }[];
+    expect(runOpened.map((stint) => stint.questId)).toEqual([questId, "Q2"]);
+    expect(runOpened.map((stint) => stint.outcome)).toEqual(["Resolve path .", "Resolve path .."]);
+
+    // A version-like trailing dot is a path-like tail, not a sentence end.
+    const versionSummary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:30:00.000Z",
+            endedAt: "2026-09-04T15:40:00.000Z",
+            quest: "Q1",
+            stint: "new: bump the pinned version to 1.2",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:40:00.000Z",
+            endedAt: "2026-09-04T15:50:00.000Z",
+            quest: "Q1",
+            stint: "new: bump the pinned version to 1.2.",
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    expect(versionSummary.stintsOpened).toBe(2);
+    expect(versionSummary.sameWindowReuse).toBe(0);
+  });
+
+  test("a new: whose text matches an earlier segment's outcome ignoring a lone trailing mark reuses its stint", () => {
     const database = openDatabase(":memory:");
     const { store } = seedDeclared(database);
 

@@ -717,18 +717,27 @@ function resolveStintForSegment(
  * exactly as a fabricated id did before.
  */
 /**
- * Trims, collapses internal whitespace, lowercases, and drops trailing
- * punctuation for `new:` reuse matching. A model that rephrases the same
- * stint's outcome with different capitalization, spacing or a full stop
- * across windows is plausible variance, not a genuinely new outcome, so both
- * sides of the comparison go through this before being compared.
+ * Trims, collapses internal whitespace, lowercases, and folds at most one
+ * sentence-ending mark for `new:` reuse matching. A model that rephrases the
+ * same stint's outcome with different capitalization, spacing or a single
+ * trailing full stop or bang across windows is plausible variance, not a
+ * genuinely new outcome, so both sides of the comparison go through this
+ * before being compared. A *run* of marks or a path-like tail is a
+ * meaningful technical token, never sentence punctuation: `..`, `done!!`
+ * and `v1.2.` keep their punctuation, so `Resolve path .` and
+ * `Resolve path ..` stay two different outcomes.
  */
 function normalizeOutcome(outcome: string): string {
-  return outcome
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/[.,;:!?\u2026]+$/u, "")
-    .toLowerCase();
+  let text = outcome.trim().replace(/\s+/g, " ");
+  if (/[.!?]$/.test(text) && !/[.!?]{2}$/.test(text)) {
+    const before = text.slice(0, -1);
+    const token = before.split(" ").pop() ?? "";
+    const pathLike = /[/.]/.test(token);
+    if (!pathLike) {
+      text = before.trimEnd();
+    }
+  }
+  return text.toLowerCase();
 }
 
 function resolveStintForSegmentDeclared(
