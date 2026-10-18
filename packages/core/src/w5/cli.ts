@@ -24,6 +24,7 @@ import { ClaudeCliClassifier } from "./classifier-cli";
 import { dedupe } from "./dedupe";
 import { InvalidDeclareFileError, InvalidEvalRangeError, runEval, validateEvalRange } from "./eval";
 import {
+  answerQuestForm,
   buildAdditionalContext,
   buildBelongsHandback,
   buildDeclarationLine,
@@ -373,7 +374,7 @@ function runReview(args: string[], context: W5Context): number {
       continue;
     }
     context.stdout(
-      `question ${question.id} expired (${question.text}) — ${usageText("answer").replace("<question-id>", question.id)}`,
+      `question ${question.id} expired (${question.text}) — ${answerQuestForm(question.id)}`,
     );
   }
 

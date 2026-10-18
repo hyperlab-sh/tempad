@@ -184,6 +184,23 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
   { paths: ["project reresolve"], text: "tempad project reresolve <path>" },
 ];
 
+/**
+ * The commands a hand-back asks an agent to run, one runnable form each: the hooks and
+ * `tempad review` print them as shown, so no form carries a flag that is invalid for the
+ * question it answers (`--belongs` is only valid on a belongs-kind question). The flags of
+ * each are a subset of the entry of the command they belong to (a test checks it).
+ */
+export const ANSWER_BELONGS_FORM = 'tempad answer <question-id> --belongs --why "<reason>"';
+export const ANSWER_QUEST_FORM =
+  'tempad answer <question-id> --quest <id>|new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]';
+export const DECLARE_QUEST_FORM =
+  'tempad quest declare --session <id> --quest <id>|--new "<title>" --outcome "<text>" --by agent';
+
+/** A hand-back form with the question's or session's id in place of its placeholder. */
+export function handbackForm(form: string, placeholder: string, value: string): string {
+  return form.replace(placeholder, value);
+}
+
 const HELP_SYNOPSIS = "tempad --help | -h | help [<command> [<subcommand> ...]] | --version";
 const HELP_FOOTER = "Run tempad help <command> for one command.";
 

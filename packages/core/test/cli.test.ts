@@ -16,11 +16,15 @@ import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
 import {
+  ANSWER_BELONGS_FORM,
+  ANSWER_QUEST_FORM,
   BOOLEAN_FLAGS,
   checkPositionals,
+  DECLARE_QUEST_FORM,
   documentedPaths,
   POSITIONAL_LIMITS,
   usageForPath,
+  usageText,
   walkPath,
 } from "../src/usage.ts";
 import { renderHookSettings } from "../src/w5/hooks.ts";
@@ -464,7 +468,13 @@ function listTree(directory: string): string[] {
     .sort();
 }
 
-/** The body of each string literal in `source` with its 1-based starting line, comments skipped. */
+/**
+ * The body of each string literal in `source` with its 1-based starting line, comments skipped.
+ * A small scanner, not the TypeScript tokenizer: it knows quotes, template interpolations and
+ * `//` and `/* *\/` comments, but not regular expression literals, so a `/` that starts a regex
+ * is read as division and a quote inside one would open a bogus literal. `src/` has no such
+ * regex today, and the guard test reading it would fail loudly rather than pass silently.
+ */
 function stringLiterals(source: string): { line: number; body: string }[] {
   const literals: { line: number; body: string }[] = [];
   let line = 1;
@@ -525,7 +535,8 @@ function stringLiterals(source: string): { line: number; body: string }[] {
  * any case, or a synopsis, `tempad <command>` anywhere in a line of the literal (after spaces,
  * words or an interpolation) followed by an option or placeholder (`[`, `<`). Comments are
  * skipped, and strings that merely name a command (`"tempad sync --forget"`, `"tempad setup: ..."`)
- * have neither.
+ * have neither. Only the commands of `COMMAND_TREE` are recognised: a synopsis for a command
+ * that is not in the table is not caught, but such a command cannot run either.
  */
 function handWrittenUsageLines(source: string): number[] {
   const commands = Object.keys(COMMAND_TREE).join("|");
@@ -616,6 +627,20 @@ describe("cli --help on every command and subcommand", () => {
       expect(failures).toEqual([]);
     } finally {
       cleanup(sandbox);
+    }
+  });
+
+  test("each hand-back form uses only flags its command's usage entry documents", () => {
+    for (const [form, path] of [
+      [ANSWER_BELONGS_FORM, "answer"],
+      [ANSWER_QUEST_FORM, "answer"],
+      [DECLARE_QUEST_FORM, "quest declare"],
+    ] as const) {
+      const documented = usageText(path);
+      expect(form.startsWith(`tempad ${path} `)).toBe(true);
+      for (const flag of form.match(/--[\w-]+/g) ?? []) {
+        expect(documented, `${flag} in ${form}`).toContain(flag);
+      }
     }
   });
 

@@ -749,6 +749,38 @@ describe("tempad review", () => {
     expect(lines.some((line) => line.includes("T3"))).toBe(false);
   });
 
+  test("an expired classifier question offers only the --quest answer, never --belongs", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const store = new EventStore(database);
+    applyIncremental(
+      database,
+      store.append({
+        actor: "hook",
+        kind: "question.asked",
+        subject: "Q-shift",
+        sessionId: "s1",
+        payload: { trace: "T", kind: "which_quest", text: "which quest is this?" },
+      }),
+    );
+    applyIncremental(
+      database,
+      store.append({ actor: "system", kind: "question.expired", subject: "Q-shift", payload: {} }),
+    );
+
+    const lines: string[] = [];
+    runReviewCommand([], {
+      database,
+      config: makeConfig(mkdtempSync(join(tmpdir(), "tempad-cli-test-"))),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => lines.push(line),
+    });
+
+    const line = lines.find((candidate) => candidate.includes("Q-shift expired"));
+    expect(line).toContain('tempad answer Q-shift --quest <id>|new:"<title>" --why "<reason>"');
+    expect(line).not.toContain("--belongs");
+  });
+
   test("lists an expired declare question only while the session has no active quest", () => {
     const database = openDatabase(":memory:");
     ensureTables(database);

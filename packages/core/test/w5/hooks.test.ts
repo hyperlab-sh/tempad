@@ -10,7 +10,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { usageText } from "../../src/usage.ts";
 import {
   buildAdditionalContext,
   buildBelongsHandback,
@@ -190,7 +189,10 @@ describe("buildAdditionalContext", () => {
     ];
     const text = buildAdditionalContext(questions);
     expect(text).toContain("Q1");
-    expect(text).toContain("tempad answer Q1");
+    // A classifier question is not a belongs question: `answer --belongs` would exit 2.
+    expect(text).toContain('tempad answer Q1 --quest <id>|new:"<title>" --why "<reason>"');
+    expect(text).not.toContain("--belongs");
+    expect(text).not.toContain("<question-id>");
   });
 
   test("returns empty string for no questions", () => {
@@ -440,7 +442,9 @@ describe("verifier hand-back text", () => {
     expect(text).toBe(
       [
         "w5 thinks the last stretch is not part of your active quests (Ship marko-ui [Q1], Fix the flake [Q2]) (looks like: a competitor comparison). Reply:",
-        `  ${usageText("answer").replace("<question-id>", "Q123")}`,
+        '  tempad answer Q123 --belongs --why "<reason>"',
+        "  or",
+        '  tempad answer Q123 --quest <id>|new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]',
         "Ask the user if you are not sure.",
       ].join("\n"),
     );
@@ -458,7 +462,7 @@ describe("verifier hand-back text", () => {
     expect(text).toBe(
       [
         "w5 has no declared quest for this session. Reply:",
-        `  ${usageText("quest declare").replace("--session <id>", "--session s1")}`,
+        '  tempad quest declare --session s1 --quest <id>|--new "<title>" --outcome "<text>" --by agent',
       ].join("\n"),
     );
   });
