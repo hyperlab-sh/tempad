@@ -65,17 +65,20 @@ interface StintRow {
  * used to be a correlated subquery per stint, and `traces` has no index on
  * `stint_id`: with ~2000 stints that never closed that was a full scan each, 1.4 s
  * per window on real data.
+ *
  * Two traces can end in the same instant (a window's last message ends every
- * segment cut there, and a double backfill leaves exact duplicates); the lower id
- * wins, which is what the correlated subquery returned on every tie in real data
- * and what `w5 dedupe` keeps.
+ * segment cut there, and a double backfill leaves exact duplicates). The tie is
+ * broken explicitly: latest end, then latest start, then highest id. Of two traces
+ * ending together the one that started later is the more recent work, and the
+ * highest id is the last one recorded. The old correlated subquery left the tie to
+ * the sorter, which mostly picked the lower id, i.e. the earlier-started trace.
  */
 const ACTIVITY_SLICE_SELECT = `
   WITH ranked AS (
     SELECT traces.stint_id, traces.what, traces.why, traces.ended_at, traces.session_id,
            traces.place,
            ROW_NUMBER() OVER (
-             PARTITION BY traces.stint_id ORDER BY traces.ended_at DESC, traces.id ASC) AS rank
+             PARTITION BY traces.stint_id ORDER BY traces.ended_at DESC, traces.started_at DESC, traces.id DESC) AS rank
       FROM traces
      WHERE traces.retracted_at IS NULL AND traces.started_at < ?)
   SELECT stints.id as stintId,
@@ -160,76 +163,6 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
   // happened, so it is never a candidate -- see `windowEnd` on `BuildWindowInput`.
   const windowEnd = input.windowEnd ?? new Date().toISOString();
 
-  // The open quests the classifier may match, ranked and capped at `memoryQuests`:
-  // on real data the full list was ~475 quests by full ULID, 66 KB of prompt and
-  // a 2 s `buildWindow`, and the model crossed quest and stint ids in it. The
-  // ones this session already worked on come first, then the project's, then the
-  // rest, each by most recent use, so what the model is likely to name survives
-  // the cap. A quest left out cannot be matched, so the classifier may propose a
-  // duplicate of it: `memory_quests` trades prompt size against that.
-  const openQuests =
-    mode === "inferred"
-      ? (database
-          .query(
-            `WITH usage AS (
-               SELECT stints.quest_id AS questId,
-                      MAX(traces.started_at) AS lastStintAt,
-                      MAX(traces.session_id = ?) AS inSession,
-                      MAX(traces.place = ?) AS inProject
-                 FROM traces
-                 JOIN stints ON stints.id = traces.stint_id
-                WHERE traces.started_at < ? AND traces.retracted_at IS NULL
-                  AND stints.quest_id IS NOT NULL
-                GROUP BY stints.quest_id)
-            SELECT quests.id as id, quests.title as title, quests.outcome as outcome,
-                   usage.lastStintAt as lastStintAt
-              FROM quests
-              LEFT JOIN usage ON usage.questId = quests.id
-             WHERE COALESCE(
-                     (SELECT json_extract(events.payload, '$.state') FROM events
-                       WHERE events.kind = 'quest.lifecycle' AND events.subject = quests.id
-                         AND events.at <= ?
-                       ORDER BY events.uid DESC LIMIT 1),
-                     'started') IN ('started', 'resumed')
-               AND (quests.merged_into IS NULL
-                    OR NOT EXISTS (SELECT 1 FROM events
-                                    WHERE events.kind = 'quest.merged' AND events.subject = quests.id
-                                      AND events.at <= ?))
-               AND (quests.retracted_at IS NULL OR quests.retracted_at > ?)
-               AND (quests.created_at <= ?
-                    OR EXISTS (SELECT 1 FROM stints WHERE stints.quest_id = quests.id
-                                  AND stints.opened_at < ?))
-               AND (
-                 quests.owner_kind = 'hero'
-                 OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)
-               )
-             ORDER BY COALESCE(usage.inSession, 0) DESC,
-                      COALESCE(usage.inProject, 0) DESC,
-                      usage.lastStintAt IS NULL,
-                      usage.lastStintAt DESC,
-                      quests.created_at DESC,
-                      quests.id
-             LIMIT ?`,
-          )
-          .all(
-            input.sessionId,
-            `${session.org}/${session.project}`,
-            windowEnd,
-            windowEnd,
-            windowEnd,
-            windowEnd,
-            windowEnd,
-            windowEnd,
-            session.org,
-            input.memoryQuests,
-          ) as {
-          id: string;
-          title: string;
-          outcome: string | null;
-          lastStintAt: string | null;
-        }[])
-      : undefined;
-
   // "Open" is as of the window's end: a stint that closed at or after it was
   // still open when the window happened, so with later windows already
   // classified it is offered as open here rather than as a closed one to
@@ -291,6 +224,89 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
         input.memoryStints,
       ) as (StintRow & { closedAt: string | null; closeReason: string | null })[]
   ).map(openAsOfWindow);
+
+  // The open quests the classifier may match, ranked and capped at `memoryQuests`:
+  // on real data the full list was ~475 quests by full ULID, 66 KB of prompt and
+  // a 2 s `buildWindow`, and the model crossed quest and stint ids in it.
+  //
+  // The quest of every stint the window offers (session-open and recent) is
+  // always listed, whatever the cap: the model sees that stint with its quest's
+  // title, and a quest it cannot name by id makes it pick another quest (a doubt)
+  // or propose a duplicate. The remaining slots go to the quests this session
+  // already worked on, then the project's, then the rest, each by most recent use.
+  // A quest left out cannot be matched, so the classifier may propose a duplicate
+  // of it: `memory_quests` trades prompt size against that.
+  const stintQuestIds = [
+    ...new Set(
+      [...sessionOpenStints, ...recentStints]
+        .map((stint) => stint.questId)
+        .filter((questId): questId is string => questId !== null),
+    ),
+  ];
+  const openQuests =
+    mode === "inferred"
+      ? (database
+          .query(
+            `WITH usage AS (
+               SELECT stints.quest_id AS questId,
+                      MAX(traces.started_at) AS lastStintAt,
+                      MAX(traces.session_id = ?) AS inSession,
+                      MAX(traces.place = ?) AS inProject
+                 FROM traces
+                 JOIN stints ON stints.id = traces.stint_id
+                WHERE traces.started_at < ? AND traces.retracted_at IS NULL
+                  AND stints.quest_id IS NOT NULL
+                GROUP BY stints.quest_id)
+            SELECT quests.id as id, quests.title as title, quests.outcome as outcome,
+                   usage.lastStintAt as lastStintAt
+              FROM quests
+              LEFT JOIN usage ON usage.questId = quests.id
+             WHERE COALESCE(
+                     (SELECT json_extract(events.payload, '$.state') FROM events
+                       WHERE events.kind = 'quest.lifecycle' AND events.subject = quests.id
+                         AND events.at <= ?
+                       ORDER BY events.uid DESC LIMIT 1),
+                     'started') IN ('started', 'resumed')
+               AND (quests.merged_into IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM events
+                                    WHERE events.kind = 'quest.merged' AND events.subject = quests.id
+                                      AND events.at <= ?))
+               AND (quests.retracted_at IS NULL OR quests.retracted_at > ?)
+               AND (quests.created_at <= ?
+                    OR EXISTS (SELECT 1 FROM stints WHERE stints.quest_id = quests.id
+                                  AND stints.opened_at < ?))
+               AND (
+                 quests.owner_kind = 'hero'
+                 OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)
+               )
+             ORDER BY quests.id IN (SELECT value FROM json_each(?)) DESC,
+                      COALESCE(usage.inSession, 0) DESC,
+                      COALESCE(usage.inProject, 0) DESC,
+                      usage.lastStintAt IS NULL,
+                      usage.lastStintAt DESC,
+                      quests.created_at DESC,
+                      quests.id
+             LIMIT ?`,
+          )
+          .all(
+            input.sessionId,
+            `${session.org}/${session.project}`,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            session.org,
+            JSON.stringify(stintQuestIds),
+            Math.max(input.memoryQuests, stintQuestIds.length),
+          ) as {
+          id: string;
+          title: string;
+          outcome: string | null;
+          lastStintAt: string | null;
+        }[])
+      : undefined;
 
   const recentSideQuests =
     mode === "inferred"

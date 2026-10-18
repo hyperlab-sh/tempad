@@ -812,7 +812,14 @@ describe("window slice as of the window's end", () => {
 
   function insertTrace(
     database: ReturnType<typeof openDatabase>,
-    input: { id: string; stint: string; session: string; startedAt: string; what: string },
+    input: {
+      id: string;
+      stint: string;
+      session: string;
+      startedAt: string;
+      endedAt?: string;
+      what: string;
+    },
   ) {
     database
       .query(
@@ -823,7 +830,7 @@ describe("window slice as of the window's end", () => {
         input.id,
         input.stint,
         input.startedAt,
-        input.startedAt,
+        input.endedAt ?? input.startedAt,
         input.what,
         input.session,
         input.startedAt,
@@ -903,30 +910,50 @@ describe("window slice as of the window's end", () => {
     ]);
   });
 
-  test("two traces ending in the same instant: the lower id names the stint", () => {
-    const database = openDatabase(":memory:");
-    ensureTables(database);
-    seedSession(database);
-    seedOpenStint(database);
-    // T1 (seeded) ends 14:30; two more end together at 15:00, inserted newest id first.
-    insertTrace(database, {
-      id: "T-b",
-      stint: "A1",
-      session: "s1",
-      startedAt: "2026-09-04T15:00:00.000Z",
-      what: "second of the tie",
-    });
-    insertTrace(database, {
-      id: "T-a",
-      stint: "A1",
-      session: "s1",
-      startedAt: "2026-09-04T15:00:00.000Z",
-      what: "first of the tie",
+  describe("two traces ending in the same instant", () => {
+    const latestWhat = (
+      traces: { id: string; startedAt: string; what: string }[],
+    ): string | undefined => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      seedOpenStint(database);
+      // T1 (seeded) ends 14:30; the others all end together at 15:00.
+      for (const trace of traces) {
+        insertTrace(database, {
+          ...trace,
+          stint: "A1",
+          session: "s1",
+          endedAt: "2026-09-04T15:00:00.000Z",
+        });
+      }
+      return buildWindow(database, { ...base, windowEnd }).sessionOpenStints[0]?.what;
+    };
+
+    test("the one that started later names the stint, whatever the ids", () => {
+      // The later-started trace has the LOWER id, so neither id order explains the pick.
+      expect(
+        latestWhat([
+          { id: "T-b", startedAt: "2026-09-04T14:40:00.000Z", what: "started earlier" },
+          { id: "T-a", startedAt: "2026-09-04T14:50:00.000Z", what: "started later" },
+        ]),
+      ).toBe("started later");
+      expect(
+        latestWhat([
+          { id: "T-a", startedAt: "2026-09-04T14:40:00.000Z", what: "started earlier" },
+          { id: "T-b", startedAt: "2026-09-04T14:50:00.000Z", what: "started later" },
+        ]),
+      ).toBe("started later");
     });
 
-    const window = buildWindow(database, { ...base, windowEnd });
-
-    expect(window.sessionOpenStints.map((stint) => stint.what)).toEqual(["first of the tie"]);
+    test("with the same start too, the higher id names the stint, in either insert order", () => {
+      const tied = [
+        { id: "T-a", startedAt: "2026-09-04T14:50:00.000Z", what: "lower id" },
+        { id: "T-b", startedAt: "2026-09-04T14:50:00.000Z", what: "higher id" },
+      ];
+      expect(latestWhat(tied)).toBe("higher id");
+      expect(latestWhat([...tied].reverse())).toBe("higher id");
+    });
   });
 
   describe("open quests", () => {
@@ -1047,12 +1074,14 @@ describe("window slice as of the window's end", () => {
       for (const id of ["Q-session-old", "Q-session-new", "Q-project", "Q-elsewhere", "Q-unused"]) {
         insertQuest(database, id);
       }
+      // Closed and a day before the window, so no stint of theirs is offered: the cap alone
+      // decides which quests are listed.
       const use = (quest: string, session: string, place: string, at: string) => {
         database
           .query(
-            "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES (?, ?, 'work', ?, 1)",
+            "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES (?, ?, 'work', ?, ?, 'idle', 1)",
           )
-          .run(`S-${quest}-${at}`, quest, at);
+          .run(`S-${quest}-${at}`, quest, at, at);
         database
           .query(
             `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
@@ -1060,11 +1089,11 @@ describe("window slice as of the window's end", () => {
           )
           .run(`T-${quest}-${at}`, `S-${quest}-${at}`, place, at, at, place, session, at);
       };
-      use("Q-session-old", "s1", "personal/marko-ui", "2026-09-04T10:00:00.000Z");
-      use("Q-session-new", "s1", "personal/marko-ui", "2026-09-04T12:00:00.000Z");
+      use("Q-session-old", "s1", "personal/marko-ui", "2026-09-03T10:00:00.000Z");
+      use("Q-session-new", "s1", "personal/marko-ui", "2026-09-03T12:00:00.000Z");
       // Newer than both session quests, but another session's: ranks below them.
-      use("Q-project", "s-other", "personal/marko-ui", "2026-09-04T15:00:00.000Z");
-      use("Q-elsewhere", "s-other", "personal/other", "2026-09-04T15:10:00.000Z");
+      use("Q-project", "s-other", "personal/marko-ui", "2026-09-03T15:00:00.000Z");
+      use("Q-elsewhere", "s-other", "personal/other", "2026-09-03T15:10:00.000Z");
 
       const ids = (memoryQuests: number) =>
         (buildWindow(database, { ...base, windowEnd, memoryQuests }).openQuests ?? []).map(
@@ -1081,6 +1110,123 @@ describe("window slice as of the window's end", () => {
       expect(ids(3)).toEqual(["Q-session-new", "Q-session-old", "Q-project"]);
       expect(ids(1)).toEqual(["Q-session-new"]);
       expect(ids(0)).toEqual([]);
+    });
+
+    describe("the quests of the stints the window offers", () => {
+      const addStint = (
+        database: ReturnType<typeof openDatabase>,
+        input: {
+          stint: string;
+          quest: string;
+          session: string;
+          at: string;
+          closedAt?: string;
+        },
+      ) => {
+        database
+          .query(
+            "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES (?, ?, 'work', ?, ?, ?, 1)",
+          )
+          .run(
+            input.stint,
+            input.quest,
+            input.at,
+            input.closedAt ?? null,
+            input.closedAt ? "idle" : null,
+          );
+        insertTrace(database, {
+          id: `T-${input.stint}`,
+          stint: input.stint,
+          session: input.session,
+          startedAt: input.at,
+          what: "w",
+        });
+      };
+      const ids = (database: ReturnType<typeof openDatabase>, memoryQuests: number) =>
+        (buildWindow(database, { ...base, windowEnd, memoryQuests }).openQuests ?? []).map(
+          (quest) => quest.id,
+        );
+
+      test("a session-open and a recent stint's quest is offered even when the cap would drop it", () => {
+        const database = openDatabase(":memory:");
+        ensureTables(database);
+        seedSession(database);
+        // Ten quests this session used more recently than the two below, a day back so
+        // their stints are not offered and only the cap ranks them.
+        for (let index = 0; index < 10; index += 1) {
+          const id = `Q-hot-${String(index).padStart(2, "0")}`;
+          insertQuest(database, id);
+          addStint(database, {
+            stint: `S-${id}`,
+            quest: id,
+            session: "s1",
+            at: `2026-09-03T13:${String(10 + index)}:00.000Z`,
+            closedAt: `2026-09-03T13:${String(10 + index)}:30.000Z`,
+          });
+        }
+        // The session's own open stint, long idle: oldest use of all.
+        insertQuest(database, "Q-open");
+        addStint(database, {
+          stint: "S-open",
+          quest: "Q-open",
+          session: "s1",
+          at: "2026-09-04T08:00:00.000Z",
+        });
+        // Another session's recent stint in the same project: not this session's, not the newest.
+        insertQuest(database, "Q-recent");
+        addStint(database, {
+          stint: "S-recent",
+          quest: "Q-recent",
+          session: "s-other",
+          at: "2026-09-04T13:00:00.000Z",
+          closedAt: "2026-09-04T13:05:00.000Z",
+        });
+
+        const window = buildWindow(database, { ...base, windowEnd, memoryQuests: 3 });
+        expect(window.sessionOpenStints.map((stint) => stint.stintId)).toEqual(["S-open"]);
+        expect(window.recentStints.map((stint) => stint.stintId)).toContain("S-recent");
+        const offered = (window.openQuests ?? []).map((quest) => quest.id);
+        expect(offered).toContain("Q-open");
+        expect(offered).toContain("Q-recent");
+        // The pinned two come first; the one remaining slot is the best-ranked of the rest.
+        expect(offered).toHaveLength(3);
+        expect(offered.slice(0, 2).sort()).toEqual(["Q-open", "Q-recent"]);
+      });
+
+      test("the pinned quests exceed the cap rather than lose one, and 0 offers only them", () => {
+        const database = openDatabase(":memory:");
+        ensureTables(database);
+        seedSession(database);
+        insertQuest(database, "Q-other");
+        insertQuest(database, "Q-open");
+        addStint(database, {
+          stint: "S-open",
+          quest: "Q-open",
+          session: "s1",
+          at: "2026-09-04T08:00:00.000Z",
+        });
+
+        expect(ids(database, 0)).toEqual(["Q-open"]);
+        expect(ids(database, 1)).toEqual(["Q-open"]);
+        expect(ids(database, 2)).toEqual(["Q-open", "Q-other"]);
+      });
+
+      test("a stint's quest that was abandoned before the window is still not offered", () => {
+        const database = openDatabase(":memory:");
+        ensureTables(database);
+        seedSession(database);
+        const store = new EventStore(database);
+        insertQuest(database, "Q-gone", { state: "abandoned" });
+        lifecycle(store, "Q-gone", "abandoned", "2026-09-04T14:00:00.000Z");
+        addStint(database, {
+          stint: "S-open",
+          quest: "Q-gone",
+          session: "s1",
+          at: "2026-09-04T08:00:00.000Z",
+        });
+
+        expect(ids(database, 5)).toEqual([]);
+      });
     });
 
     test("a retracted trace does not make a quest relevant to the session", () => {
