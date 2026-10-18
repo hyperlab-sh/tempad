@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- An inference window that the classifier splits into several segments no longer turns into one stint per segment, all but the first with no quest. The prompt lists only stints and quests that existed before the window, so a later segment had no way to name the stint or quest an earlier segment had just opened: four review rounds of one brief came back as four stints, and `tempad w5 backfill --reclassify` of Oct 2-5 raised the quest-less stints of those sessions from 68 to 82. A segment can now name an earlier one as `"segment:<n>"` in `matchedStint`, `continuesStint` or `matchedQuest` (renumbered when a segment in the context-only tail is dropped; a reference to itself, a later or a dropped segment is ignored). A quest id in `matchedStint` or `continuesStint` (the commonest selector mix-up) lands on the stint an earlier segment of the window opened for that quest, rather than opening a second one or continuing an older stint of another session. A segment that says it did not switch (`isSwitch: false`) and names no stint stays on the previous segment's stint when their quests agree; a reason the model gave for a new stint is overridden only when it also names the previous stint's own quest, and the discarded reason is logged. A quest proposed again in one window with the same title and outcome is reused rather than created twice (the same title for another outcome is a quest of its own), and a quest-less stint the window opened can be given a quest the window offered or created. `tempad w5 eval` prints how often this happened as `same_window_reuse=`. Ids from before the window are still checked against what the window offered; declared mode is unchanged.
+
 ## [0.3.0] - 2026-10-18
 
 ### Added

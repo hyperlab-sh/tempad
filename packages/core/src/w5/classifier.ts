@@ -137,9 +137,13 @@ export interface ClassifierSegment {
    * different sources that the value itself has to disambiguate.
    */
   stint?: string;
-  /** Inference mode only. Alias in declared mode is gone; see `stint`. */
+  /**
+   * Inference mode only: a listed stint's id, or `"segment:<n>"` for the stint an
+   * earlier segment of the same response landed on (`parseSegmentReference`).
+   * Alias in declared mode is gone; see `stint`.
+   */
   matchedStint?: string | null;
-  /** Inference mode only. */
+  /** Inference mode only; takes `"segment:<n>"` like `matchedStint`. */
   continuesStint?: string | null;
   /** Inference mode only. */
   newStintReason?: string | null;
@@ -150,6 +154,7 @@ export interface ClassifierSegment {
    * Inference-mode only. The verifier makes no quest decision, so these are
    * absent in declared mode and only read on the fallback path.
    */
+  /** A listed quest's id, or `"segment:<n>"` for the quest that segment's stint has. */
   matchedQuest?: string | null;
   proposedQuest?: { title: string; outcome: string; commitment: Commitment } | null;
   questions?: LegacyQuestionKind[];
@@ -196,6 +201,47 @@ export const UNSPECIFIED_GUESS = "something else";
 
 /** Stands in for a `newStintReason` the classifier omitted entirely. */
 export const DEFAULT_NEW_STINT_REASON = "classifier gave no reason";
+
+/**
+ * Inference mode: `"segment:<n>"` in `matchedStint`, `continuesStint` or
+ * `matchedQuest` names the stint or quest that segment n (1-based) of the same
+ * response landed on. A stint or quest an earlier segment opens has no id the
+ * model could know, so without this a later segment of the same stretch of work
+ * could only open yet another stint: one window became a stint per segment, all
+ * but the first with no quest.
+ */
+const SEGMENT_REFERENCE = /^segment\s*[:#]?\s*(\d+)$/i;
+
+const SEGMENT_REFERENCE_FIELDS = ["matchedStint", "continuesStint", "matchedQuest"] as const;
+
+/** The 1-based segment position a `"segment:<n>"` value names, else null. */
+export function parseSegmentReference(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const match = SEGMENT_REFERENCE.exec(value.trim());
+  return match === null ? null : Number(match[1]);
+}
+
+/**
+ * Rewrites every segment reference against the segments validation kept, in
+ * their new numbering (`kept[i].position` is the segment's 1-based position in
+ * the model's response). A reference to the segment itself, a later one, or one
+ * dropped as overlap names nothing that has landed yet, so it becomes null: a
+ * stint slot left empty is then re-defaulted by `validateSegment` like any other
+ * missing selector, and a null `matchedQuest` is no opinion.
+ */
+function renumberSegmentReferences(kept: { segment: unknown; position: number }[]): void {
+  const renumbered = new Map(kept.map(({ position }, index) => [position, index + 1]));
+  for (const [index, { segment }] of kept.entries()) {
+    if (typeof segment !== "object" || segment === null) continue;
+    const fields = segment as Record<string, unknown>;
+    for (const field of SEGMENT_REFERENCE_FIELDS) {
+      const referenced = parseSegmentReference(fields[field]);
+      if (referenced === null) continue;
+      const position = renumbered.get(referenced);
+      fields[field] = position !== undefined && position <= index ? `segment:${position}` : null;
+    }
+  }
+}
 
 /**
  * The guess put on a segment whose `quest` alias the window never offered. The
@@ -634,12 +680,11 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
     guessDefaulted: 0,
   };
   const repairs: RepairCounters = { overlapDropped: 0, boundsClamped: 0 };
-  const segments =
-    bounds === null
-      ? (raw as { segments: unknown[] }).segments
-      : (raw as { segments: unknown[] }).segments.filter(
-          (segment) => repairBounds(segment, bounds, repairs) === "keep",
-        );
+  const kept = (raw as { segments: unknown[] }).segments
+    .map((segment, index) => ({ segment, position: index + 1 }))
+    .filter(({ segment }) => bounds === null || repairBounds(segment, bounds, repairs) === "keep");
+  if (mode === "inferred") renumberSegmentReferences(kept);
+  const segments = kept.map(({ segment }) => segment);
   for (const [index, segment] of segments.entries()) {
     validateSegment(segment, index, problems, bounds, counters, aliases, mode, declaredAliases);
   }

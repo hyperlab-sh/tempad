@@ -11,7 +11,12 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import { backfill, planBackfillWindows, selectBackfillSessions } from "../../src/w5/backfill";
-import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
+import {
+  type Classifier,
+  type ClassifierResult,
+  type ClassifierWindow,
+  validateResult,
+} from "../../src/w5/classifier";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
 
 registerAllProjections();
@@ -1072,6 +1077,132 @@ describe("backfill with a classifier that mixes up the ids it is offered", () =>
     expect(stints[0]?.questId).not.toBeNull();
     expect(stints[1]?.continues).toBe(stints[0]?.id);
     expect(stints[1]?.questId).toBe(stints[0]?.questId);
+  });
+});
+
+describe("backfill of a window the classifier splits into several segments", () => {
+  // e854515d on 2026-10-04: one window of a session that never declared came
+  // back as four segments of one brief and its review rounds. Each opened its
+  // own stint (the reclassify of Oct 2-5 went from 213 to 247 stints), and in
+  // the run where segment 1 proposed the quest, every later one had none.
+  const messageTimestamps = [
+    "2026-10-04T01:02:00.524Z",
+    "2026-10-04T01:13:37.328Z",
+    "2026-10-04T01:18:31.933Z",
+    "2026-10-04T01:20:27.190Z",
+    "2026-10-04T01:21:55.550Z",
+  ];
+
+  /** Returns the model's raw JSON through `validateResult`, as the real classifiers do. */
+  class RawClassifier implements Classifier {
+    constructor(private readonly raw: (window: ClassifierWindow) => unknown) {}
+    async classify(window: ClassifierWindow): Promise<ClassifierResult> {
+      return validateResult(this.raw(window), window);
+    }
+  }
+
+  const round = (position: number, overrides: Record<string, unknown>) => ({
+    startedAt: messageTimestamps[position - 1],
+    endedAt: messageTimestamps[position],
+    what: `review round ${position}`,
+    why: "tag contracts",
+    matchedQuest: null,
+    proposedQuest: null,
+    matchedStint: null,
+    continuesStint: null,
+    newStintReason: "Review feedback is part of the same brief execution; no separate stint needed",
+    isSwitch: false,
+    trigger: null,
+    confidence: 0.93,
+    questions: [],
+    ...overrides,
+  });
+
+  async function run(raw: (window: ClassifierWindow) => unknown, options = { seedQuest: false }) {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    if (options.seedQuest) {
+      applyIncremental(
+        database,
+        new EventStore(database).append({
+          actor: "hook",
+          kind: "quest.created",
+          subject: "Q1",
+          payload: {
+            owner: { kind: "hero", id: "H1" },
+            title: "Implement tag contracts",
+            outcome: "contracts validated",
+            commitment: "promised",
+            confirmed: true,
+          },
+          at: "2026-10-01T00:00:00.000Z",
+        }),
+      );
+    }
+    seedSession(database, {
+      id: "e854515d",
+      endedAt: "2026-10-04T01:21:55.550Z",
+      messageTimestamps,
+    });
+    const result = await backfill(database, makeConfig(), config, new RawClassifier(raw), {
+      days: 30,
+      now: "2026-10-18T12:00:00.000Z",
+      log: () => {},
+    });
+    const stints = database
+      .query(
+        `SELECT s.quest_id as questId, COUNT(t.id) as traces
+           FROM stints s JOIN traces t ON t.stint_id = s.id
+          WHERE t.session_id = 'e854515d' AND t.retracted_at IS NULL AND s.retracted_at IS NULL
+          GROUP BY s.id`,
+      )
+      .all() as { questId: string | null; traces: number }[];
+    return { result, stints };
+  }
+
+  test("segments that name the same quest without switching land on one stint", async () => {
+    // The c1 response: every segment names the session's quest and explains in
+    // newStintReason that no separate stint is needed. The quest matches, so
+    // that reason is discarded (and logged) in favour of segment 1's stint.
+    const { result, stints } = await run(
+      (window) => {
+        const quest = window.openQuests?.[0]?.id ?? null;
+        return {
+          segments: [1, 2, 3, 4].map((position) => round(position, { matchedQuest: quest })),
+          sessionNote: null,
+        };
+      },
+      { seedQuest: true },
+    );
+
+    expect(result.sessionsInferred).toBe(1);
+    expect(stints).toHaveLength(1);
+    expect(stints[0]?.questId).toBe("Q1");
+    expect(stints[0]?.traces).toBe(4);
+    expect(result.sameWindowReuse).toBe(3);
+  });
+
+  test("a quest proposed by segment 1 and named by the next as segment:1 covers the whole window", async () => {
+    const { result, stints } = await run(() => ({
+      segments: [
+        round(1, {
+          proposedQuest: {
+            title: "Implement tag contracts",
+            outcome: "contracts validated",
+            commitment: "promised",
+          },
+        }),
+        round(2, { matchedStint: "segment:1", matchedQuest: "segment:1", newStintReason: null }),
+        round(3, { isSwitch: true, matchedQuest: "segment:1", newStintReason: "a second PR" }),
+        round(4, { newStintReason: null }),
+      ],
+      sessionNote: null,
+    }));
+
+    expect(stints.map((stint) => stint.traces)).toEqual([2, 2]);
+    expect(stints.every((stint) => stint.questId !== null)).toBe(true);
+    expect(new Set(stints.map((stint) => stint.questId)).size).toBe(1);
+    expect(result.sameWindowReuse).toBe(3);
   });
 });
 

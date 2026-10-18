@@ -67,6 +67,8 @@ export interface BackfillResult {
   sessionNoteTruncated: number;
   selectorAmbiguous: number;
   selectorRepaired: number;
+  /** Inference segments that reached what an earlier segment of their window opened. */
+  sameWindowReuse: number;
   /** Sessions classified this run whose `modeFor` was `"declared"`. */
   sessionsDeclared: number;
   /** Sessions classified this run whose `modeFor` was `"inferred"`. */
@@ -271,6 +273,7 @@ export async function backfill(
   let sessionNoteTruncated = 0;
   let selectorAmbiguous = 0;
   let selectorRepaired = 0;
+  let sameWindowReuse = 0;
   const windowMinutes = backfillWindowMinutes(intentConfig);
 
   // Windows are classified in chronological order *across* sessions, not
@@ -410,6 +413,7 @@ export async function backfill(
       sessionNoteTruncated += result.sessionNoteTruncated ?? 0;
       selectorAmbiguous += result.selectorAmbiguous ?? 0;
       selectorRepaired += applied.selectorRepaired;
+      sameWindowReuse += applied.sameWindowReuse;
       writeSessionNote(database, session.id, result.sessionNote, options.now);
       applyIncremental(
         database,
@@ -461,6 +465,7 @@ export async function backfill(
     sessionNoteTruncated,
     selectorAmbiguous,
     selectorRepaired,
+    sameWindowReuse,
     sessionsDeclared,
     sessionsInferred,
   };

@@ -269,6 +269,7 @@ export interface EvalMetrics {
   sessionNoteTruncated: number;
   selectorAmbiguous: number;
   selectorRepaired: number;
+  sameWindowReuse: number;
   sessionsDeclared: number;
   sessionsInferred: number;
   stintsDismissed: number;
@@ -515,6 +516,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
     sessionNoteTruncated: backfillResult.sessionNoteTruncated,
     selectorAmbiguous: backfillResult.selectorAmbiguous,
     selectorRepaired: backfillResult.selectorRepaired,
+    sameWindowReuse: backfillResult.sameWindowReuse,
     sessionsDeclared: backfillResult.sessionsDeclared,
     sessionsInferred: backfillResult.sessionsInferred,
     stintsDismissed: stintsDismissedCount.count,

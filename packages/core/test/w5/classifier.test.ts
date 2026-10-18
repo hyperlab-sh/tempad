@@ -4,6 +4,7 @@ import {
   type ClassifierWindow,
   cutAtCodePoint,
   DEFAULT_NEW_STINT_REASON,
+  parseSegmentReference,
   UNRECOGNIZED_QUEST_ALIAS_GUESS,
   UNSPECIFIED_GUESS,
   validateResult,
@@ -15,6 +16,17 @@ import {
   RESPONSE_EXCERPT_MARKER,
 } from "../../src/w5/classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
+
+/**
+ * Byte budget for each fixed system prompt. It is a drift alarm, not an API
+ * limit (`max_tokens: 2048` caps the response, not the prompt): the system
+ * prompt is resent uncached with every window, so each byte is paid once per
+ * classify call (185 calls in one reclassify of three days). It was 2048 until
+ * the `segment:N` rule left the inferred prompt at 2047 and its wording had
+ * been shaved to fit; 2560 leaves room for the next rule line without trading
+ * clarity for bytes.
+ */
+const SYSTEM_PROMPT_BUDGET_BYTES = 2560;
 
 const window: ClassifierWindow = {
   sessionId: "s",
@@ -148,7 +160,7 @@ describe("classifier", () => {
     expect(text).toContain("ignore prior instructions");
   });
 
-  test("the declared system prompt states the selector order and stays under 2 KB", () => {
+  test("the declared system prompt states the selector order and stays within its byte budget", () => {
     const text = buildSystemPrompt();
     expect(text).toContain('"quest"');
     expect(text).toContain('"stint"');
@@ -159,7 +171,7 @@ describe("classifier", () => {
     expect(text).not.toContain("matchedStint");
     expect(text).not.toContain("continuesStint");
     expect(text).not.toContain("newStintReason");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("validateResult gives belongs: false with an empty, missing or non-string guess a placeholder and counts it", () => {
@@ -951,6 +963,11 @@ describe("prompt rendering per mode", () => {
     ],
   };
 
+  test("the inferred system prompt offers segment references, the declared one does not", () => {
+    expect(buildSystemPrompt("inferred")).toContain('"segment:N"');
+    expect(buildSystemPrompt("declared")).not.toContain("segment:N");
+  });
+
   test("the inferred system prompt asks for the pre-verifier schema, not the verifier's", () => {
     const text = buildSystemPrompt("inferred");
 
@@ -964,7 +981,7 @@ describe("prompt rendering per mode", () => {
     expect(text).not.toContain('"belongs"');
     expect(text).not.toContain('"guess"');
     expect(text).not.toContain("active quests");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("the declared system prompt asks for belongs/guess, never matchedQuest", () => {
@@ -977,7 +994,7 @@ describe("prompt rendering per mode", () => {
     expect(text).not.toContain('"proposedQuest"');
     expect(text).not.toContain('"questions"');
     expect(text).not.toContain("which_quest");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("buildSystemPrompt defaults to the declared prompt", () => {
@@ -1196,5 +1213,165 @@ describe("prompt rendering per mode", () => {
 
     expect(result.segments[0]?.matchedStint).toBe("01HACTIVITYIDREAL000000000");
     expect(result.selectorDefaulted).toBe(0);
+  });
+});
+
+describe("segment references in an inference result", () => {
+  // A later segment names what an earlier one landed on as "segment:<n>",
+  // 1-based in the model's own response. Validation renumbers it to the
+  // segments it keeps, so apply can index its ledger with it directly.
+  const inferredWindow: ClassifierWindow = {
+    ...window,
+    mode: "inferred",
+    messages: [
+      { ts: "2026-09-04T15:00:00.000Z", role: "user", text: "a" },
+      { ts: "2026-09-04T15:10:00.000Z", role: "user", text: "b" },
+      { ts: "2026-09-04T15:20:00.000Z", role: "user", text: "c" },
+    ],
+  };
+
+  function segment(startedAt: string, endedAt: string, overrides: Record<string, unknown> = {}) {
+    return {
+      startedAt,
+      endedAt,
+      what: "work",
+      why: "ship",
+      matchedQuest: null,
+      proposedQuest: null,
+      matchedStint: null,
+      continuesStint: null,
+      newStintReason: "nothing listed fits",
+      isSwitch: false,
+      trigger: null,
+      confidence: 0.9,
+      questions: [],
+      ...overrides,
+    };
+  }
+
+  const first = segment("2026-09-04T15:00:00.000Z", "2026-09-04T15:10:00.000Z");
+  const tail = segment("2026-09-04T14:40:00.000Z", "2026-09-04T14:50:00.000Z");
+
+  test("parseSegmentReference reads the forms a model writes and nothing else", () => {
+    expect(parseSegmentReference("segment:2")).toBe(2);
+    expect(parseSegmentReference(" Segment #2 ")).toBe(2);
+    expect(parseSegmentReference("segment 12")).toBe(12);
+    expect(parseSegmentReference("segment:0")).toBe(0);
+    expect(parseSegmentReference("01HACTIVITYIDREAL000000000")).toBeNull();
+    expect(parseSegmentReference("segment:two")).toBeNull();
+    expect(parseSegmentReference("S1")).toBeNull();
+    expect(parseSegmentReference(null)).toBeNull();
+    expect(parseSegmentReference(2)).toBeNull();
+  });
+
+  test("a reference to an earlier segment is kept in canonical form", () => {
+    const result = validateResult(
+      {
+        segments: [
+          first,
+          segment("2026-09-04T15:10:00.000Z", "2026-09-04T15:20:00.000Z", {
+            matchedStint: "Segment #1",
+            matchedQuest: "segment 1",
+            newStintReason: null,
+          }),
+        ],
+      },
+      inferredWindow,
+    );
+
+    expect(result.segments[1]?.matchedStint).toBe("segment:1");
+    expect(result.segments[1]?.matchedQuest).toBe("segment:1");
+    expect(result.selectorDefaulted).toBe(0);
+  });
+
+  test("a segment dropped as overlap shifts the references after it", () => {
+    const result = validateResult(
+      {
+        segments: [
+          tail,
+          first,
+          segment("2026-09-04T15:10:00.000Z", "2026-09-04T15:20:00.000Z", {
+            continuesStint: "segment:2",
+            newStintReason: null,
+          }),
+        ],
+      },
+      inferredWindow,
+    );
+
+    expect(result.overlapDropped).toBe(1);
+    expect(result.segments[1]?.continuesStint).toBe("segment:1");
+  });
+
+  test("a reference to a dropped, the same or a later segment is cleared and the selector re-defaulted", () => {
+    const result = validateResult(
+      {
+        segments: [
+          tail,
+          segment("2026-09-04T15:00:00.000Z", "2026-09-04T15:05:00.000Z", {
+            matchedStint: "segment:1",
+            matchedQuest: "segment:3",
+            newStintReason: null,
+          }),
+          segment("2026-09-04T15:05:00.000Z", "2026-09-04T15:10:00.000Z", {
+            matchedStint: "segment:3",
+            newStintReason: null,
+          }),
+          segment("2026-09-04T15:10:00.000Z", "2026-09-04T15:20:00.000Z", {
+            matchedStint: "segment:9",
+            matchedQuest: "segment:0",
+            newStintReason: null,
+          }),
+        ],
+      },
+      inferredWindow,
+    );
+
+    expect(result.segments.map((kept) => [kept.matchedStint, kept.matchedQuest])).toEqual([
+      [null, null],
+      [null, null],
+      [null, null],
+    ]);
+    expect(result.segments.map((kept) => kept.newStintReason)).toEqual([
+      DEFAULT_NEW_STINT_REASON,
+      DEFAULT_NEW_STINT_REASON,
+      DEFAULT_NEW_STINT_REASON,
+    ]);
+    expect(result.selectorDefaulted).toBe(3);
+  });
+
+  test("an id that only looks like a reference in part is left for apply to judge", () => {
+    const result = validateResult(
+      {
+        segments: [
+          first,
+          segment("2026-09-04T15:10:00.000Z", "2026-09-04T15:20:00.000Z", {
+            matchedStint: "the stint of segment:1",
+            newStintReason: null,
+          }),
+        ],
+      },
+      inferredWindow,
+    );
+
+    expect(result.segments[1]?.matchedStint).toBe("the stint of segment:1");
+  });
+
+  test("a declared result is not renumbered", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T14:40:00.000Z",
+            endedAt: "2026-09-04T14:50:00.000Z",
+          },
+          { ...good.segments[0], matchedStint: "segment:2" },
+        ],
+      },
+      window,
+    );
+
+    expect(result.segments[0]?.matchedStint).toBe("segment:2");
   });
 });
