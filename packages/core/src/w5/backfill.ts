@@ -36,18 +36,6 @@ export interface BackfillOptions {
    * host-local"). Unset: every session, regardless of host.
    */
   hostSlug?: string;
-  /**
-   * When set, only these sessions are classified, of the ones the range selects.
-   * `w5 backfill --reclassify` passes the sessions it reset, so a protected one
-   * (declared, or touched by a person) is not classified on top of what it holds.
-   */
-  sessionIds?: ReadonlySet<string>;
-  /**
-   * Called before every window is built and classified. `--reclassify` refreshes the
-   * w5 runner lock here: a lock untouched for `LOCK_MAX_HOLD_HOURS` is cleared by the
-   * next runner whatever its pid, and a real-size run outlives that.
-   */
-  beforeWindow?: () => void;
 }
 
 export interface BackfillResult {
@@ -255,7 +243,7 @@ export async function backfill(
     cutoff,
     to: options.to,
     hostSlug: options.hostSlug,
-  }).filter((session) => options.sessionIds === undefined || options.sessionIds.has(session.id));
+  });
 
   let sessionsClassified = 0;
   let sessionsSkipped = 0;
@@ -356,7 +344,6 @@ export async function backfill(
     endedAt,
     previousWindowEnd: previousChunkEnd,
   } of pending) {
-    options.beforeWindow?.();
     const session = sessionsById.get(sessionId) as SessionRow;
     closeIdleStints(store, database, {
       sessionId: session.id,

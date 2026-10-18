@@ -127,7 +127,7 @@ function promoteQuestion(
 
 /**
  * SQL for a `questions` row whose trace is not retracted. A question about a trace
- * that no longer exists (a reclassify or dedupe retracted it) is void: the hook must
+ * that no longer exists (a `w5 dedupe` retracted it, or a `w5 eval` reset on its copy) is void: the hook must
  * not ask it, `tempad review` not list it. A question whose trace row is missing
  * altogether is kept, as before.
  */

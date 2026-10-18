@@ -286,10 +286,8 @@ const RESET_REASON = "eval reset";
  * Retracts, on the copy only, every old-cohort row the eval range would
  * otherwise mix into the rerun's metrics: live traces started in
  * `[from, to)`, then stints left with no live trace, then unconfirmed
- * quests left with no live stint (the cascade in `reset.ts`, shared with
- * `w5 backfill --reclassify`, which selects by session and keeps what a person
- * touched). Also clears `w5_runs.session_note` and deletes `w5_windows` rows for
- * every touched session, since the rerun's `force` flag bypasses `w5_windows`
+ * quests left with no live stint (the cascade in `reset.ts`). Also clears
+ * `w5_runs.session_note` and deletes `w5_windows` rows for every touched session, since the rerun's `force` flag bypasses `w5_windows`
  * coverage but the copy is otherwise left inconsistent with what the rerun
  * records.
  */
@@ -300,10 +298,7 @@ function resetRange(database: Database, from: string, to: string): EvalResetResu
        WHERE retracted_at IS NULL AND started_at >= ? AND started_at < ?`,
     )
     .all(from, to) as ResetTrace[];
-  return applyReset(database, planReset(database, traces), {
-    reason: RESET_REASON,
-    clearWindowCoverage: true,
-  });
+  return applyReset(database, planReset(database, traces), { reason: RESET_REASON });
 }
 
 function median(values: number[]): number {
