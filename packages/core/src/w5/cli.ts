@@ -325,7 +325,7 @@ function runReview(args: string[], context: W5Context): number {
     .all(since) as { id: string; what: string; doubt: string }[];
   for (const trace of doubtedTraces) {
     context.stdout(
-      `trace ${trace.id} doubt (${trace.doubt}) — ${trace.what} — tempad trace list --stint <id>`,
+      `trace ${trace.id} doubt (${trace.doubt}) — ${trace.what} — ${usageText("trace list")}`,
     );
   }
 
@@ -373,7 +373,7 @@ function runReview(args: string[], context: W5Context): number {
       continue;
     }
     context.stdout(
-      `question ${question.id} expired (${question.text}) — tempad answer ${question.id} --quest <id> --why "…"`,
+      `question ${question.id} expired (${question.text}) — ${usageText("answer").replace("<question-id>", question.id)}`,
     );
   }
 
@@ -394,9 +394,7 @@ function runReview(args: string[], context: W5Context): number {
     )
     .all() as { id: string; what: string }[];
   for (const trace of lowConfidenceTraces) {
-    context.stdout(
-      `trace ${trace.id} low confidence (${trace.what}) — tempad trace list --stint <id>`,
-    );
+    context.stdout(`trace ${trace.id} low confidence (${trace.what}) — ${usageText("trace list")}`);
   }
 
   return 0;

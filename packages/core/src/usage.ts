@@ -411,7 +411,7 @@ export const POSITIONAL_LIMITS: Readonly<Record<string, number>> = {
 };
 
 /** Flags that stand alone; every other flag takes the argument after it as its value. */
-const BOOLEAN_FLAGS = new Set([
+export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "--all",
   "--belongs",
   "--detached",

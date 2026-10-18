@@ -15,7 +15,14 @@ import { COMMAND_TREE, runSkillCommand, runSync } from "../src/cli.ts";
 import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
-import { documentedPaths, POSITIONAL_LIMITS, usageForPath } from "../src/usage.ts";
+import {
+  BOOLEAN_FLAGS,
+  checkPositionals,
+  documentedPaths,
+  POSITIONAL_LIMITS,
+  usageForPath,
+  walkPath,
+} from "../src/usage.ts";
 import { renderHookSettings } from "../src/w5/hooks.ts";
 import { withEnvironment } from "./isolation.ts";
 
@@ -457,20 +464,79 @@ function listTree(directory: string): string[] {
     .sort();
 }
 
+/** The body of each string literal in `source` with its 1-based starting line, comments skipped. */
+function stringLiterals(source: string): { line: number; body: string }[] {
+  const literals: { line: number; body: string }[] = [];
+  let line = 1;
+  let index = 0;
+  while (index < source.length) {
+    const character = source[index] as string;
+    const next = source[index + 1];
+    if (character === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      const end = source.indexOf("*/", index + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      line += source.slice(index, stop).split("\n").length - 1;
+      index = stop;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      const start = line;
+      let body = "";
+      index += 1;
+      while (index < source.length && source[index] !== character) {
+        const inner = source[index] as string;
+        if (inner === "\\") {
+          body += source.slice(index, index + 2);
+          index += 2;
+          continue;
+        }
+        if (character === "`" && inner === "$" && source[index + 1] === "{") {
+          // An interpolation is one placeholder; its own strings and braces are not literals here.
+          let depth = 0;
+          index += 1;
+          do {
+            if (source[index] === "{") depth += 1;
+            if (source[index] === "}") depth -= 1;
+            if (source[index] === "\n") line += 1;
+            index += 1;
+          } while (depth > 0 && index < source.length);
+          body += "$";
+          continue;
+        }
+        if (inner === "\n") line += 1;
+        body += inner;
+        index += 1;
+      }
+      literals.push({ line: start, body });
+    } else if (character === "\n") {
+      line += 1;
+    }
+    index += 1;
+  }
+  return literals;
+}
+
 /**
- * Lines (1-based) with a string literal that is a hand-written usage: `usage: tempad ...`, or
- * a synopsis, a literal that opens with `tempad <command>` and goes on to an option or
- * placeholder (`[`, `<`), comments aside. Strings that merely name a command (`"tempad sync --forget"`, an
- * error like `"tempad setup: ..."`) have neither.
+ * Lines (1-based) holding a string literal that is a hand-written usage: `usage: tempad ...` in
+ * any case, or a synopsis, `tempad <command>` anywhere in a line of the literal (after spaces,
+ * words or an interpolation) followed by an option or placeholder (`[`, `<`). Comments are
+ * skipped, and strings that merely name a command (`"tempad sync --forget"`, `"tempad setup: ..."`)
+ * have neither.
  */
 function handWrittenUsageLines(source: string): number[] {
-  const synopsis = /["'`](?:usage: )?tempad [a-z0-9][^"'`$]*[[<]|["'`]usage: tempad /;
-  const lines: number[] = [];
-  source.split("\n").forEach((line, index) => {
-    if (/^\s*(?:\/\/|\/?\*)/.test(line)) return;
-    if (synopsis.test(line)) lines.push(index + 1);
-  });
-  return lines;
+  const commands = Object.keys(COMMAND_TREE).join("|");
+  const synopsis = new RegExp(`(?:^|[^\\w/:.-])tempad (?:${commands})(?![\\w:-])[^\\n]*[[<]`);
+  const lines = new Set<number>();
+  for (const { line, body } of stringLiterals(source)) {
+    body.split("\n").forEach((text, offset) => {
+      if (/usage: tempad /i.test(text) || synopsis.test(text)) lines.add(line + offset);
+    });
+  }
+  return [...lines];
 }
 
 describe("cli --help on every command and subcommand", () => {
@@ -503,7 +569,7 @@ describe("cli --help on every command and subcommand", () => {
   test("the usage guard catches a planted literal and ignores strings that only name a command", () => {
     const fixtures = join(import.meta.dir, "fixtures", "usage-literals");
     expect(handWrittenUsageLines(readFileSync(join(fixtures, "hand-written.txt"), "utf8"))).toEqual(
-      [2, 3, 4],
+      [2, 3, 4, 5, 6, 7, 8, 10],
     );
     expect(handWrittenUsageLines(readFileSync(join(fixtures, "clean.txt"), "utf8"))).toEqual([]);
     // The old prefix is still caught.
@@ -527,11 +593,13 @@ describe("cli --help on every command and subcommand", () => {
         await Promise.all(
           paths.slice(start, start + 8).map(async (joined) => {
             const path = joined.split(" ");
-            // `sync`'s one positional is a source, and an unknown one is its own error.
-            const filler = Array.from({ length: POSITIONAL_LIMITS[joined] ?? 0 }, () =>
-              joined === "sync" ? "monday" : "x",
-            );
-            const result = await runCli(sandbox, [...path, ...filler, "extra"]);
+            const filler = Array.from({ length: POSITIONAL_LIMITS[joined] ?? 0 }, () => "x");
+            // `sync`'s one positional is a source: past a flag the walk leaves it to the limit.
+            const argv =
+              joined === "sync"
+                ? ["sync", "--full", "monday", "extra"]
+                : [...path, ...filler, "extra"];
+            const result = await runCli(sandbox, argv);
             const usage = usageForPath(path)[1]?.trim() ?? "missing";
             if (
               result.exitCode !== 2 ||
@@ -549,6 +617,236 @@ describe("cli --help on every command and subcommand", () => {
     } finally {
       cleanup(sandbox);
     }
+  });
+
+  test("one maximal valid invocation per path is accepted", () => {
+    const valid: Record<string, string[]> = {
+      "hero init": ["hero", "init", "Ada Lovelace"],
+      "party add": ["party", "add", "acme", "Acme Inc", "--joined", "2026-01-02"],
+      "party leave": ["party", "leave", "acme", "--reason", "contract ended"],
+      "party list": ["party", "list"],
+      "client add": ["client", "add", "acme", "Acme Inc"],
+      "saga add": ["saga", "add", "--owner", "hero", "Ship it", "--statement", "all of it"],
+      "saga reword": ["saga", "reword", "S1", "New title", "--statement", "text"],
+      "saga replace": ["saga", "replace", "S1", "New title", "--statement", "t", "--reason", "r"],
+      "saga end": ["saga", "end", "S1", "--reason", "achieved"],
+      "saga edit": ["saga", "edit", "S1", "New title"],
+      "saga list": ["saga", "list", "--all", "--as-of", "2026-01-02T00:00:00Z"],
+      "quest add": [
+        "quest",
+        "add",
+        "--owner",
+        "party:acme",
+        "--serves",
+        "S1",
+        "Title",
+        "--outcome",
+        "o",
+        "--done",
+        "d",
+        "--due",
+        "2026-02-01",
+        "--budget",
+        "2h",
+        "--commitment",
+        "promised",
+      ],
+      "quest reword": ["quest", "reword", "Q1", "Title", "--outcome", "o"],
+      "quest replace": ["quest", "replace", "Q1", "Title", "--outcome", "o", "--reason", "r"],
+      "quest end": ["quest", "end", "Q1", "--reason", "r"],
+      "quest edit": ["quest", "edit", "Q1", "Title"],
+      "quest confirm": ["quest", "confirm", "Q1"],
+      "quest merge": ["quest", "merge", "Q1", "--into", "Q2"],
+      "quest pause": ["quest", "pause", "Q1", "--reason", "r"],
+      "quest resume": ["quest", "resume", "Q1"],
+      "quest done": ["quest", "done", "Q1", "--reason=r"],
+      "quest abandon": ["quest", "abandon", "Q1", "--reason", "r"],
+      "quest branch": [
+        "quest",
+        "branch",
+        "Q1",
+        "--deviates-from",
+        "Q2",
+        "--trigger",
+        "t",
+        "--kind",
+        "waiting",
+        "--at",
+        "2026-01-02T00:00:00Z",
+      ],
+      "quest return": ["quest", "return", "Q1", "--to", "Q2"],
+      "quest retract": ["quest", "retract", "Q1", "--reason", "r", "--force"],
+      "quest delete": ["quest", "delete", "Q1", "--reason", "r", "--force"],
+      "quest declare": [
+        "quest",
+        "declare",
+        "--session",
+        "s1",
+        "--parent",
+        "p1",
+        "--new",
+        "Title",
+        "--outcome",
+        "o",
+        "--commitment",
+        "promised",
+        "--project",
+        "p",
+        "--serves",
+        "S1",
+        "--plan",
+        "a; b",
+        "--by",
+        "agent",
+        "--at",
+        "2026-01-02T00:00:00Z",
+      ],
+      "quest list": [
+        "quest",
+        "list",
+        "--all",
+        "--unconfirmed",
+        "--side",
+        "--as-of",
+        "2026-01-02T00:00:00Z",
+      ],
+      "stint list": ["stint", "list", "--open", "--quest", "Q1"],
+      "trace list": ["trace", "list", "--since", "2026-01-02T00:00:00Z", "--stint", "T1"],
+      "impact set": ["impact", "set", "pr:acme/x#1", "Fixed it", "--theme", "fix"],
+      "impact list": [
+        "impact",
+        "list",
+        "--project",
+        "p",
+        "--from",
+        "2026-01-01",
+        "--to",
+        "2026-02-01",
+      ],
+      "impact import": ["impact", "import", "impacts.json"],
+      answer: [
+        "answer",
+        "Q9",
+        "--quest",
+        "new:Title",
+        "--why",
+        "w",
+        "--origin",
+        "current",
+        "--trigger",
+        "t",
+        "--kind",
+        "blocker",
+      ],
+      rebuild: ["rebuild", "--until", "2026-01-02T00:00:00Z"],
+      setup: [
+        "setup",
+        "--non-interactive",
+        "--home",
+        "/tmp/x",
+        "--force",
+        "--no-verify",
+        "--monday-api-token",
+        "t",
+        "--tz=UTC",
+      ],
+      init: ["init", "--home", "/tmp/x"],
+      sync: ["sync", "monday", "--full"],
+      "sync monday": ["sync", "monday", "--full"],
+      "sync github": ["sync", "github", "--full"],
+      "sync claude": ["sync", "claude", "--full"],
+      "report daily": [
+        "report",
+        "daily",
+        "--from",
+        "2026-01-01",
+        "--to",
+        "2026-01-31",
+        "--org",
+        "o",
+        "--project",
+        "p",
+        "--out",
+        "out.md",
+        "--as-of",
+        "2026-02-01T00:00:00Z",
+        "--party",
+        "acme",
+        "--client",
+        "acme",
+        "--pr-date",
+        "authored",
+      ],
+      "report project": ["report", "project", "--from", "2026-01-01", "--to", "2026-01-31"],
+      "report hourly": ["report", "hourly", "--from", "2026-01-01", "--to", "2026-01-31"],
+      "report weekly": ["report", "weekly", "--from", "2026-01-01", "--to", "2026-01-31"],
+      "w5 enqueue": ["w5", "enqueue", "--session", "s1", "--forced"],
+      "w5 context": ["w5", "context", "--session", "s1"],
+      "w5 run": ["w5", "run", "--detached"],
+      "w5 hook install": ["w5", "hook", "install", "--scope", "project"],
+      "w5 hook uninstall": ["w5", "hook", "uninstall", "--scope=user"],
+      "w5 backfill": ["w5", "backfill", "--from", "2026-01-01", "--model", "m", "--force"],
+      "w5 dedupe": ["w5", "dedupe", "--dry-run"],
+      "w5 eval": [
+        "w5",
+        "eval",
+        "--from",
+        "2026-01-01",
+        "--to",
+        "2026-01-31",
+        "--db",
+        "x.db",
+        "--declare",
+        "d.toml",
+      ],
+      quiet: ["quiet", "2h"],
+      review: ["review", "--days", "3"],
+      scry: ["scry", "--json", "--days", "3", "--fast"],
+      "schedule install": ["schedule", "install"],
+      "schedule remove": ["schedule", "remove"],
+      "schedule status": ["schedule", "status", "--json"],
+      "skill install": ["skill", "install", "--scope", "project"],
+      "project register": [
+        "project",
+        "register",
+        "~/work/x",
+        "--name",
+        "X",
+        "--org",
+        "o",
+        "--project",
+        "p",
+      ],
+      "project list": ["project", "list"],
+      "project reresolve": ["project", "reresolve", "~/work/x"],
+    };
+    expect(Object.keys(valid).sort()).toEqual(Object.keys(POSITIONAL_LIMITS).sort());
+    for (const [joined, argv] of Object.entries(valid)) {
+      const [command = "", ...rest] = argv;
+      const walked = walkPath(command, rest);
+      if (!walked.ok) throw new Error(`${joined}: ${walked.message}`);
+      expect(walked.path.join(" "), joined).toBe(joined === "sync" ? "sync monday" : joined);
+      expect(checkPositionals(walked.path, rest), joined).toBeNull();
+    }
+    // The bare source form, where the walk stops at the flag and the limit takes over.
+    const sourceAfterFlag = walkPath("sync", ["--full", "monday"]);
+    expect(
+      sourceAfterFlag.ok && checkPositionals(sourceAfterFlag.path, ["--full", "monday"]),
+    ).toBeNull();
+  });
+
+  test("every boolean option parseArgs declares in src/ is in BOOLEAN_FLAGS, and no string option shares its name", async () => {
+    const booleans = new Set<string>();
+    const strings = new Set<string>();
+    for await (const file of new Glob("**/*.ts").scan(join(import.meta.dir, "..", "src"))) {
+      const source = readFileSync(join(import.meta.dir, "..", "src", file), "utf8");
+      for (const match of source.matchAll(/"?([a-z][\w-]*)"?: \{ type: "(boolean|string)"/g)) {
+        (match[2] === "boolean" ? booleans : strings).add(`--${match[1]}`);
+      }
+    }
+    expect(booleans.size).toBeGreaterThan(10);
+    expect([...booleans].filter((flag) => !BOOLEAN_FLAGS.has(flag))).toEqual([]);
+    expect([...strings].filter((flag) => BOOLEAN_FLAGS.has(flag))).toEqual([]);
   });
 
   test("flags and their values are not positionals", async () => {

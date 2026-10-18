@@ -1,4 +1,10 @@
 // Planted for test/cli.test.ts: usage strings written by hand instead of read from src/usage.ts.
-console.error("tempad widget frob <id> [--force]");
+console.error("tempad party frob <id> [--force]");
 console.error(`tempad sync [monday|github] --full`);
 const text = 'tempad quest merge <id> --into <id>';
+const interpolated = `tempad answer ${id} --quest <id> --why "..."`;
+const indented = `  tempad quest confirm <id>`;
+const prose = "run tempad quest confirm <id> to keep it";
+const capital = "Usage: tempad rebuild";
+const multiline = `first line
+  tempad party add <slug> "<name>"`;

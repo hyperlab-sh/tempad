@@ -626,13 +626,11 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     // subcommands is a usage error, so a command missing from `COMMAND_TREE` cannot run.
     const walked = walkPath(command, rest);
     if (!walked.ok) return printResolvedHelp(walked);
-    if (!isHelpFlagRequest(rest)) {
-      const excess = checkPositionals(walked.path, rest);
-      if (excess !== null) return printResolvedHelp(excess);
-    }
     if (isHelpFlagRequest(rest)) {
       return printResolvedHelp({ ok: true, lines: usageForPath(walked.path) });
     }
+    const excess = checkPositionals(walked.path, rest);
+    if (excess !== null) return printResolvedHelp(excess);
   }
 
   // `setup` needs no configuration and opens no database: it creates them.

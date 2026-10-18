@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { usageText } from "../../src/usage.ts";
 import {
   buildAdditionalContext,
   buildBelongsHandback,
@@ -439,9 +440,7 @@ describe("verifier hand-back text", () => {
     expect(text).toBe(
       [
         "w5 thinks the last stretch is not part of your active quests (Ship marko-ui [Q1], Fix the flake [Q2]) (looks like: a competitor comparison). Reply:",
-        '  tempad answer Q123 --belongs --why "<reason>"',
-        "  or",
-        '  tempad answer Q123 --quest <id>|new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]',
+        `  ${usageText("answer").replace("<question-id>", "Q123")}`,
         "Ask the user if you are not sure.",
       ].join("\n"),
     );
@@ -459,7 +458,7 @@ describe("verifier hand-back text", () => {
     expect(text).toBe(
       [
         "w5 has no declared quest for this session. Reply:",
-        '  tempad quest declare --session s1 --quest <id>|--new "<title>" --outcome "<text>" [--commitment ...] --by agent',
+        `  ${usageText("quest declare").replace("--session <id>", "--session s1")}`,
       ].join("\n"),
     );
   });
