@@ -12,6 +12,7 @@ import { EventStore } from "../intent/store";
 import { localDayBoundsUtc } from "../report/markdown.ts";
 import { backfill } from "./backfill";
 import type { Classifier } from "./classifier";
+import { applyReset, planReset, type ResetResult, type ResetTrace } from "./reset";
 
 registerAllProjections();
 
@@ -276,128 +277,32 @@ export interface EvalMetrics {
   sample: EvalSampleStint[];
 }
 
-export interface EvalResetResult {
-  traces: number;
-  stints: number;
-  quests: number;
-}
+export type EvalResetResult = ResetResult;
 
 const RESET_REASON = "eval reset";
 
 /**
  * Retracts, on the copy only, every old-cohort row the eval range would
  * otherwise mix into the rerun's metrics: live traces started in
- * `[from, to]`, then stints left with no live trace, then unconfirmed
- * quests left with no live stint -- mirroring `dedupe.ts`'s cascade but
- * selecting by date range instead of duplicate grouping. Also clears
- * `w5_runs.session_note` and deletes `w5_windows` rows for every touched
- * session, since the rerun's `force` flag bypasses `w5_windows` coverage
- * but the copy is otherwise left inconsistent with what the rerun records.
+ * `[from, to)`, then stints left with no live trace, then unconfirmed
+ * quests left with no live stint (the cascade in `reset.ts`, shared with
+ * `w5 backfill --reclassify`, which selects by session and keeps what a person
+ * touched). Also clears `w5_runs.session_note` and deletes `w5_windows` rows for
+ * every touched session, since the rerun's `force` flag bypasses `w5_windows`
+ * coverage but the copy is otherwise left inconsistent with what the rerun
+ * records.
  */
 function resetRange(database: Database, from: string, to: string): EvalResetResult {
-  const store = new EventStore(database);
-
-  const traceRows = database
+  const traces = database
     .query(
       `SELECT id, stint_id, session_id FROM traces
        WHERE retracted_at IS NULL AND started_at >= ? AND started_at < ?`,
     )
-    .all(from, to) as { id: string; stint_id: string; session_id: string | null }[];
-
-  const sessionIds = new Set(
-    traceRows.map((row) => row.session_id).filter((id): id is string => id !== null),
-  );
-
-  const affectedStintIds = new Set(traceRows.map((row) => row.stint_id));
-  const retractedTraceIds = new Set(traceRows.map((row) => row.id));
-
-  const result = { traces: 0, stints: 0, quests: 0 };
-
-  const run = database.transaction(() => {
-    for (const trace of traceRows) {
-      applyIncremental(
-        database,
-        store.append({
-          actor: "backfill",
-          kind: "retracted",
-          subject: trace.id,
-          payload: { retracts: trace.id, reason: RESET_REASON },
-        }),
-      );
-    }
-    result.traces = traceRows.length;
-
-    const stintsToRetract: string[] = [];
-    for (const stintId of affectedStintIds) {
-      const liveTraces = database
-        .query("SELECT id FROM traces WHERE stint_id = ? AND retracted_at IS NULL")
-        .all(stintId) as { id: string }[];
-      const hasLiveTrace = liveTraces.some((trace) => !retractedTraceIds.has(trace.id));
-      if (!hasLiveTrace) stintsToRetract.push(stintId);
-    }
-    for (const stintId of stintsToRetract) {
-      applyIncremental(
-        database,
-        store.append({
-          actor: "backfill",
-          kind: "retracted",
-          subject: stintId,
-          payload: { retracts: stintId, reason: RESET_REASON },
-        }),
-      );
-    }
-    result.stints = stintsToRetract.length;
-
-    const affectedQuestIds = new Set(
-      stintsToRetract
-        .map(
-          (stintId) =>
-            (
-              database.query("SELECT quest_id FROM stints WHERE id = ?").get(stintId) as {
-                quest_id: string | null;
-              } | null
-            )?.quest_id ?? null,
-        )
-        .filter((id): id is string => id !== null),
-    );
-    const retractedStintIds = new Set(stintsToRetract);
-    const questsToRetract: string[] = [];
-    for (const questId of affectedQuestIds) {
-      const quest = database
-        .query("SELECT confirmed FROM quests WHERE id = ? AND retracted_at IS NULL")
-        .get(questId) as { confirmed: number } | null;
-      if (!quest || quest.confirmed === 1) continue;
-      const liveStints = database
-        .query("SELECT id FROM stints WHERE quest_id = ? AND retracted_at IS NULL")
-        .all(questId) as { id: string }[];
-      const hasLiveStint = liveStints.some((stint) => !retractedStintIds.has(stint.id));
-      if (!hasLiveStint) questsToRetract.push(questId);
-    }
-    for (const questId of questsToRetract) {
-      applyIncremental(
-        database,
-        store.append({
-          actor: "backfill",
-          kind: "retracted",
-          subject: questId,
-          payload: { retracts: questId, reason: RESET_REASON },
-        }),
-      );
-    }
-    result.quests = questsToRetract.length;
-
-    for (const sessionId of sessionIds) {
-      database.query("UPDATE w5_runs SET session_note = NULL WHERE session_id = ?").run(sessionId);
-      database.query("DELETE FROM w5_windows WHERE session_id = ?").run(sessionId);
-    }
+    .all(from, to) as ResetTrace[];
+  return applyReset(database, planReset(database, traces), {
+    reason: RESET_REASON,
+    clearWindowCoverage: true,
   });
-  run();
-
-  return {
-    traces: result.traces,
-    stints: result.stints,
-    quests: result.quests,
-  };
 }
 
 function median(values: number[]): number {

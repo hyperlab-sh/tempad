@@ -1612,10 +1612,16 @@ function runAnswerCommand(args: string[], context: IntentContext): number {
     return 1;
   }
   const trace = context.database
-    .query("SELECT stint_id FROM traces WHERE id = ?")
-    .get(question.trace_id) as { stint_id: string } | null;
+    .query("SELECT stint_id, retracted_at FROM traces WHERE id = ?")
+    .get(question.trace_id) as { stint_id: string; retracted_at: string | null } | null;
   if (!trace) {
     console.error(`unknown trace: ${question.trace_id}`);
+    return 1;
+  }
+  if (trace.retracted_at !== null) {
+    console.error(
+      `question ${questionId} is about trace ${question.trace_id}, which was retracted; there is nothing left to answer`,
+    );
     return 1;
   }
 

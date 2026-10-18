@@ -40,7 +40,8 @@ import {
 } from "./hooks";
 import { enqueueJob } from "./jobs";
 import { acquireLock, clearStaleLock, releaseLock, touchLock } from "./lock";
-import type { QuestionRow } from "./questions";
+import { type QuestionRow, TRACE_NOT_RETRACTED } from "./questions";
+import { BackupError, backupDatabase, planReclassify, reclassify } from "./reclassify";
 import { drain } from "./runner";
 
 export interface SpawnOptions {
@@ -193,7 +194,7 @@ function runContext(args: string[], context: W5Context): number {
     .query(
       `SELECT id, trace_id as traceId, session_id as sessionId, kind, state, turns_watched as turnsWatched,
               turns_at_ask as turnsAtAsk, is_switch as isSwitch
-         FROM questions WHERE session_id = ? AND state = 'asked' ORDER BY asked_at DESC`,
+         FROM questions WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED} ORDER BY asked_at DESC`,
     )
     .all(values.session) as (Omit<QuestionRow, "isSwitch"> & { isSwitch: number })[];
 
@@ -201,7 +202,9 @@ function runContext(args: string[], context: W5Context): number {
   const guesses = new Map(
     (
       context.database
-        .query("SELECT id, guess FROM questions WHERE session_id = ? AND state = 'asked'")
+        .query(
+          `SELECT id, guess FROM questions WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED}`,
+        )
         .all(values.session) as { id: string; guess: string | null }[]
     ).map((row) => [row.id, row.guess]),
   );
@@ -332,7 +335,8 @@ function runReview(args: string[], context: W5Context): number {
 
   const expiredQuestions = context.database
     .query(
-      "SELECT id, text, kind, guess, session_id as sessionId FROM questions WHERE state = 'expired' ORDER BY rowid ASC",
+      `SELECT id, text, kind, guess, session_id as sessionId FROM questions
+        WHERE state = 'expired' AND ${TRACE_NOT_RETRACTED} ORDER BY rowid ASC`,
     )
     .all() as {
     id: string;
@@ -580,9 +584,47 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
       from: { type: "string" },
       model: { type: "string" },
       force: { type: "boolean", default: false },
+      reclassify: { type: "boolean", default: false },
+      to: { type: "string" },
+      "dry-run": { type: "boolean", default: false },
+      backup: { type: "string" },
     },
     strict: true,
   });
+
+  if (!values.reclassify) {
+    for (const flag of ["to", "dry-run", "backup"] as const) {
+      if (values[flag] !== undefined && values[flag] !== false) {
+        context.stdout(`${BACKFILL_USAGE}\n--${flag} is only valid with --reclassify`);
+        return 2;
+      }
+    }
+  } else if (values.force || values.days !== undefined) {
+    context.stdout(
+      `${BACKFILL_USAGE}\n--reclassify names its own range with --from/--to: it cannot be combined with --force or --days`,
+    );
+    return 2;
+  } else if (values.from === undefined) {
+    context.stdout(`${BACKFILL_USAGE}\n--reclassify needs --from <iso>`);
+    return 2;
+  } else if (values["dry-run"] && values.backup !== undefined) {
+    context.stdout(
+      `${BACKFILL_USAGE}\n--dry-run writes nothing, so it takes no --backup: drop one of them`,
+    );
+    return 2;
+  } else if (!values["dry-run"] && values.backup === undefined) {
+    const suggestion = join(context.config.home, "backups", `tempad-${Date.now()}.db`);
+    context.stdout(
+      [
+        BACKFILL_USAGE,
+        "--reclassify retracts traces, stints and quests in this database and needs --backup <path> (it takes the backup itself, checked, before the first write).",
+        `  tempad w5 backfill --reclassify --from ${values.from}${values.to !== undefined ? ` --to ${values.to}` : ""} --backup ${suggestion}`,
+        `or by hand: sqlite3 ${join(context.config.home, "tempad.db")} "VACUUM INTO '${suggestion}'"`,
+        "Add --dry-run instead to see what it would do without writing.",
+      ].join("\n"),
+    );
+    return 2;
+  }
 
   if (values.days !== undefined && values.from !== undefined) {
     context.stdout(`${BACKFILL_USAGE}\n--days and --from cannot be combined: pick one lower bound`);
@@ -600,16 +642,44 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
     }
     from = new Date(fromMs).toISOString();
   }
+  let to: string | undefined;
+  if (values.to !== undefined) {
+    const toMs = parseIsoInstant(values.to);
+    if (toMs === null) {
+      context.stdout(
+        `${BACKFILL_USAGE}\n--to needs an ISO 8601 date or datetime (2026-10-01, 2026-10-01T10:00:00Z, 2026-10-01T10:00:00-03:00), got "${values.to}"`,
+      );
+      return 2;
+    }
+    to = new Date(toMs).toISOString();
+    if (from !== undefined && to <= from) {
+      context.stdout(`${BACKFILL_USAGE}\n--to must be after --from`);
+      return 2;
+    }
+  }
 
   const days = values.days
     ? Number.parseInt(values.days, 10)
     : context.intentConfig.w5.backfillDays;
+
+  // A dry run classifies nothing, so it needs no classifier and no API key.
+  if (values.reclassify && values["dry-run"] && from !== undefined) {
+    return runReclassifyDryRun(context, { from, ...(to !== undefined ? { to } : {}) });
+  }
 
   if (context.intentConfig.w5.backend === "api" && !anthropicApiKey(context.config.home)) {
     context.stdout("ANTHROPIC_API_KEY not set");
     return 1;
   }
   const classifier = buildClassifier(context.config, context.intentConfig, values.model);
+
+  if (values.reclassify && from !== undefined && values.backup !== undefined) {
+    return runReclassify(context, classifier, {
+      from,
+      ...(to !== undefined ? { to } : {}),
+      backup: values.backup,
+    });
+  }
 
   const result = await backfill(
     context.database,
@@ -638,6 +708,112 @@ async function runBackfill(args: string[], context: W5Context): Promise<number> 
   const attemptedWindows = result.windowsClassified + result.windowsFailed;
   if (attemptedWindows > 0 && result.windowsClassified === 0) return 1;
   return 0;
+}
+
+/**
+ * `w5 backfill --reclassify --from <iso> [--to <iso>] (--dry-run | --backup <path>)`:
+ * the supported way to redo a range on the real database. It retracts (by events)
+ * what w5 inferred for the sessions in range and classifies them again. It writes
+ * to the database, so it needs `--backup <path>` (which it takes itself, checked,
+ * before the first write) unless it is a `--dry-run`.
+ */
+function reclassifyRange(context: W5Context, input: { from: string; to?: string }) {
+  return {
+    from: input.from,
+    ...(input.to !== undefined ? { to: input.to } : {}),
+    ...(isSyncEnabled(context.config.home) ? { hostSlug: context.config.hostSlug } : {}),
+    now: new Date().toISOString(),
+    activeMinutes: context.intentConfig.w5.stintIdleMinutes,
+  };
+}
+
+function runReclassifyDryRun(context: W5Context, input: { from: string; to?: string }): number {
+  const plan = planReclassify(context.database, reclassifyRange(context, input));
+  const byReason = new Map<string, number>();
+  for (const entry of plan.protectedSessions) {
+    byReason.set(entry.reason, (byReason.get(entry.reason) ?? 0) + 1);
+  }
+  const breakdown = [...byReason].map(([reason, count]) => `${reason}=${count}`).join(", ");
+  context.stdout(
+    `reclassify (dry run): sessions=${plan.sessions.length} protected=${plan.protectedSessions.length}${breakdown ? ` (${breakdown})` : ""} would retract traces=${plan.reset.traces.length} stints=${plan.reset.stintIds.length} quests=${plan.reset.questIds.length} and close questions=${plan.reset.questionIds.length} continuations=${plan.reset.continuationIds.length}`,
+  );
+  for (const entry of plan.protectedSessions) {
+    context.stdout(`reclassify: protected ${entry.sessionId} (${entry.reason})`);
+  }
+  return 0;
+}
+
+async function runReclassify(
+  context: W5Context,
+  classifier: Classifier,
+  input: { from: string; to?: string; backup: string },
+): Promise<number> {
+  // The runner's own lock, held from before the backup to the end: a hook-spawned
+  // `w5 run` classifies the live session against the stints this retracts, and
+  // would also append events between the backup and its check.
+  const lockPath = lockPathFor(context.config);
+  clearStaleLock(lockPath, (line) => log(context.config, line));
+  mkdirSync(dirname(lockPath), { recursive: true });
+  if (!acquireLock(lockPath)) {
+    context.stdout(
+      `reclassify: the w5 runner lock is held (${lockPath}); a w5 run is working. Wait for it to end and run this again; nothing was changed`,
+    );
+    return 1;
+  }
+  try {
+    return await runReclassifyLocked(context, classifier, input, () => touchLock(lockPath));
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+
+async function runReclassifyLocked(
+  context: W5Context,
+  classifier: Classifier,
+  input: { from: string; to?: string; backup: string },
+  refreshLock: () => void,
+): Promise<number> {
+  const range = reclassifyRange(context, input);
+  try {
+    mkdirSync(dirname(input.backup), { recursive: true });
+    backupDatabase(context.database, input.backup);
+  } catch (error) {
+    if (error instanceof BackupError) {
+      context.stdout(`reclassify: backup failed: ${error.message}; nothing was changed`);
+      return 1;
+    }
+    throw error;
+  }
+  context.stdout(`reclassify: backup written to ${input.backup}`);
+  context.stdout(
+    "reclassify: holding the w5 runner lock until it ends; live sessions are not classified meanwhile (their jobs stay queued and run afterwards)",
+  );
+
+  const result = await reclassify(
+    context.database,
+    context.config,
+    context.intentConfig.w5,
+    classifier,
+    {
+      ...range,
+      beforeWindow: refreshLock,
+      log: (line) => {
+        log(context.config, line);
+        context.stdout(line);
+      },
+    },
+  );
+  for (const entry of result.plan.protectedSessions) {
+    context.stdout(`reclassify: protected ${entry.sessionId} (${entry.reason})`);
+  }
+  context.stdout(
+    `reclassify: sessions=${result.plan.sessions.length} protected=${result.plan.protectedSessions.length} retracted traces=${result.reset.traces} stints=${result.reset.stints} quests=${result.reset.quests} closed questions=${result.reset.questions} continuations=${result.reset.continuations}`,
+  );
+  context.stdout(
+    `classified=${result.backfill.sessionsClassified} windows=${result.backfill.windowsClassified} failed=${result.backfill.windowsFailed} skipped=${result.backfill.sessionsSkipped} windows_skipped=${result.backfill.windowsSkipped}`,
+  );
+  const attempted = result.backfill.windowsClassified + result.backfill.windowsFailed;
+  return attempted > 0 && result.backfill.windowsClassified === 0 ? 1 : 0;
 }
 
 async function runEvalCommand(args: string[], context: W5Context): Promise<number> {
