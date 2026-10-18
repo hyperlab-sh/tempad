@@ -1525,6 +1525,18 @@ describe("w5 backfill --from", () => {
     });
   }
 
+  // A range can no longer be retracted on the real database.
+  for (const flag of [
+    ["--reclassify"],
+    ["--to", "2026-10-02"],
+    ["--backup", "x.db"],
+    ["--dry-run"],
+  ]) {
+    test(`${flag[0]} is an unknown flag like any other`, async () => {
+      await expect(run(["--from", "2026-10-01", ...flag])).rejects.toThrow(flag[0] as string);
+    });
+  }
+
   for (const good of [
     "2026-10-01",
     "2026-10-01T10:00:00Z",

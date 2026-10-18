@@ -172,7 +172,7 @@ interface StintState {
  * With `through` (the instant the segment ends) a stint that closed at or after
  * it counts as open: it was still open for the whole stretch of work, which is
  * how `buildWindow` offered it when later windows were already classified (a
- * `--force` or `--reclassify` re-run). Opening a `continues` stint there would
+ * `--force` re-run or a `w5 eval` rerun). Opening a `continues` stint there would
  * overlap the stint it continues. A stint that closed *inside* the segment is not
  * open: reusing it would put a trace past its own `closed_at`, so the segment
  * continues it instead.

@@ -985,7 +985,7 @@ describe("applyResult", () => {
     expect(trace.stint_id).not.toBe("A-does-not-exist");
   });
 
-  // A later window already closed the stint (a `--force` / `--reclassify` re-run), but
+  // A later window already closed the stint (a `--force` re-run), but
   // the segment ran at 15:00-15:20, before the close when `closedAt` is 15:30 and across
   // it when `closedAt` is 15:10.
   for (const selector of ["matchedStint", "continuesStint"] as const) {

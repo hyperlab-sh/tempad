@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- `tempad w5 backfill --reclassify` (with `--to`, `--backup` and `--dry-run`, which existed only for it) is gone: retracting a whole time range is not a product feature, it was written to repair one classifier incident, and a mistake is corrected per item instead (`tempad quest retract`, or `tempad quest reword` for a title). `w5 backfill [--days <n> | --from <iso>] [--model <name>] [--force]`, `w5 eval` and `w5 dedupe` are unchanged, and the `retracted`, `question.answered` and `stint.continuation_cleared` events a run already wrote still replay.
+
 ## [0.3.1] - 2026-10-18
 
 ### Fixed

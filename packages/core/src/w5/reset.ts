@@ -43,16 +43,9 @@ export interface ResetOptions {
    * Whether to delete the `w5_windows` rows of the touched sessions. `w5_windows`
    * is a projection of `window.classified` events, so a delete is not an event:
    * a `tempad rebuild` (or `scry`'s projection check) replays the deleted rows
-   * back. Only a throwaway copy may do it (`w5 eval`). A reset on a real database
-   * leaves them, which is harmless because the re-run that follows classifies
-   * with `force`, which ignores coverage.
+   * back. Only a throwaway copy may do it, which is what `w5 eval` runs on.
    */
   clearWindowCoverage: boolean;
-  /**
-   * Whether an unconfirmed quest that is left with no live stint may be retracted.
-   * Confirmed quests never are. Unset: every such quest.
-   */
-  mayRetractQuest?: (questId: string) => boolean;
 }
 
 /** Questions about these traces that were never answered (a person's answer or the context's). */
@@ -71,17 +64,13 @@ function openQuestionsOf(database: Database, traceIds: string[]): string[] {
 }
 
 /**
- * The cascade behind both `w5 eval`'s reset and `w5 backfill --reclassify`,
- * mirroring `dedupe.ts`: the given traces, then the stints left with no live
- * trace, then the unconfirmed quests left with no live stint. A stint that keeps
- * a live trace (another session's, or one the caller did not select) stays, and
- * so does its quest.
+ * The cascade behind `w5 eval`'s reset (on its throwaway copy), mirroring
+ * `dedupe.ts`: the given traces, then the stints left with no live trace, then
+ * the unconfirmed quests left with no live stint. A stint that keeps a live
+ * trace (another session's, or one the caller did not select) stays, and so
+ * does its quest.
  */
-export function planReset(
-  database: Database,
-  traces: ResetTrace[],
-  options: Pick<ResetOptions, "mayRetractQuest"> = {},
-): ResetPlan {
+export function planReset(database: Database, traces: ResetTrace[]): ResetPlan {
   const retractedTraceIds = new Set(traces.map((trace) => trace.id));
   const sessionIds = [
     ...new Set(traces.map((trace) => trace.session_id).filter((id): id is string => id !== null)),
@@ -114,7 +103,6 @@ export function planReset(
       .query("SELECT confirmed FROM quests WHERE id = ? AND retracted_at IS NULL")
       .get(questId) as { confirmed: number } | null;
     if (!quest || quest.confirmed === 1) continue;
-    if (options.mayRetractQuest && !options.mayRetractQuest(questId)) continue;
     const liveStints = database
       .query("SELECT id FROM stints WHERE quest_id = ? AND retracted_at IS NULL")
       .all(questId) as { id: string }[];
