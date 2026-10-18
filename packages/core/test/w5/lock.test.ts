@@ -3,13 +3,14 @@ import {
   existsSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   acquireLock,
   CLEARING_STALE_MS,
@@ -355,6 +356,28 @@ describe("tryClearStaleLock", () => {
     });
   });
 
+  test("a handoff replaced after it was judged abandoned is given back, not deleted, and the run skips", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "4242");
+      const lines: string[] = [];
+      const outcome = tryClearStaleLock(path, (line) => lines.push(line), {
+        now: NOW,
+        // 4242 is gone; 4343 is the run that cleared the abandoned handoff first and took a fresh one
+        isAlive: (pid) => pid === 4343,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, "4343");
+        },
+      });
+      expect(outcome).toBe("contended");
+      expect(lines).toEqual([]);
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(existsSync(path)).toBe(true);
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+
   test("a grace of 0 clears a dead runner's fresh lock but never a pid-less one", () => {
     withLock("4242", 0, (path) => {
       const options = { now: NOW, isAlive: () => false, deadRunnerGraceMinutes: 0 };
@@ -390,6 +413,7 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
     waitUntil(startAt);
     clearStaleLock(process.argv[1], () => {}, {
       afterJudgedStale: () => waitUntil(startAt + 300),
+      beforeRemoveAbandoned: () => waitUntil(startAt + 450 + 40 * Number(process.argv[3])),
       beforeUnlink: () => waitUntil(startAt + 600 + 40 * Number(process.argv[3])),
     });
     console.log(acquireLock(process.argv[1]) ? "won" : "lost");
@@ -444,7 +468,13 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
 
   const old = (minutes: number) => new Date(Date.now() - minutes * 60_000);
 
-  const w5Cases: { name: string; content: () => string; ageMinutes: number }[] = [
+  const w5Cases: {
+    name: string;
+    content: () => string;
+    ageMinutes: number;
+    /** A handoff its clearer died holding: every racer finds it and judges it abandoned. */
+    abandonedHandoff?: boolean;
+  }[] = [
     {
       name: "its runner is gone",
       content: () => String(deadPid()),
@@ -452,18 +482,25 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
     },
     { name: "it holds no pid", content: () => "", ageMinutes: STALE_LOCK_MINUTES + 1 },
     {
+      name: "its runner is gone and the clearing handoff was abandoned",
+      content: () => String(deadPid()),
+      ageMinutes: STALE_LOCK_MINUTES + 1,
+      abandonedHandoff: true,
+    },
+    {
       name: "it is past the hold ceiling with a live pid",
       content: () => String(process.pid),
       ageMinutes: LOCK_MAX_HOLD_HOURS * 60 + 1,
     },
   ];
 
-  for (const { name, content, ageMinutes } of w5Cases) {
+  for (const { name, content, ageMinutes, abandonedHandoff } of w5Cases) {
     test(`w5.lock, ${name}`, async () => {
       await withDirectory(async (directory) => {
         const lockPath = join(directory, "w5.lock");
         writeFileSync(lockPath, content());
         utimesSync(lockPath, old(ageMinutes), old(ageMinutes));
+        if (abandonedHandoff) writeFileSync(`${lockPath}.clearing`, String(deadPid()));
         expectOneWinner(await race(w5Racer, (startAt) => [lockPath, startAt]));
         expect(readdirSync(directory).sort()).toEqual(["w5.lock"]);
       });

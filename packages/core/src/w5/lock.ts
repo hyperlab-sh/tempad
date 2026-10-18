@@ -1,7 +1,10 @@
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
+  linkSync,
   openSync,
   readFileSync,
+  renameSync,
   statSync,
   unlinkSync,
   utimesSync,
@@ -110,6 +113,8 @@ export interface ClearStaleLockOptions extends LockCheckOptions {
   name?: string;
   afterJudgedStale?: () => void;
   beforeUnlink?: () => void;
+  /** Between judging a handoff abandoned and removing it. */
+  beforeRemoveAbandoned?: () => void;
 }
 
 export type ClearOutcome =
@@ -135,8 +140,10 @@ export type ClearOutcome =
  * removed by the next run, which then retries its own clear once, when its pid is gone, when it
  * names no pid and is older than `CLEARING_STALE_MS`, or when it names a live pid and is older than
  * `STALE_LOCK_MINUTES` (a stopped clearer is not abandoned after 10 s, but a reused pid would
- * otherwise block every run forever); two runs removing that abandoned handoff at once is the one
- * remaining race, and it needs a crash inside the critical section first.
+ * otherwise block every run forever). The removal renames the handoff aside and deletes it only
+ * if it is the one that was judged abandoned (`removeAbandonedHandoff`), so a second run judging
+ * the same abandoned handoff cannot delete the fresh one the first run took; what remains needs
+ * a crash inside the critical section plus a third run inside the microseconds of the give-back.
  * `releaseLock` unlinks by path after reading the pid, so a holder past the hold ceiling
  * releasing at the very moment it is cleared can still take down the lock a third run just
  * acquired; that needs a runner that held the lock for over six hours and is harmless to
@@ -155,8 +162,10 @@ export function tryClearStaleLock(
   if (!acquireLock(clearingPath)) {
     // An abandoned handoff is removed and the clear tried once more, so the run that finds one
     // does not report a holder that is not there; a second failure means someone else is clearing.
-    if (!clearingIsStale(clearingPath, options.isAlive ?? pidIsAlive)) return "contended";
-    removeIfPresent(clearingPath);
+    const abandoned = abandonedHandoff(clearingPath, options.isAlive ?? pidIsAlive);
+    if (abandoned === null) return "contended";
+    options.beforeRemoveAbandoned?.();
+    removeAbandonedHandoff(clearingPath, abandoned);
     if (!acquireLock(clearingPath)) return "contended";
   }
   try {
@@ -188,25 +197,75 @@ export function clearStaleLock(
   return tryClearStaleLock(lockPath, log, options) === "cleared";
 }
 
-/**
- * A handoff is abandoned when its clearer is gone: its pid is dead, or it names no pid (a crash
- * before the pid was written) and is older than `CLEARING_STALE_MS`. A clearer whose pid is alive
- * keeps the handoff for `STALE_LOCK_MINUTES`, not 10 s: a process stopped between its second
- * judgment and its unlink (SIGSTOP, a sleeping laptop) is still the clearer and would, once
- * resumed, unlink whatever lock exists by then. Only a pid reused by an unrelated process
- * outlives that, and the age ends it.
- */
-function clearingIsStale(clearingPath: string, isAlive: (pid: number) => boolean): boolean {
-  let ageMs: number;
+/** What identifies one handoff file: its holder's text, modification time and inode. */
+interface HandoffIdentity {
+  pidText: string;
+  mtimeMs: number;
+  ino: number;
+}
+
+function handoffIdentity(path: string): HandoffIdentity | null {
   try {
-    ageMs = Date.now() - statSync(clearingPath).mtimeMs;
+    const { mtimeMs, ino } = statSync(path);
+    return { pidText: readFileSync(path, "utf8").trim(), mtimeMs, ino };
   } catch {
-    return false; // gone already: whoever held it finished
+    return null; // gone already: whoever held it finished
   }
-  const clearer = lockPid(clearingPath);
-  if (clearer === null) return ageMs > CLEARING_STALE_MS;
-  if (clearer !== process.pid && !isAlive(clearer)) return true;
-  return ageMs > STALE_LOCK_MINUTES * 60_000;
+}
+
+/**
+ * The handoff's identity when it is abandoned, null when it is not (or is gone). Abandoned means
+ * its clearer is gone: its pid is dead, or it names no pid (a crash before the pid was written)
+ * and is older than `CLEARING_STALE_MS`. A clearer whose pid is alive keeps the handoff for
+ * `STALE_LOCK_MINUTES`, not 10 s: a process stopped between its second judgment and its unlink
+ * (SIGSTOP, a sleeping laptop) is still the clearer and would, once resumed, unlink whatever lock
+ * exists by then. Only a pid reused by an unrelated process outlives that, and the age ends it.
+ */
+function abandonedHandoff(
+  clearingPath: string,
+  isAlive: (pid: number) => boolean,
+): HandoffIdentity | null {
+  const seen = handoffIdentity(clearingPath);
+  if (seen === null) return null;
+  const ageMs = Date.now() - seen.mtimeMs;
+  const clearer = /^\d+$/.test(seen.pidText) ? Number.parseInt(seen.pidText, 10) : 0;
+  if (clearer <= 0) return ageMs > CLEARING_STALE_MS ? seen : null;
+  if (clearer !== process.pid && !isAlive(clearer)) return seen;
+  return ageMs > STALE_LOCK_MINUTES * 60_000 ? seen : null;
+}
+
+/**
+ * Removes the handoff that was judged abandoned, and only that one. Two runs can judge the same
+ * abandoned handoff: the first removes it and takes a fresh one, and a plain unlink by the second
+ * would delete that live handoff, after which both clear the lock. So the file at the path is
+ * renamed to a unique name (atomic, and it keeps the inode and mtime), compared with what was
+ * judged, and deleted only if it is the same; a handoff that is not (the fresh one) is given back
+ * with `link`, which fails rather than replace one a third run has created since.
+ */
+function removeAbandonedHandoff(clearingPath: string, judged: HandoffIdentity): void {
+  const parked = `${clearingPath}.abandoned.${process.pid}.${randomBytes(4).toString("hex")}`;
+  try {
+    renameSync(clearingPath, parked);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    const taken = handoffIdentity(parked);
+    if (taken !== null && !sameHandoff(taken, judged)) {
+      try {
+        linkSync(parked, clearingPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+  } finally {
+    removeIfPresent(parked);
+  }
+}
+
+function sameHandoff(left: HandoffIdentity, right: HandoffIdentity): boolean {
+  return left.ino === right.ino && left.mtimeMs === right.mtimeMs && left.pidText === right.pidText;
 }
 
 function removeIfPresent(path: string): void {
