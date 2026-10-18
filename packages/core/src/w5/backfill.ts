@@ -48,6 +48,7 @@ export interface BackfillResult {
   unknownStintIds: number;
   overlapDropped: number;
   questProposedOnMatched: number;
+  questAttachedOnMatched: number;
   selectorDefaulted: number;
   boundsClamped: number;
   guessDefaulted: number;
@@ -251,6 +252,7 @@ export async function backfill(
   let unknownStintIds = 0;
   let overlapDropped = 0;
   let questProposedOnMatched = 0;
+  let questAttachedOnMatched = 0;
   let selectorDefaulted = 0;
   let boundsClamped = 0;
   let guessDefaulted = 0;
@@ -362,6 +364,7 @@ export async function backfill(
         maxMessages: 5000,
         memoryHours: intentConfig.memoryHours,
         memoryStints: intentConfig.memoryStints,
+        memoryQuests: intentConfig.memoryQuests,
         overlapMessages: intentConfig.overlapMessages,
         windowEnd: endedAt,
       }),
@@ -387,6 +390,7 @@ export async function backfill(
       unknownStintIds += applied.unknownStintIds;
       overlapDropped += result.overlapDropped ?? 0;
       questProposedOnMatched += applied.questProposedOnMatched;
+      questAttachedOnMatched += applied.questAttachedOnMatched;
       selectorDefaulted += result.selectorDefaulted ?? 0;
       boundsClamped += result.boundsClamped ?? 0;
       guessDefaulted += result.guessDefaulted ?? 0;
@@ -437,6 +441,7 @@ export async function backfill(
     unknownStintIds,
     overlapDropped,
     questProposedOnMatched,
+    questAttachedOnMatched,
     selectorDefaulted,
     boundsClamped,
     guessDefaulted,

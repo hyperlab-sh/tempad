@@ -47,6 +47,7 @@ throttle_minutes = 5
     expect(config.w5.stintIdleMinutes).toBe(45);
     expect(config.w5.memoryHours).toBe(8);
     expect(config.w5.memoryStints).toBe(10);
+    expect(config.w5.memoryQuests).toBe(20);
     expect(config.w5.overlapMessages).toBe(3);
   });
 
@@ -261,6 +262,7 @@ describe("a [w5] key of the wrong type", () => {
       ["stint_min_minutes", "stintMinMinutes"],
       ["memory_hours", "memoryHours"],
       ["memory_stints", "memoryStints"],
+      ["memory_quests", "memoryQuests"],
       ["overlap_messages", "overlapMessages"],
     ];
     const toml = `[w5]\n${keys.map(([key]) => `${key} = "x"`).join("\n")}\n`;
@@ -419,21 +421,33 @@ describe("a [w5] number that makes no sense", () => {
   });
 
   test("counts must be whole numbers of 0 or more", () => {
-    for (const key of ["watch_turns", "ask_expire_turns", "overlap_messages", "memory_stints"]) {
-      for (const value of ["-1", "1.5"]) {
+    for (const key of [
+      "watch_turns",
+      "ask_expire_turns",
+      "overlap_messages",
+      "memory_stints",
+      "memory_quests",
+    ]) {
+      // 1e20 is an integer to Number.isInteger but not a valid SQL LIMIT: every window would fail.
+      for (const [value, shown] of [
+        ["-1", "-1"],
+        ["1.5", "1.5"],
+        ["1e20", "100000000000000000000"],
+      ] as const) {
         const { warnings } = load(`[w5]\n${key} = ${value}\n`);
         expect(warnings).toHaveLength(1);
         expect(warnings[0]).toContain(
-          `[w5].${key} must be a whole number, 0 or more, got ${value}`,
+          `[w5].${key} must be a whole number, 0 or more, got ${shown}`,
         );
       }
     }
     const { config, warnings } = load(
-      "[w5]\nwatch_turns = 0\nask_expire_turns = 0\noverlap_messages = 0\nmemory_stints = 0\n",
+      "[w5]\nwatch_turns = 0\nask_expire_turns = 0\noverlap_messages = 0\nmemory_stints = 0\nmemory_quests = 0\n",
     );
     expect(warnings).toEqual([]);
     expect(config.w5.watchTurns).toBe(0);
     expect(config.w5.memoryStints).toBe(0);
+    expect(config.w5.memoryQuests).toBe(0);
     expect(config.w5.overlapMessages).toBe(0);
   });
 

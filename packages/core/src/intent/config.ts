@@ -24,6 +24,7 @@ export interface W5Config {
   stintMinMinutes: number;
   memoryHours: number;
   memoryStints: number;
+  memoryQuests: number;
   overlapMessages: number;
   mode: (typeof W5_MODES)[number];
   inferenceFallback: boolean;
@@ -55,6 +56,7 @@ export function defaultIntentConfig(): IntentConfig {
       stintMinMinutes: 5,
       memoryHours: 8,
       memoryStints: 10,
+      memoryQuests: 20,
       overlapMessages: 3,
       mode: "declared",
       inferenceFallback: true,
@@ -220,14 +222,16 @@ export function loadIntentConfig(
         wrongType(reporter, `[w5].${key}`, expected, value, fallback);
         return fallback;
       };
-    // Finite always (TOML allows `nan` and `inf`). Counts are whole numbers, which also keeps
-    // `memory_stints` and `overlap_messages` valid as a SQL `LIMIT`; minutes and hours may be
-    // fractions; 0 is a real setting for the ones that are thresholds.
+    // Finite always (TOML allows `nan` and `inf`). Counts are safe whole numbers (an integer
+    // such as 1e20 is one to `Number.isInteger` but SQLite rejects it as a `LIMIT`, failing
+    // every window), which keeps `memory_stints`, `memory_quests` and `overlap_messages` valid
+    // as a SQL `LIMIT`; minutes and hours may be fractions; 0 is a real setting for the ones
+    // that are thresholds.
     const isNumber = (value: unknown): value is number =>
       typeof value === "number" && Number.isFinite(value);
     const count = typed(
       "a whole number, 0 or more",
-      (value): value is number => isNumber(value) && Number.isInteger(value) && value >= 0,
+      (value): value is number => isNumber(value) && Number.isSafeInteger(value) && value >= 0,
     );
     const amount = typed(
       "a number, 0 or more",
@@ -259,6 +263,7 @@ export function loadIntentConfig(
       stintMinMinutes: amount("stint_min_minutes", config.w5.stintMinMinutes),
       memoryHours: amount("memory_hours", config.w5.memoryHours),
       memoryStints: count("memory_stints", config.w5.memoryStints),
+      memoryQuests: count("memory_quests", config.w5.memoryQuests),
       overlapMessages: count("overlap_messages", config.w5.overlapMessages),
       mode: parseChoice(w5.mode, W5_MODES, config.w5.mode, "[w5].mode", reporter),
       inferenceFallback: boolean("inference_fallback", config.w5.inferenceFallback),

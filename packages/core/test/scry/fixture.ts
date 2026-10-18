@@ -38,6 +38,7 @@ export const w5Config: W5Config = {
   stintIdleMinutes: 45,
   memoryHours: 8,
   memoryStints: 10,
+  memoryQuests: 20,
   overlapMessages: 3,
   mode: "declared",
   inferenceFallback: true,

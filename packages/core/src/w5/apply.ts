@@ -37,6 +37,11 @@ export interface AppliedSummary {
    * A matched stint that had no quest, for which the classifier proposed one.
    */
   questProposedOnMatched: number;
+  /**
+   * A matched stint that had no quest, for which the classifier named an open
+   * quest the window offered, now attached to it.
+   */
+  questAttachedOnMatched: number;
 }
 
 export interface ApplyOptions {
@@ -133,6 +138,16 @@ interface ResolvedStint {
   questConflict: boolean;
   unknownStintId: boolean;
   questProposedOnMatched: boolean;
+  questAttachedOnMatched: boolean;
+}
+
+/**
+ * What a segment may attach a quest to: the open quests and this session's open
+ * stints the window offered.
+ */
+interface AttachTargets {
+  questIds: ReadonlySet<string>;
+  stintIds: ReadonlySet<string>;
 }
 
 interface StintState {
@@ -189,9 +204,23 @@ function resolveQuest(
  *   segment a conflict.
  * - a different non-null `matchedQuest` is a real disagreement: counted, logged,
  *   never applied.
- * - `proposedQuest` on a matched stint that has *no* quest is the one case
- *   where something is missing rather than contested, so the quest is created and
+ * - `proposedQuest` on a matched stint that has *no* quest is a case where
+ *   something is missing rather than contested, so the quest is created and
  *   attached through the ordinary `stint.assigned` path.
+ * - so is a non-null `matchedQuest` on a stint with *no* quest: there is nothing
+ *   to disagree with, and leaving it unattached left the stint's traces
+ *   unattributed and the same doubt repeating every window. The quest is attached
+ *   the same way, but only when it is one of the open quests the window offered
+ *   and the stint is one of this session's open stints the window offered
+ *   (`attachable`); otherwise it stays a doubt. A quest id outside the list
+ *   (garbled, abandoned, merged) and a stint of another session or project, or
+ *   one the window never offered, are not this segment's to claim.
+ *
+ *   Attaching is not local to the segment: `traces` carry no quest of their own,
+ *   they take it from their stint, so one segment's `matchedQuest` puts every
+ *   earlier trace of the stint under that quest too. That is the point (they were
+ *   unattributed), and why it is limited to this session's stints; it is counted
+ *   (`questAttachedOnMatched`) and logged, never silent.
  */
 function reuseStint(
   store: EventStore,
@@ -200,9 +229,30 @@ function reuseStint(
   segment: ClassifierSegment,
   stintId: string,
   existingQuestId: string | null,
+  attachable: AttachTargets,
 ): ResolvedStint {
   const matchedQuest = segment.matchedQuest ?? null;
   const proposedQuest = segment.proposedQuest ?? null;
+
+  if (
+    existingQuestId === null &&
+    matchedQuest !== null &&
+    attachable.questIds.has(matchedQuest) &&
+    attachable.stintIds.has(stintId)
+  ) {
+    assignStint(store, database, stintId, matchedQuest, "hook");
+    return {
+      stintId,
+      questId: matchedQuest,
+      stintOpened: false,
+      questCreated: false,
+      questConflict: false,
+      unknownStintId: false,
+      questProposedOnMatched: false,
+      questAttachedOnMatched: true,
+    };
+  }
+
   const questConflict = matchedQuest !== null && matchedQuest !== (existingQuestId ?? null);
 
   if (existingQuestId === null && matchedQuest === null && proposedQuest !== null) {
@@ -222,6 +272,7 @@ function reuseStint(
       questConflict: false,
       unknownStintId: false,
       questProposedOnMatched: true,
+      questAttachedOnMatched: false,
     };
   }
 
@@ -233,6 +284,7 @@ function reuseStint(
     questConflict,
     unknownStintId: false,
     questProposedOnMatched: false,
+    questAttachedOnMatched: false,
   };
 }
 
@@ -352,6 +404,7 @@ function resolveStintForSegment(
   heroId: string,
   segment: ClassifierSegment,
   openedAt: string,
+  attachable: AttachTargets,
 ): ResolvedStint {
   let unknownStintId = false;
 
@@ -366,7 +419,15 @@ function resolveStintForSegment(
   if (typeof segment.matchedStint === "string") {
     const matched = readStint(database, segment.matchedStint);
     if (matched?.isOpen) {
-      return reuseStint(store, database, heroId, segment, segment.matchedStint, matched.questId);
+      return reuseStint(
+        store,
+        database,
+        heroId,
+        segment,
+        segment.matchedStint,
+        matched.questId,
+        attachable,
+      );
     }
     if (matched !== null) {
       continues = segment.matchedStint;
@@ -391,6 +452,7 @@ function resolveStintForSegment(
         segment,
         segment.continuesStint,
         referenced.questId,
+        attachable,
       );
     } else {
       continues = segment.continuesStint;
@@ -420,6 +482,7 @@ function resolveStintForSegment(
     questConflict: false,
     unknownStintId,
     questProposedOnMatched: false,
+    questAttachedOnMatched: false,
   };
 }
 
@@ -481,6 +544,7 @@ function resolveStintForSegmentDeclared(
       questConflict: false,
       unknownStintId: false,
       questProposedOnMatched: false,
+      questAttachedOnMatched: false,
     };
   };
 
@@ -507,6 +571,7 @@ function resolveStintForSegmentDeclared(
       questConflict: false,
       unknownStintId: false,
       questProposedOnMatched: false,
+      questAttachedOnMatched: false,
     };
   };
 
@@ -645,6 +710,7 @@ export function applyResult(
     unknownStintIds: 0,
     selectorRepaired: 0,
     questProposedOnMatched: 0,
+    questAttachedOnMatched: 0,
   };
 
   // Which quest a segment serves is now the model's per-segment call, resolved
@@ -705,6 +771,13 @@ export function applyResult(
       .filter((questId): questId is string => questId !== null),
   );
 
+  // The open quests the window offered: the only ones a matched stint with no
+  // quest may be attached to when the classifier names one.
+  const attachable: AttachTargets = {
+    questIds: new Set((window.openQuests ?? []).map((quest) => quest.id)),
+    stintIds: new Set(window.sessionOpenStints.map((stint) => stint.stintId)),
+  };
+
   for (const classified of result.segments) {
     const { segment, repairs } = declaredMode
       ? { segment: classified, repairs: [] as string[] }
@@ -726,6 +799,7 @@ export function applyResult(
       questConflict,
       unknownStintId,
       questProposedOnMatched,
+      questAttachedOnMatched,
     } = declaredMode
       ? resolveStintForSegmentDeclared(
           store,
@@ -740,7 +814,7 @@ export function applyResult(
           window.planAliases ?? {},
           planStints,
         )
-      : resolveStintForSegment(store, database, heroId, segment, segment.startedAt);
+      : resolveStintForSegment(store, database, heroId, segment, segment.startedAt, attachable);
 
     if (stintOpened) summary.stintsOpened += 1;
     if (questCreated) summary.questsProposed += 1;
@@ -754,6 +828,12 @@ export function applyResult(
       summary.questProposedOnMatched += 1;
       options.log(
         `w5 quest proposed on matched stint: stint ${stintId} had no quest, attached newly proposed ${questId ?? "none"}`,
+      );
+    }
+    if (questAttachedOnMatched) {
+      summary.questAttachedOnMatched += 1;
+      options.log(
+        `w5 quest attached to matched stint: stint ${stintId} had no quest, attached ${questId ?? "none"}`,
       );
     }
     if (questConflict) {

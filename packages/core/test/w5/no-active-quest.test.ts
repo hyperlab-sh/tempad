@@ -98,6 +98,7 @@ function classifyAndApply({ database, store }: ReturnType<typeof seed>, quest?: 
     maxMessages: 50,
     memoryHours: 8,
     memoryStints: 10,
+    memoryQuests: 20,
     overlapMessages: 3,
     windowEnd: WINDOW_END,
   });
@@ -195,6 +196,7 @@ describe("a window with no active quest and a model that says belongs: true", ()
       maxMessages: 50,
       memoryHours: 8,
       memoryStints: 10,
+      memoryQuests: 20,
       overlapMessages: 3,
       windowEnd: WINDOW_END,
     });
@@ -223,6 +225,7 @@ describe("a window whose answer lies in the overlap tail", () => {
       maxMessages: 50,
       memoryHours: 8,
       memoryStints: 10,
+      memoryQuests: 20,
       overlapMessages: 3,
       windowEnd: WINDOW_END,
     });

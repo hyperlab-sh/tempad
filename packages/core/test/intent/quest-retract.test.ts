@@ -490,7 +490,13 @@ describe("a retracted quest disappears from every surface", () => {
   });
 
   describe("classifier window", () => {
-    const memoryInput = { maxMessages: 50, memoryHours: 8, memoryStints: 10, overlapMessages: 3 };
+    const memoryInput = {
+      maxMessages: 50,
+      memoryHours: 8,
+      memoryStints: 10,
+      memoryQuests: 20,
+      overlapMessages: 3,
+    };
 
     function seedSession(database: Database) {
       database
