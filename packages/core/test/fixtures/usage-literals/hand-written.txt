@@ -1,0 +1,4 @@
+// Planted for test/cli.test.ts: usage strings written by hand instead of read from src/usage.ts.
+console.error("tempad widget frob <id> [--force]");
+console.error(`tempad sync [monday|github] --full`);
+const text = 'tempad quest merge <id> --into <id>';

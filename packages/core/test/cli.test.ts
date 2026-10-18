@@ -15,7 +15,7 @@ import { COMMAND_TREE, runSkillCommand, runSync } from "../src/cli.ts";
 import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
 import { getSyncState, setSyncState } from "../src/db/sync-state.ts";
-import { documentedPaths } from "../src/usage.ts";
+import { documentedPaths, POSITIONAL_LIMITS, usageForPath } from "../src/usage.ts";
 import { renderHookSettings } from "../src/w5/hooks.ts";
 import { withEnvironment } from "./isolation.ts";
 
@@ -457,6 +457,22 @@ function listTree(directory: string): string[] {
     .sort();
 }
 
+/**
+ * Lines (1-based) with a string literal that is a hand-written usage: `usage: tempad ...`, or
+ * a synopsis, a literal that opens with `tempad <command>` and goes on to an option or
+ * placeholder (`[`, `<`), comments aside. Strings that merely name a command (`"tempad sync --forget"`, an
+ * error like `"tempad setup: ..."`) have neither.
+ */
+function handWrittenUsageLines(source: string): number[] {
+  const synopsis = /["'`](?:usage: )?tempad [a-z0-9][^"'`$]*[[<]|["'`]usage: tempad /;
+  const lines: number[] = [];
+  source.split("\n").forEach((line, index) => {
+    if (/^\s*(?:\/\/|\/?\*)/.test(line)) return;
+    if (synopsis.test(line)) lines.push(index + 1);
+  });
+  return lines;
+}
+
 describe("cli --help on every command and subcommand", () => {
   const paths: string[][] = [];
   for (const [command, nested] of Object.entries(COMMAND_TREE)) {
@@ -478,12 +494,80 @@ describe("cli --help on every command and subcommand", () => {
     const offenders: string[] = [];
     for await (const file of new Glob("**/*.ts").scan(join(import.meta.dir, "..", "src"))) {
       if (file === "usage.ts") continue;
-      const lines = readFileSync(join(import.meta.dir, "..", "src", file), "utf8").split("\n");
-      lines.forEach((line, index) => {
-        if (/["'`]usage: tempad /.test(line)) offenders.push(`${file}:${index + 1}`);
-      });
+      const source = readFileSync(join(import.meta.dir, "..", "src", file), "utf8");
+      for (const line of handWrittenUsageLines(source)) offenders.push(`${file}:${line}`);
     }
     expect(offenders).toEqual([]);
+  });
+
+  test("the usage guard catches a planted literal and ignores strings that only name a command", () => {
+    const fixtures = join(import.meta.dir, "fixtures", "usage-literals");
+    expect(handWrittenUsageLines(readFileSync(join(fixtures, "hand-written.txt"), "utf8"))).toEqual(
+      [2, 3, 4],
+    );
+    expect(handWrittenUsageLines(readFileSync(join(fixtures, "clean.txt"), "utf8"))).toEqual([]);
+    // The old prefix is still caught.
+    expect(handWrittenUsageLines('const text = "usage: tempad rebuild";')).toEqual([1]);
+  });
+
+  test("POSITIONAL_LIMITS has an entry for every leaf of COMMAND_TREE and for nothing else", () => {
+    const { table } = documentedPaths();
+    const leaves = table.filter((path) => !table.some((other) => other.startsWith(`${path} `)));
+    const expected = [...new Set([...leaves, "sync"])].sort();
+    expect(Object.keys(POSITIONAL_LIMITS).sort()).toEqual(expected);
+  });
+
+  test("an extra positional on any path is a usage error: that path's usage on stderr, exit 2", async () => {
+    const sandbox = makeSandbox();
+    try {
+      configure(sandbox);
+      const failures: string[] = [];
+      const paths = Object.keys(POSITIONAL_LIMITS);
+      for (let start = 0; start < paths.length; start += 8) {
+        await Promise.all(
+          paths.slice(start, start + 8).map(async (joined) => {
+            const path = joined.split(" ");
+            // `sync`'s one positional is a source, and an unknown one is its own error.
+            const filler = Array.from({ length: POSITIONAL_LIMITS[joined] ?? 0 }, () =>
+              joined === "sync" ? "monday" : "x",
+            );
+            const result = await runCli(sandbox, [...path, ...filler, "extra"]);
+            const usage = usageForPath(path)[1]?.trim() ?? "missing";
+            if (
+              result.exitCode !== 2 ||
+              result.stdout !== "" ||
+              !result.stderr.includes('unexpected argument "extra"') ||
+              !result.stderr.includes(usage) ||
+              result.stderr.includes("tempad --help | -h")
+            ) {
+              failures.push(`${joined}: exit ${result.exitCode}, stderr ${result.stderr}`);
+            }
+          }),
+        );
+      }
+      expect(failures).toEqual([]);
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
+  test("flags and their values are not positionals", async () => {
+    const sandbox = makeSandbox();
+    try {
+      configure(sandbox);
+      for (const args of [
+        ["scry", "--days", "3", "--json"],
+        ["review", "--days=2"],
+      ]) {
+        const result = await runCli(sandbox, args);
+        expect(result.stderr).not.toContain("unexpected argument");
+      }
+      const terminated = await runCli(sandbox, ["rebuild", "--", "extra"]);
+      expect(terminated.exitCode).toBe(2);
+      expect(terminated.stderr).toContain('unexpected argument "extra"');
+    } finally {
+      cleanup(sandbox);
+    }
   });
 
   test("each path's help carries the options its command requires", async () => {

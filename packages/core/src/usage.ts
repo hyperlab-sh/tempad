@@ -337,6 +337,134 @@ export function walkPath(command: string, args: string[]): WalkedPath {
   return { ok: true, path };
 }
 
+/**
+ * How many positional arguments each runnable path takes after the path itself. `walkPath`
+ * only catches an unknown word where a subcommand may stand, so this is what turns
+ * `rebuild bogus`, `party list bogus` or `sync --full bogus` into a usage error. Every leaf of
+ * `COMMAND_TREE` and `sync` (whose one positional is the source) needs an entry; a test walks
+ * the table, so a new command cannot slip through.
+ */
+export const POSITIONAL_LIMITS: Readonly<Record<string, number>> = {
+  "hero init": 1,
+  "party add": 2,
+  "party leave": 1,
+  "party list": 0,
+  "client add": 2,
+  "saga add": 1,
+  "saga reword": 2,
+  "saga replace": 2,
+  "saga end": 1,
+  "saga edit": 2,
+  "saga list": 0,
+  "quest add": 1,
+  "quest reword": 2,
+  "quest replace": 2,
+  "quest end": 1,
+  "quest edit": 2,
+  "quest confirm": 1,
+  "quest merge": 1,
+  "quest pause": 1,
+  "quest resume": 1,
+  "quest done": 1,
+  "quest abandon": 1,
+  "quest branch": 1,
+  "quest return": 1,
+  "quest retract": 1,
+  "quest delete": 1,
+  "quest declare": 0,
+  "quest list": 0,
+  "stint list": 0,
+  "trace list": 0,
+  "impact set": 2,
+  "impact list": 0,
+  "impact import": 1,
+  answer: 1,
+  rebuild: 0,
+  setup: 0,
+  init: 0,
+  sync: 1,
+  "sync monday": 0,
+  "sync github": 0,
+  "sync claude": 0,
+  "report daily": 0,
+  "report project": 0,
+  "report hourly": 0,
+  "report weekly": 0,
+  "w5 enqueue": 0,
+  "w5 context": 0,
+  "w5 run": 0,
+  "w5 hook install": 0,
+  "w5 hook uninstall": 0,
+  "w5 backfill": 0,
+  "w5 dedupe": 0,
+  "w5 eval": 0,
+  quiet: 1,
+  review: 0,
+  scry: 0,
+  "schedule install": 0,
+  "schedule remove": 0,
+  "schedule status": 0,
+  "skill install": 0,
+  "project register": 1,
+  "project list": 0,
+  "project reresolve": 1,
+};
+
+/** Flags that stand alone; every other flag takes the argument after it as its value. */
+const BOOLEAN_FLAGS = new Set([
+  "--all",
+  "--belongs",
+  "--detached",
+  "--dry-run",
+  "--fast",
+  "--force",
+  "--forced",
+  "--forget",
+  "--full",
+  "--json",
+  "--no-verify",
+  "--non-interactive",
+  "--open",
+  "--pull",
+  "--push",
+  "--side",
+  "--unconfirmed",
+]);
+
+/** The positional arguments of `args`: what is left once flags and their values are skipped. */
+function positionalsOf(args: string[]): string[] {
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] as string;
+    if (argument === "--") {
+      positionals.push(...args.slice(index + 1));
+      break;
+    }
+    if (!argument.startsWith("-")) {
+      positionals.push(argument);
+      continue;
+    }
+    if (!argument.includes("=") && !BOOLEAN_FLAGS.has(argument)) index += 1;
+  }
+  return positionals;
+}
+
+/**
+ * The first positional of `args` past what `path` takes, as a usage error, or `null`. `args`
+ * are the arguments after the command, including the words `walkPath` consumed for `path`.
+ */
+export function checkPositionals(path: string[], args: string[]): HelpResolution | null {
+  const limit = POSITIONAL_LIMITS[path.join(" ")];
+  if (limit === undefined) return null;
+  const extra = positionalsOf(args)[path.length - 1 + limit];
+  if (extra === undefined) return null;
+  return {
+    ok: false,
+    message: `tempad: unexpected argument "${extra}" for tempad ${path.join(" ")}`,
+    lines: usageForPath(path),
+  };
+}
+
 /** Every path of `COMMAND_TREE` and every path a usage entry documents, for the drift test. */
 export function documentedPaths(): { table: string[]; usage: string[] } {
   const table = Object.entries(COMMAND_TREE).flatMap(([command, nested]) => [
