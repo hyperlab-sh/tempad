@@ -5,7 +5,7 @@
 -- only costs a refill. A kind set by hand is a human decision and lives in
 -- the event log instead (`session.kind_set`, projected into
 -- session_kind_overrides), which wins over this table.
-CREATE TABLE session_kind (
+CREATE TABLE IF NOT EXISTS session_kind (
   session_id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('human', 'lead', 'subagent', 'automated')),
   source TEXT NOT NULL,

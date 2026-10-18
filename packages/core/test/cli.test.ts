@@ -593,7 +593,7 @@ describe("cli --help on every command and subcommand", () => {
   test("POSITIONAL_LIMITS has an entry for every leaf of COMMAND_TREE and for nothing else", () => {
     const { table } = documentedPaths();
     const leaves = table.filter((path) => !table.some((other) => other.startsWith(`${path} `)));
-    const expected = [...new Set([...leaves, "sync"])].sort();
+    const expected = [...new Set([...leaves, "sync", "sessions"])].sort();
     expect(Object.keys(POSITIONAL_LIMITS).sort()).toEqual(expected);
   });
 
@@ -609,10 +609,13 @@ describe("cli --help on every command and subcommand", () => {
             const path = joined.split(" ");
             const filler = Array.from({ length: POSITIONAL_LIMITS[joined] ?? 0 }, () => "x");
             // `sync`'s one positional is a source: past a flag the walk leaves it to the limit.
+            // `sessions` is runnable beside its `kind` child, so the filler rides a flag value.
             const argv =
               joined === "sync"
                 ? ["sync", "--full", "monday", "extra"]
-                : [...path, ...filler, "extra"];
+                : joined === "sessions"
+                  ? ["sessions", "--kind", "human", "extra"]
+                  : [...path, ...filler, "extra"];
             const result = await runCli(sandbox, argv);
             const usage = usageForPath(path)[1]?.trim() ?? "missing";
             if (
@@ -823,6 +826,8 @@ describe("cli --help on every command and subcommand", () => {
       ],
       init: ["init", "--home", "/tmp/x"],
       sync: ["sync", "monday", "--full"],
+      sessions: ["sessions", "--days", "7", "--kind", "human"],
+      "sessions kind": ["sessions", "kind", "s1", "--set", "human"],
       "sync monday": ["sync", "monday", "--full"],
       "sync github": ["sync", "github", "--full"],
       "sync claude": ["sync", "claude", "--full"],
