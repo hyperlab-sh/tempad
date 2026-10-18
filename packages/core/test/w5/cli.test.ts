@@ -777,7 +777,10 @@ describe("tempad review", () => {
     });
 
     const line = lines.find((candidate) => candidate.includes("Q-shift expired"));
-    expect(line).toContain('tempad answer Q-shift --quest <id>|new:"<title>" --why "<reason>"');
+    expect(line).toContain('  tempad answer Q-shift --quest <quest-id> --why "<reason>"\n');
+    expect(line).toContain(
+      '  tempad answer Q-shift --quest new:"<title>" --why "<reason>" [--origin',
+    );
     expect(line).not.toContain("--belongs");
   });
 
