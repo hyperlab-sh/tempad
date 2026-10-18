@@ -266,6 +266,7 @@ export interface EvalMetrics {
   guessDefaulted: number;
   sessionNoteTruncated: number;
   selectorAmbiguous: number;
+  selectorRepaired: number;
   sessionsDeclared: number;
   sessionsInferred: number;
   stintsDismissed: number;
@@ -606,6 +607,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
     guessDefaulted: backfillResult.guessDefaulted,
     sessionNoteTruncated: backfillResult.sessionNoteTruncated,
     selectorAmbiguous: backfillResult.selectorAmbiguous,
+    selectorRepaired: backfillResult.selectorRepaired,
     sessionsDeclared: backfillResult.sessionsDeclared,
     sessionsInferred: backfillResult.sessionsInferred,
     stintsDismissed: stintsDismissedCount.count,

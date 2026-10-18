@@ -52,6 +52,12 @@ interface StintRow {
 /**
  * A stint plus the `what`/`why` of its latest live trace and its last trace's
  * `ended_at`. `traces.session_id` decides which session a stint belongs to.
+ *
+ * The latest trace is the latest one that started before the window's end (the
+ * first `?`), not the latest now: with later windows already classified, as a
+ * `--force` re-run or a gap-filling backfill sees, "latest" would otherwise be
+ * a trace from the window's future, leaking its text and moving the stint to
+ * that trace's session.
  */
 const ACTIVITY_SLICE_SELECT = `
   SELECT stints.id as stintId,
@@ -67,6 +73,7 @@ const ACTIVITY_SLICE_SELECT = `
     JOIN traces latest ON latest.id = (
            SELECT traces.id FROM traces
             WHERE traces.stint_id = stints.id AND traces.retracted_at IS NULL
+              AND traces.started_at < ?
             ORDER BY traces.ended_at DESC LIMIT 1)
     LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
    WHERE stints.retracted_at IS NULL
@@ -135,6 +142,10 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
 
   const mode = input.mode ?? "declared";
 
+  // A stint opened after this window ended did not exist yet when the window
+  // happened, so it is never a candidate -- see `windowEnd` on `BuildWindowInput`.
+  const windowEnd = input.windowEnd ?? new Date().toISOString();
+
   const openQuests =
     mode === "inferred"
       ? (database
@@ -142,17 +153,28 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
             `SELECT quests.id as id, quests.title as title, quests.outcome as outcome,
               (SELECT MAX(traces.started_at) FROM traces
                  JOIN stints ON stints.id = traces.stint_id
-                WHERE stints.quest_id = quests.id) as lastStintAt
+                WHERE stints.quest_id = quests.id AND traces.started_at < ?) as lastStintAt
          FROM quests
-        WHERE quests.state IN ('started', 'resumed')
-          AND quests.merged_into IS NULL
-          AND quests.retracted_at IS NULL
+        WHERE COALESCE(
+                (SELECT json_extract(events.payload, '$.state') FROM events
+                  WHERE events.kind = 'quest.lifecycle' AND events.subject = quests.id
+                    AND events.at <= ?
+                  ORDER BY events.uid DESC LIMIT 1),
+                'started') IN ('started', 'resumed')
+          AND (quests.merged_into IS NULL
+               OR NOT EXISTS (SELECT 1 FROM events
+                               WHERE events.kind = 'quest.merged' AND events.subject = quests.id
+                                 AND events.at <= ?))
+          AND (quests.retracted_at IS NULL OR quests.retracted_at > ?)
+          AND (quests.created_at <= ?
+               OR EXISTS (SELECT 1 FROM stints WHERE stints.quest_id = quests.id
+                             AND stints.opened_at < ?))
           AND (
             quests.owner_kind = 'hero'
             OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)
           )`,
           )
-          .all(session.org) as {
+          .all(windowEnd, windowEnd, windowEnd, windowEnd, windowEnd, windowEnd, session.org) as {
           id: string;
           title: string;
           outcome: string | null;
@@ -160,22 +182,31 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
         }[])
       : undefined;
 
-  // A stint opened after this window ended did not exist yet when the window
-  // happened, so it is never a candidate -- see `windowEnd` on `BuildWindowInput`.
-  const windowEnd = input.windowEnd ?? new Date().toISOString();
+  // "Open" is as of the window's end: a stint that closed at or after it was
+  // still open when the window happened, so with later windows already
+  // classified it is offered as open here rather than as a closed one to
+  // continue (which would link an overlapping stint to it).
+  const openAsOfWindow = <T extends { closedAt: string | null; closeReason: string | null }>(
+    row: T,
+  ): T =>
+    row.closedAt !== null && row.closedAt >= windowEnd
+      ? { ...row, closedAt: null, closeReason: null }
+      : row;
 
-  const sessionOpenStints = database
-    .query(
-      `${ACTIVITY_SLICE_SELECT}
-         AND stints.closed_at IS NULL
+  const sessionOpenStints = (
+    database
+      .query(
+        `${ACTIVITY_SLICE_SELECT}
+         AND (stints.closed_at IS NULL OR stints.closed_at >= ?)
          AND stints.opened_at < ?
          AND latest.session_id = ?
        ORDER BY stints.opened_at ASC`,
-    )
-    .all(windowEnd, input.sessionId) as (StintRow & {
-    closedAt: string | null;
-    closeReason: string | null;
-  })[];
+      )
+      .all(windowEnd, windowEnd, windowEnd, input.sessionId) as (StintRow & {
+      closedAt: string | null;
+      closeReason: string | null;
+    })[]
+  ).map(openAsOfWindow);
 
   // The reference time for "recent": where this window starts, so backfill windows
   // see the same slice a live run would have seen at that point in the session.
@@ -188,26 +219,30 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
   // closes a stint, and returning to it afterwards is exactly a `continues`
   // link. Still-open ones are already in `sessionOpenActivities`, so no stint
   // appears in both slices.
-  const recentStints = database
-    .query(
-      `${ACTIVITY_SLICE_SELECT}
+  const recentStints = (
+    database
+      .query(
+        `${ACTIVITY_SLICE_SELECT}
          AND stints.opened_at < ?
          AND (stints.closed_at IS NULL OR stints.closed_at >= ?)
          AND (stints.opened_at >= ? OR stints.closed_at >= ?)
-         AND (latest.session_id != ? OR stints.closed_at IS NOT NULL)
+         AND (latest.session_id != ? OR (stints.closed_at IS NOT NULL AND stints.closed_at < ?))
          AND latest.place = ?
        ORDER BY COALESCE(stints.closed_at, stints.opened_at) DESC
        LIMIT ?`,
-    )
-    .all(
-      windowEnd,
-      memoryCutoff,
-      memoryCutoff,
-      memoryCutoff,
-      input.sessionId,
-      `${session.org}/${session.project}`,
-      input.memoryStints,
-    ) as (StintRow & { closedAt: string | null; closeReason: string | null })[];
+      )
+      .all(
+        windowEnd,
+        windowEnd,
+        memoryCutoff,
+        memoryCutoff,
+        memoryCutoff,
+        input.sessionId,
+        windowEnd,
+        `${session.org}/${session.project}`,
+        input.memoryStints,
+      ) as (StintRow & { closedAt: string | null; closeReason: string | null })[]
+  ).map(openAsOfWindow);
 
   const recentSideQuests =
     mode === "inferred"

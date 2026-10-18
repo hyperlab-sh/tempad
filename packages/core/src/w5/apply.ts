@@ -6,7 +6,12 @@ import { currentHeroId } from "../intent/identity";
 import { newUlid } from "../intent/ids";
 import { applyIncremental } from "../intent/projections";
 import type { EventStore } from "../intent/store";
-import type { ClassifierResult, ClassifierSegment, ClassifierWindow } from "./classifier";
+import {
+  type ClassifierResult,
+  type ClassifierSegment,
+  type ClassifierWindow,
+  DEFAULT_NEW_STINT_REASON,
+} from "./classifier";
 import { openStintContinuing } from "./lifecycle";
 
 export interface AppliedSummary {
@@ -22,6 +27,12 @@ export interface AppliedSummary {
    */
   doubts: number;
   unknownStintIds: number;
+  /**
+   * Inference mode: segments whose quest/stint selectors were repaired because
+   * the model put a quest id where a stint id belongs or the reverse
+   * (`normalizeInferredSelectors`).
+   */
+  selectorRepaired: number;
   /**
    * A matched stint that had no quest, for which the classifier proposed one.
    */
@@ -225,6 +236,116 @@ function reuseStint(
   };
 }
 
+/**
+ * A repaired segment is a guess about what the model meant, so its confidence is
+ * capped. The cap is bookkeeping, not a signal: the low-confidence list in
+ * reports uses `< 0.5`, so a capped segment never appears in it, and nothing else
+ * reads `confidence`. `selectorRepaired` is the signal that repairs happened.
+ */
+const REPAIRED_CONFIDENCE_CAP = 0.5;
+
+/**
+ * Inference mode lists quests and stints by their 26-character ULIDs in one
+ * prompt, and the model mixes the two up: the 2026-10-18 backfill logged 345
+ * `w5 unknown stint id` lines and 236 of them named a *quest* in a stint slot
+ * (a stint id sat in `matchedQuest` as well). Every such segment opened an
+ * unlinked stint, so one stretch of work became a stint per window.
+ *
+ * Every repaired id is resolved against the window's own candidate lists only
+ * (`sessionOpenStints`, `recentStints`, `openQuests`), never the database: those
+ * are bounded by `windowEnd` and filtered by state, so a repair cannot reach a
+ * stint opened after the segment, a quest that was abandoned or merged, or
+ * another session's open stint. The lists are also what the model was shown, so
+ * an id outside them (garbled, another table's) is not a mix-up and stays
+ * unknown.
+ *
+ * - A quest named in `matchedStint`/`continuesStint` is read as "this quest's
+ *   work continues": the session's open stint of that quest is reused, else
+ *   the most recent closed stint of that quest in `recentStints` (the project's,
+ *   so possibly another session's: the prompt offers those to resume too) is
+ *   continued, else a new stint is opened. The quest becomes `matchedQuest` when none was given. When
+ *   `matchedQuest` names a *different* quest the segment keeps that one and the
+ *   stint slot is dropped, so a new stint never links across quests.
+ * - A stint named in `matchedQuest` stands for that stint's quest, so the normal
+ *   conflict check against `matchedStint` still runs. It is promoted to the
+ *   stint selector only when the segment named none and its reason is the
+ *   defaulted one (an explicit `newStintReason` is the model's own judgement),
+ *   and only for this session's open stint or a closed one.
+ */
+function normalizeInferredSelectors(
+  window: ClassifierWindow,
+  segment: ClassifierSegment,
+): { segment: ClassifierSegment; repairs: string[] } {
+  const repairs: string[] = [];
+  let matchedStint = segment.matchedStint ?? null;
+  let continuesStint = segment.continuesStint ?? null;
+  let matchedQuest = segment.matchedQuest ?? null;
+  let newStintReason = segment.newStintReason ?? null;
+
+  const sessionOpen = new Map(window.sessionOpenStints.map((stint) => [stint.stintId, stint]));
+  const recent = new Map(window.recentStints.map((stint) => [stint.stintId, stint]));
+  const stintQuest = (id: string): string | null | undefined =>
+    (sessionOpen.get(id) ?? recent.get(id))?.questId;
+  const isStint = (id: string): boolean => sessionOpen.has(id) || recent.has(id);
+  const openQuestIds = new Set((window.openQuests ?? []).map((quest) => quest.id));
+
+  if (matchedQuest !== null && !openQuestIds.has(matchedQuest) && isStint(matchedQuest)) {
+    const named = matchedQuest;
+    const closedOrOwn = sessionOpen.has(named) || recent.get(named)?.closedAt !== null;
+    const promotable =
+      matchedStint === null &&
+      continuesStint === null &&
+      (newStintReason === null || newStintReason === DEFAULT_NEW_STINT_REASON) &&
+      closedOrOwn;
+    if (promotable) {
+      if (sessionOpen.has(named)) matchedStint = named;
+      else continuesStint = named;
+      newStintReason = null;
+    }
+    // The stint's quest stands in only while it is an open candidate: a closed
+    // stint of an abandoned or merged quest must not put that quest back.
+    const namedQuestId = stintQuest(named) ?? null;
+    matchedQuest = namedQuestId !== null && openQuestIds.has(namedQuestId) ? namedQuestId : null;
+    repairs.push(`matchedQuest named stint ${named}`);
+  }
+
+  const namedQuest = [matchedStint, continuesStint].find(
+    (id): id is string => id !== null && !isStint(id) && openQuestIds.has(id),
+  );
+  if (namedQuest !== undefined) {
+    matchedStint = null;
+    continuesStint = null;
+    if (matchedQuest === null || matchedQuest === namedQuest) {
+      const open = window.sessionOpenStints
+        .filter((stint) => stint.questId === namedQuest)
+        .sort((left, right) => (left.openedAt < right.openedAt ? 1 : -1))[0];
+      const closed = window.recentStints.find(
+        (stint) => stint.questId === namedQuest && stint.closedAt !== null,
+      );
+      if (open !== undefined) matchedStint = open.stintId;
+      else if (closed !== undefined) continuesStint = closed.stintId;
+      matchedQuest = namedQuest;
+    }
+    repairs.push(`stint selector named quest ${namedQuest}`);
+  }
+
+  if (repairs.length === 0) return { segment, repairs };
+  if (matchedStint === null && continuesStint === null && newStintReason === null) {
+    newStintReason = "classifier named a quest, no stint of it to continue";
+  }
+  return {
+    segment: {
+      ...segment,
+      matchedStint,
+      continuesStint,
+      matchedQuest,
+      newStintReason,
+      confidence: Math.min(segment.confidence, REPAIRED_CONFIDENCE_CAP),
+    },
+    repairs,
+  };
+}
+
 function resolveStintForSegment(
   store: EventStore,
   database: Database,
@@ -234,22 +355,31 @@ function resolveStintForSegment(
 ): ResolvedStint {
   let unknownStintId = false;
 
-  // `matchedStint` means "this stretch of attention is still going", so it is
-  // only honoured for a stint that is actually still open.
+  // `matchedStint` means "this stretch of attention is still going", so a stint
+  // that is still open is reused. One that has since closed is a return after a
+  // gap -- the model read the same stint from the "recent" list and used the
+  // wrong selector for it -- so it becomes a `continues` link, exactly as if it
+  // had named it in `continuesStint`. Opening an unlinked stint instead
+  // fragmented one stretch of work into a stint per window. Only an id that
+  // resolves to no live stint at all is unknown.
+  let continues: string | null = null;
   if (typeof segment.matchedStint === "string") {
     const matched = readStint(database, segment.matchedStint);
     if (matched?.isOpen) {
       return reuseStint(store, database, heroId, segment, segment.matchedStint, matched.questId);
     }
-    unknownStintId = true;
+    if (matched !== null) {
+      continues = segment.matchedStint;
+    } else {
+      unknownStintId = true;
+    }
   }
 
   // `continuesStint` means "the same outcome, resumed after a gap", so it is
   // only a link when the stint it names has actually closed. Pointing it at a
   // still-open stint says the attention never stopped: that is a plain reuse,
   // and opening a second row would leave two open stints for one outcome.
-  let continues: string | null = null;
-  if (typeof segment.continuesStint === "string") {
+  if (continues === null && typeof segment.continuesStint === "string") {
     const referenced = readStint(database, segment.continuesStint);
     if (referenced === null) {
       unknownStintId = true;
@@ -513,6 +643,7 @@ export function applyResult(
     questionsWatching: 0,
     doubts: 0,
     unknownStintIds: 0,
+    selectorRepaired: 0,
     questProposedOnMatched: 0,
   };
 
@@ -574,7 +705,14 @@ export function applyResult(
       .filter((questId): questId is string => questId !== null),
   );
 
-  for (const segment of result.segments) {
+  for (const classified of result.segments) {
+    const { segment, repairs } = declaredMode
+      ? { segment: classified, repairs: [] as string[] }
+      : normalizeInferredSelectors(window, classified);
+    if (repairs.length > 0) summary.selectorRepaired += 1;
+    for (const repair of repairs) {
+      options.log(`w5 stint selector repaired: session ${window.sessionId}, ${repair}`);
+    }
     // A stint opens when the work started, not when the classifier ran. For a
     // live run the two are minutes apart, but backfill classifies history with
     // `now` set to the run's own clock: stamping `opened_at` with it put every

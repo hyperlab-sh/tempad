@@ -757,6 +757,7 @@ describe("w5 eval", () => {
 
     expect(metrics.selectorDefaulted).toBe(1);
     expect(metrics.selectorAmbiguous).toBe(0);
+    expect(metrics.selectorRepaired).toBe(0);
     expect(metrics.traces).toBe(1);
   });
 

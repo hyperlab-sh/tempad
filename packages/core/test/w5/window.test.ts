@@ -799,3 +799,231 @@ describe("declared quests in the window", () => {
     expect(Object.keys(window.openStintAliases).every((alias) => /^S\d+$/.test(alias))).toBe(true);
   });
 });
+
+describe("window slice as of the window's end", () => {
+  const windowEnd = "2026-09-04T15:20:00.000Z";
+  const base = { sessionId: "s1", sinceTs: null, mode: "inferred" as const, ...memoryInput };
+
+  function insertTrace(
+    database: ReturnType<typeof openDatabase>,
+    input: { id: string; stint: string; session: string; startedAt: string; what: string },
+  ) {
+    database
+      .query(
+        `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
+         VALUES (?, ?, 'claude-code', 'personal/marko-ui', 'session', ?, ?, 'hero', ?, 'ship', 'personal/marko-ui', 'claude-code', 0.9, 'assistant', ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.stint,
+        input.startedAt,
+        input.startedAt,
+        input.what,
+        input.session,
+        input.startedAt,
+      );
+  }
+
+  test("a stint that closed after the window ended was open at the window and is offered as open", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedOpenStint(database);
+    // Later windows were already classified: A1 has since closed, at 16:00.
+    database
+      .query(
+        "UPDATE stints SET closed_at = '2026-09-04T16:00:00.000Z', close_reason = 'idle' WHERE id = 'A1'",
+      )
+      .run();
+
+    const window = buildWindow(database, { ...base, windowEnd });
+
+    expect(window.sessionOpenStints.map((stint) => stint.stintId)).toEqual(["A1"]);
+    expect(window.recentStints.map((stint) => stint.stintId)).toEqual([]);
+  });
+
+  test("a stint that closed before the window ended is still offered as closed", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedOpenStint(database);
+    database
+      .query(
+        "UPDATE stints SET closed_at = '2026-09-04T15:00:00.000Z', close_reason = 'idle' WHERE id = 'A1'",
+      )
+      .run();
+
+    const window = buildWindow(database, { ...base, windowEnd });
+
+    expect(window.sessionOpenStints).toEqual([]);
+    expect(window.recentStints.map((stint) => stint.stintId)).toEqual(["A1"]);
+  });
+
+  test("another session's stint that closed after the window is shown as still open", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedEarlierSession(database);
+    database
+      .query(
+        "UPDATE stints SET closed_at = '2026-09-04T17:00:00.000Z', close_reason = 'session_end' WHERE id = 'A0'",
+      )
+      .run();
+
+    const window = buildWindow(database, { ...base, windowEnd, memoryHours: 240 });
+
+    expect(window.recentStints.map((stint) => [stint.stintId, stint.closedAt])).toEqual([
+      ["A0", null],
+    ]);
+  });
+
+  test("a trace that started after the window ended neither names the stint nor moves it to another session", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedOpenStint(database);
+    insertTrace(database, {
+      id: "T-later",
+      stint: "A1",
+      session: "s-other",
+      startedAt: "2026-09-04T15:50:00.000Z",
+      what: "work from the window's future",
+    });
+
+    const window = buildWindow(database, { ...base, windowEnd });
+
+    expect(window.sessionOpenStints.map((stint) => [stint.stintId, stint.what])).toEqual([
+      ["A1", "fixing walk order"],
+    ]);
+  });
+
+  describe("open quests", () => {
+    function insertQuest(
+      database: ReturnType<typeof openDatabase>,
+      id: string,
+      columns: {
+        state?: string;
+        createdAt?: string;
+        mergedInto?: string;
+        retractedAt?: string;
+      } = {},
+    ) {
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, merged_into, retracted_at, created_at)
+           VALUES (?, 'hero', 'H1', ?, 'o', 1, 1, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          id,
+          columns.state ?? "started",
+          columns.mergedInto ?? null,
+          columns.retractedAt ?? null,
+          columns.createdAt ?? "2026-09-01T00:00:00.000Z",
+        );
+    }
+
+    function lifecycle(store: EventStore, quest: string, state: string, at: string) {
+      store.append({
+        actor: "hero",
+        kind: "quest.lifecycle",
+        subject: quest,
+        at,
+        payload: { state },
+      });
+    }
+
+    const openIds = (database: ReturnType<typeof openDatabase>) =>
+      (buildWindow(database, { ...base, windowEnd }).openQuests ?? []).map((quest) => quest.id);
+
+    test("a quest created after the window ended is not offered", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      insertQuest(database, "Q-before");
+      insertQuest(database, "Q-future", { createdAt: "2026-09-06T00:00:00.000Z" });
+
+      expect(openIds(database)).toEqual(["Q-before"]);
+    });
+
+    test("a quest created at run time but already used by a stint before the window is offered", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      // Backfill stamps an inferred quest with the run's clock, not the segment's.
+      insertQuest(database, "Q-inferred", { createdAt: "2026-10-18T08:55:44.678Z" });
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('A-used', 'Q-inferred', 'work', '2026-09-04T14:00:00.000Z', 1)",
+        )
+        .run();
+
+      expect(openIds(database)).toEqual(["Q-inferred"]);
+    });
+
+    test("state is judged as of the window: later lifecycle events do not hide or revive a quest", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      const store = new EventStore(database);
+      // Abandoned now, but only after the window: it was open then.
+      insertQuest(database, "Q-abandoned-later", { state: "abandoned" });
+      lifecycle(store, "Q-abandoned-later", "abandoned", "2026-09-04T16:00:00.000Z");
+      // Started now, but paused before the window and resumed only after it.
+      insertQuest(database, "Q-paused-then-resumed", { state: "resumed" });
+      lifecycle(store, "Q-paused-then-resumed", "paused", "2026-09-04T14:00:00.000Z");
+      lifecycle(store, "Q-paused-then-resumed", "resumed", "2026-09-04T16:00:00.000Z");
+      // Abandoned before the window.
+      insertQuest(database, "Q-abandoned-before", { state: "abandoned" });
+      lifecycle(store, "Q-abandoned-before", "abandoned", "2026-09-04T14:00:00.000Z");
+
+      expect(openIds(database)).toEqual(["Q-abandoned-later"]);
+    });
+
+    test("a merge or retraction after the window does not hide the quest, one before does", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      const store = new EventStore(database);
+      insertQuest(database, "Q-target");
+      insertQuest(database, "Q-merged-later", { mergedInto: "Q-target" });
+      store.append({
+        actor: "hero",
+        kind: "quest.merged",
+        subject: "Q-merged-later",
+        at: "2026-09-04T16:00:00.000Z",
+        payload: { into: "Q-target" },
+      });
+      insertQuest(database, "Q-merged-before", { mergedInto: "Q-target" });
+      store.append({
+        actor: "hero",
+        kind: "quest.merged",
+        subject: "Q-merged-before",
+        at: "2026-09-04T14:00:00.000Z",
+        payload: { into: "Q-target" },
+      });
+      insertQuest(database, "Q-retracted-later", { retractedAt: "2026-09-04T16:00:00.000Z" });
+      insertQuest(database, "Q-retracted-before", { retractedAt: "2026-09-04T14:00:00.000Z" });
+
+      expect(openIds(database).sort()).toEqual(["Q-merged-later", "Q-retracted-later", "Q-target"]);
+    });
+
+    test("lastStintAt ignores traces that started after the window", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      seedOpenStint(database);
+      insertTrace(database, {
+        id: "T-later",
+        stint: "A1",
+        session: "s1",
+        startedAt: "2026-09-04T16:30:00.000Z",
+        what: "later",
+      });
+
+      const quest = buildWindow(database, { ...base, windowEnd }).openQuests?.[0];
+
+      expect(quest?.lastStintAt).toBe("2026-09-04T14:00:00.000Z");
+    });
+  });
+});
