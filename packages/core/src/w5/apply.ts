@@ -161,13 +161,15 @@ interface StintState {
  * retracted since the slice was built, so every id it hands back is looked up
  * before it is trusted.
  *
- * With `at` (the instant the segment starts) a stint that closed at or after it
- * counts as open: it was open when the work began, which is how `buildWindow`
- * offered it when later windows were already classified (a `--force` or
- * `--reclassify` re-run). Opening a `continues` stint there would overlap the
- * stint it continues.
+ * With `through` (the instant the segment ends) a stint that closed at or after
+ * it counts as open: it was still open for the whole stretch of work, which is
+ * how `buildWindow` offered it when later windows were already classified (a
+ * `--force` or `--reclassify` re-run). Opening a `continues` stint there would
+ * overlap the stint it continues. A stint that closed *inside* the segment is not
+ * open: reusing it would put a trace past its own `closed_at`, so the segment
+ * continues it instead.
  */
-function readStint(database: Database, stintId: string, at?: string): StintState | null {
+function readStint(database: Database, stintId: string, through?: string): StintState | null {
   const row = database
     .query(
       "SELECT quest_id as questId, closed_at as closedAt FROM stints WHERE id = ? AND retracted_at IS NULL AND dismissed_at IS NULL",
@@ -176,7 +178,7 @@ function readStint(database: Database, stintId: string, at?: string): StintState
   if (!row) return null;
   return {
     questId: row.questId,
-    isOpen: row.closedAt === null || (at !== undefined && row.closedAt >= at),
+    isOpen: row.closedAt === null || (through !== undefined && row.closedAt >= through),
   };
 }
 
@@ -426,7 +428,7 @@ function resolveStintForSegment(
   // resolves to no live stint at all is unknown.
   let continues: string | null = null;
   if (typeof segment.matchedStint === "string") {
-    const matched = readStint(database, segment.matchedStint, openedAt);
+    const matched = readStint(database, segment.matchedStint, segment.endedAt);
     if (matched?.isOpen) {
       return reuseStint(
         store,
@@ -450,7 +452,7 @@ function resolveStintForSegment(
   // still-open stint says the attention never stopped: that is a plain reuse,
   // and opening a second row would leave two open stints for one outcome.
   if (continues === null && typeof segment.continuesStint === "string") {
-    const referenced = readStint(database, segment.continuesStint, openedAt);
+    const referenced = readStint(database, segment.continuesStint, segment.endedAt);
     if (referenced === null) {
       unknownStintId = true;
     } else if (referenced.isOpen) {
