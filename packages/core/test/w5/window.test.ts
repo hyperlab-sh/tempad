@@ -903,6 +903,32 @@ describe("window slice as of the window's end", () => {
     ]);
   });
 
+  test("two traces ending in the same instant: the lower id names the stint", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    seedOpenStint(database);
+    // T1 (seeded) ends 14:30; two more end together at 15:00, inserted newest id first.
+    insertTrace(database, {
+      id: "T-b",
+      stint: "A1",
+      session: "s1",
+      startedAt: "2026-09-04T15:00:00.000Z",
+      what: "second of the tie",
+    });
+    insertTrace(database, {
+      id: "T-a",
+      stint: "A1",
+      session: "s1",
+      startedAt: "2026-09-04T15:00:00.000Z",
+      what: "first of the tie",
+    });
+
+    const window = buildWindow(database, { ...base, windowEnd });
+
+    expect(window.sessionOpenStints.map((stint) => stint.what)).toEqual(["first of the tie"]);
+  });
+
   describe("open quests", () => {
     function insertQuest(
       database: ReturnType<typeof openDatabase>,

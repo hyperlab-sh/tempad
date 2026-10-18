@@ -65,13 +65,17 @@ interface StintRow {
  * used to be a correlated subquery per stint, and `traces` has no index on
  * `stint_id`: with ~2000 stints that never closed that was a full scan each, 1.4 s
  * per window on real data.
+ * Two traces can end in the same instant (a window's last message ends every
+ * segment cut there, and a double backfill leaves exact duplicates); the lower id
+ * wins, which is what the correlated subquery returned on every tie in real data
+ * and what `w5 dedupe` keeps.
  */
 const ACTIVITY_SLICE_SELECT = `
   WITH ranked AS (
     SELECT traces.stint_id, traces.what, traces.why, traces.ended_at, traces.session_id,
            traces.place,
            ROW_NUMBER() OVER (
-             PARTITION BY traces.stint_id ORDER BY traces.ended_at DESC, traces.id DESC) AS rank
+             PARTITION BY traces.stint_id ORDER BY traces.ended_at DESC, traces.id ASC) AS rank
       FROM traces
      WHERE traces.retracted_at IS NULL AND traces.started_at < ?)
   SELECT stints.id as stintId,
