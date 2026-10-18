@@ -982,9 +982,9 @@ describe("prompt rendering per mode", () => {
     ],
   };
 
-  test("the inferred system prompt offers segment references, the declared one does not", () => {
+  test("both system prompts offer segment references", () => {
     expect(buildSystemPrompt("inferred")).toContain('"segment:N"');
-    expect(buildSystemPrompt("declared")).not.toContain("segment:N");
+    expect(buildSystemPrompt("declared")).toContain('"segment:N"');
   });
 
   test("the inferred system prompt asks for the pre-verifier schema, not the verifier's", () => {
@@ -1376,7 +1376,7 @@ describe("segment references in an inference result", () => {
     expect(result.segments[1]?.matchedStint).toBe("the stint of segment:1");
   });
 
-  test("a declared result is not renumbered", () => {
+  test("a declared result's stint references are renumbered like the inference selectors", () => {
     const result = validateResult(
       {
         segments: [
@@ -1385,12 +1385,70 @@ describe("segment references in an inference result", () => {
             startedAt: "2026-09-04T14:40:00.000Z",
             endedAt: "2026-09-04T14:50:00.000Z",
           },
-          { ...good.segments[0], matchedStint: "segment:2" },
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+          },
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "Segment #2",
+          },
         ],
       },
       window,
     );
 
-    expect(result.segments[0]?.matchedStint).toBe("segment:2");
+    // The overlap tail is dropped, so the reference shifts to the segment that
+    // is now first, in canonical form; the inference selectors behave the same.
+    expect(result.segments[1]?.stint).toBe("segment:1");
+    expect(result.selectorDefaulted).toBe(0);
+  });
+
+  test("a declared stint reference to a dropped, the same or a later segment is cleared to null", () => {
+    const result = validateResult(
+      {
+        segments: [
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T14:40:00.000Z",
+            endedAt: "2026-09-04T14:50:00.000Z",
+          },
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:05:00.000Z",
+            stint: "segment:1",
+          },
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:05:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "segment:3",
+          },
+          {
+            ...good.segments[0],
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "segment:0",
+          },
+        ],
+      },
+      window,
+    );
+
+    // Nothing has landed yet for a dropped, later or out-of-range reference,
+    // so the slot is cleared to null: apply's same-outcome rule may still place
+    // the segment on the previous stint, else it opens one from `what`.
+    expect(result.segments.map((kept) => kept.stint)).toEqual([null, null, null]);
+  });
+
+  test("a declared segment that named no stint keeps null and counts the default", () => {
+    const result = validateResult({ segments: [{ ...good.segments[0], stint: null }] }, window);
+
+    expect(result.segments[0]?.stint).toBeNull();
+    expect(result.selectorDefaulted).toBe(1);
   });
 });
