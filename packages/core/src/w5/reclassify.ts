@@ -14,7 +14,10 @@ export const RECLASSIFY_REASON = "reclassify";
 
 /** Why a session in the range is left exactly as it is. */
 export type ProtectionReason =
+  | "still active"
   | "declared"
+  | "on a confirmed quest"
+  | "on a quest a person changed"
   | "answered or assigned by a person"
   | "not written by w5";
 
@@ -37,6 +40,14 @@ export interface ReclassifyRange {
   /** Exclusive upper bound; when unset every later session is in range. */
   to?: string;
   hostSlug?: string;
+  /** The instant "still active" is judged against. */
+  now: string;
+  /**
+   * A session that ended less than this many minutes before `now` is still active:
+   * the live runner closes a stint only after `[w5].stint_idle_minutes` without a
+   * trace, so within that time its hook may classify the session's next window.
+   */
+  activeMinutes: number;
 }
 
 /**
@@ -61,9 +72,17 @@ function hasEventBy(database: Database, ids: string[], condition: string): boole
  * Why a session must not be reclassified, or null when everything w5 holds for it
  * is w5's own inference.
  *
+ * - **still active**: it ended within `activeMinutes` of now, so the live runner
+ *   (which does not wait for this command) may be classifying it, and both would
+ *   write the same window.
  * - **declared**: any `quest.declared` for the session. Its traces were verified
  *   against what the person declared, and re-running it would put them in the
  *   "nothing declared yet" path.
+ * - **on a confirmed quest** / **on a quest a person changed**: one of its stints
+ *   sits on a quest a person confirmed (declared quests are confirmed) or that
+ *   anything but w5 ever touched. Retracting the stint would leave the quest
+ *   without the attribution the person validated, and the classifier need not
+ *   attach the new stint to it.
  * - **answered or assigned by a person**: a `hero` event on one of its traces,
  *   stints or questions (`tempad answer`, a manual quest assignment, a reword).
  * - **not written by w5**: a live trace that no w5 actor recorded.
@@ -74,10 +93,32 @@ function hasEventBy(database: Database, ids: string[], condition: string): boole
  */
 function protectionFor(
   database: Database,
-  sessionId: string,
+  session: SessionRow,
   traces: ResetTrace[],
+  range: ReclassifyRange,
+  w5Only: (questId: string) => boolean,
 ): ProtectionReason | null {
+  const sessionId = session.id;
+  if (Date.parse(range.now) - Date.parse(session.ended_at) < range.activeMinutes * 60_000) {
+    return "still active";
+  }
   if (hasAnyDeclaration(database, sessionId)) return "declared";
+
+  const questRows =
+    traces.length === 0
+      ? []
+      : (database
+          .query(
+            `SELECT DISTINCT quests.id AS id, quests.confirmed AS confirmed FROM stints
+               JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
+              WHERE stints.id IN (SELECT value FROM json_each(?))`,
+          )
+          .all(JSON.stringify([...new Set(traces.map((trace) => trace.stint_id))])) as {
+          id: string;
+          confirmed: number;
+        }[]);
+  if (questRows.some((quest) => quest.confirmed === 1)) return "on a confirmed quest";
+  if (questRows.some((quest) => !w5Only(quest.id))) return "on a quest a person changed";
 
   const traceIds = traces.map((trace) => trace.id);
   const w5Actors = W5_ACTORS.map((actor) => `'${actor}'`).join(", ");
@@ -126,18 +167,20 @@ export function planReclassify(database: Database, range: ReclassifyRange): Recl
     hostSlug: range.hostSlug,
   });
 
+  const w5Only = (questId: string): boolean =>
+    !hasEventBy(database, [questId], `actor NOT IN (${W5_ACTORS.map((a) => `'${a}'`).join(", ")})`);
+
   const sessions: SessionRow[] = [];
   const protectedSessions: ProtectedSession[] = [];
   const traces: ResetTrace[] = [];
   for (const session of selected) {
+    // Every live trace: the session ended before `to`, so none of them can start after it.
     const sessionTraces = database
       .query(
-        `SELECT id, stint_id, session_id FROM traces
-          WHERE session_id = ? AND retracted_at IS NULL
-            ${range.to !== undefined ? "AND started_at < ?" : ""}`,
+        "SELECT id, stint_id, session_id FROM traces WHERE session_id = ? AND retracted_at IS NULL",
       )
-      .all(...(range.to !== undefined ? [session.id, range.to] : [session.id])) as ResetTrace[];
-    const reason = protectionFor(database, session.id, sessionTraces);
+      .all(session.id) as ResetTrace[];
+    const reason = protectionFor(database, session, sessionTraces, range, w5Only);
     if (reason !== null) {
       protectedSessions.push({ sessionId: session.id, reason });
       continue;
@@ -146,8 +189,6 @@ export function planReclassify(database: Database, range: ReclassifyRange): Recl
     traces.push(...sessionTraces);
   }
 
-  const w5Only = (questId: string): boolean =>
-    !hasEventBy(database, [questId], `actor NOT IN (${W5_ACTORS.map((a) => `'${a}'`).join(", ")})`);
   return {
     sessions,
     protectedSessions,
@@ -156,7 +197,6 @@ export function planReclassify(database: Database, range: ReclassifyRange): Recl
 }
 
 export interface ReclassifyOptions extends ReclassifyRange {
-  now: string;
   log: (line: string) => void;
 }
 
@@ -189,7 +229,7 @@ export async function reclassify(
     clearWindowCoverage: false,
   });
   options.log(
-    `reclassify: retracted traces=${reset.traces} stints=${reset.stints} quests=${reset.quests}`,
+    `reclassify: retracted traces=${reset.traces} stints=${reset.stints} quests=${reset.quests}, closed questions=${reset.questions} continuations=${reset.continuations}`,
   );
 
   const result = await backfill(database, config, intentConfig, classifier, {

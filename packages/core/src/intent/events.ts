@@ -28,6 +28,7 @@ export const EVENT_KINDS = [
   "stint.closed",
   "stint.dismissed",
   "stint.assigned",
+  "stint.continuation_cleared",
   "trace.recorded",
   "trace.relinked",
   "question.asked",

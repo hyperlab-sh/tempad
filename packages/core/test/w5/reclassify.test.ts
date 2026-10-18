@@ -1,16 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
+import { runIntentCommand } from "../../src/intent/cli";
 import { defaultIntentConfig } from "../../src/intent/config";
 import { declareQuest } from "../../src/intent/declarations";
 import { applyIncremental, ensureTables, rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
-import { runW5Command } from "../../src/w5/cli";
+import { runReviewCommand, runW5Command } from "../../src/w5/cli";
+import { advanceQuestions } from "../../src/w5/questions";
 import {
   BackupError,
   backupDatabase,
@@ -18,12 +20,15 @@ import {
   RECLASSIFY_REASON,
   reclassify,
 } from "../../src/w5/reclassify";
+import { applyReset, planReset } from "../../src/w5/reset";
 
 registerAllProjections();
 
 type TestDatabase = ReturnType<typeof openDatabase>;
 
 const FROM = "2026-09-04T00:00:00.000Z";
+/** Judged long after every seeded session ended, so none is still active. */
+const IDLE = { now: "2026-10-01T00:00:00.000Z", activeMinutes: 45 };
 
 function makeConfig(home: string): Config {
   return {
@@ -166,6 +171,7 @@ function seedWorld(database: TestDatabase, store: EventStore) {
   ensureTables(database);
   append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
   seedInferred(database, store, "s-inferred");
+  seedInferred(database, store, "s-inferred-two");
   seedInferred(database, store, "s-confirmed", { confirmedQuest: true });
   seedInferred(database, store, "s-declared");
   declareQuest(store, database, {
@@ -178,8 +184,15 @@ function seedWorld(database: TestDatabase, store: EventStore) {
     heroId: "H1",
   });
   seedInferred(database, store, "s-assigned");
-  // A person moved this session's stint to a quest of their own.
-  append(database, store, "hero", "stint.assigned", "A-s-assigned", { quest: "Q-s-confirmed" });
+  // A person moved this session's stint to another (unconfirmed) quest.
+  append(database, store, "hook", "quest.created", "Q-other", {
+    owner: { kind: "hero", id: "H1" },
+    title: "another quest",
+    outcome: "o",
+    commitment: "focused",
+    confirmed: false,
+  });
+  append(database, store, "hero", "stint.assigned", "A-s-assigned", { quest: "Q-other" });
   seedInferred(database, store, "s-manual", { traceActor: "hero" });
   seedInferred(database, store, "s-old", { endedAt: "2026-08-01T15:00:00.000Z" });
 }
@@ -215,27 +228,27 @@ describe("planReclassify", () => {
     const database = openDatabase(":memory:");
     seedWorld(database, new EventStore(database));
 
-    const plan = planReclassify(database, { from: FROM });
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
 
     expect(plan.sessions.map((session) => session.id).sort()).toEqual([
-      "s-confirmed",
       "s-inferred",
+      "s-inferred-two",
     ]);
     expect(
       Object.fromEntries(plan.protectedSessions.map((entry) => [entry.sessionId, entry.reason])),
     ).toEqual({
       "s-declared": "declared",
+      "s-confirmed": "on a confirmed quest",
       "s-assigned": "answered or assigned by a person",
       "s-manual": "not written by w5",
     });
     // s-old ended before --from: not in range at all.
     expect(plan.reset.traces.map((trace) => trace.id).sort()).toEqual([
-      "T-s-confirmed",
       "T-s-inferred",
+      "T-s-inferred-two",
     ]);
-    expect(plan.reset.stintIds.sort()).toEqual(["A-s-confirmed", "A-s-inferred"]);
-    // The confirmed quest stays, and Q-s-confirmed is also what a person assigned elsewhere.
-    expect(plan.reset.questIds).toEqual(["Q-s-inferred"]);
+    expect(plan.reset.stintIds.sort()).toEqual(["A-s-inferred", "A-s-inferred-two"]);
+    expect(plan.reset.questIds.sort()).toEqual(["Q-s-inferred", "Q-s-inferred-two"]);
   });
 
   test("a stint with a trace outside the reset stays, and so does its quest", () => {
@@ -280,14 +293,14 @@ describe("planReclassify", () => {
       heroId: "H1",
     });
 
-    const plan = planReclassify(database, { from: FROM });
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
 
     expect(plan.reset.traces.map((trace) => trace.id)).toEqual(["T-s-inferred"]);
     expect(plan.reset.stintIds).toEqual([]);
     expect(plan.reset.questIds).toEqual([]);
   });
 
-  test("an unconfirmed quest a person reworded is kept", () => {
+  test("a session whose stint sits on an unconfirmed quest a person reworded is protected whole", () => {
     const database = openDatabase(":memory:");
     const store = new EventStore(database);
     ensureTables(database);
@@ -297,10 +310,13 @@ describe("planReclassify", () => {
       title: "my own wording",
     });
 
-    const plan = planReclassify(database, { from: FROM });
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
 
-    expect(plan.reset.stintIds).toEqual(["A-s-inferred"]);
-    expect(plan.reset.questIds).toEqual([]);
+    expect(plan.protectedSessions).toEqual([
+      { sessionId: "s-inferred", reason: "on a quest a person changed" },
+    ]);
+    expect(plan.reset.traces).toEqual([]);
+    expect(plan.reset.stintIds).toEqual([]);
   });
 
   test("--to is an exclusive bound: a session ending at it is out of range", () => {
@@ -311,7 +327,7 @@ describe("planReclassify", () => {
     seedInferred(database, store, "s-a", { endedAt: "2026-09-04T10:00:00.000Z" });
     seedInferred(database, store, "s-b", { endedAt: "2026-09-04T12:00:00.000Z" });
 
-    const plan = planReclassify(database, { from: FROM, to: "2026-09-04T12:00:00.000Z" });
+    const plan = planReclassify(database, { from: FROM, to: "2026-09-04T12:00:00.000Z", ...IDLE });
 
     expect(plan.sessions.map((session) => session.id)).toEqual(["s-a"]);
   });
@@ -321,7 +337,7 @@ describe("planReclassify", () => {
     ensureTables(database);
     seedSession(database, "s-fresh", "2026-09-04T10:00:00.000Z");
 
-    const plan = planReclassify(database, { from: FROM });
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
 
     expect(plan.sessions.map((session) => session.id)).toEqual(["s-fresh"]);
     expect(plan.reset.traces).toEqual([]);
@@ -333,8 +349,8 @@ describe("reclassify", () => {
     const database = openDatabase(":memory:");
     seedWorld(database, new EventStore(database));
     const untouchedBefore = {
-      traces: ["T-s-assigned", "T-s-declared", "T-s-manual", "T-s-old"],
-      stints: ["A-s-assigned", "A-s-declared", "A-s-manual", "A-s-old"],
+      traces: ["T-s-assigned", "T-s-confirmed", "T-s-declared", "T-s-manual", "T-s-old"],
+      stints: ["A-s-assigned", "A-s-confirmed", "A-s-declared", "A-s-manual", "A-s-old"],
     };
     const before = counts(database);
     const classifier = new FreshStintClassifier();
@@ -345,12 +361,18 @@ describe("reclassify", () => {
       makeConfig("/tmp"),
       defaultIntentConfig().w5,
       classifier,
-      { from: FROM, now: "2026-09-05T00:00:00.000Z", log: (line) => logs.push(line) },
+      { from: FROM, ...IDLE, log: (line) => logs.push(line) },
     );
 
-    expect(result.reset).toEqual({ traces: 2, stints: 2, quests: 1 });
+    expect(result.reset).toEqual({
+      traces: 2,
+      stints: 2,
+      quests: 2,
+      questions: 0,
+      continuations: 0,
+    });
     // Only the two reset sessions were classified, once each.
-    expect(classifier.sessions.sort()).toEqual(["s-confirmed", "s-inferred"]);
+    expect(classifier.sessions.sort()).toEqual(["s-inferred", "s-inferred-two"]);
     expect(result.backfill.windowsClassified).toBe(2);
 
     // The untouched sessions' rows are all still live, byte for byte the same ids.
@@ -358,22 +380,23 @@ describe("reclassify", () => {
     for (const id of untouchedBefore.stints) expect(liveIds(database, "stints")).toContain(id);
     // The old inferred rows are retracted, the confirmed quest and the declared quest are not.
     expect(liveIds(database, "traces")).not.toContain("T-s-inferred");
-    expect(liveIds(database, "traces")).not.toContain("T-s-confirmed");
+    expect(liveIds(database, "traces")).not.toContain("T-s-inferred-two");
     expect(liveIds(database, "quests")).toContain("Q-s-confirmed");
     expect(liveIds(database, "quests")).toContain("Q-s-declared");
     expect(liveIds(database, "quests")).not.toContain("Q-s-inferred");
+    expect(liveIds(database, "quests")).not.toContain("Q-s-inferred-two");
 
-    // Stint count: 6 live before, the 2 inferred ones retracted and 2 new ones after.
+    // Stint count: 7 live before, the 2 inferred ones retracted and 2 new ones after.
     const after = counts(database);
-    expect(before.stints).toBe(6);
-    expect(after.stints).toBe(6);
+    expect(before.stints).toBe(7);
+    expect(after.stints).toBe(7);
     const live = (outcome: string) =>
       (
         database
           .query("SELECT COUNT(*) AS n FROM stints WHERE outcome = ? AND retracted_at IS NULL")
           .get(outcome) as { n: number }
       ).n;
-    expect(live("inferred work")).toBe(4);
+    expect(live("inferred work")).toBe(5);
     expect(live("redone work")).toBe(2);
     expect(after.traces).toBe(before.traces);
 
@@ -385,11 +408,12 @@ describe("reclassify", () => {
       )
       .all() as { subject: string; reason: string }[];
     expect(retractions.map((row) => row.subject).sort()).toEqual([
-      "A-s-confirmed",
       "A-s-inferred",
+      "A-s-inferred-two",
       "Q-s-inferred",
-      "T-s-confirmed",
+      "Q-s-inferred-two",
       "T-s-inferred",
+      "T-s-inferred-two",
     ]);
     expect(new Set(retractions.map((row) => row.reason))).toEqual(new Set([RECLASSIFY_REASON]));
     // No person's event was added or changed.
@@ -407,7 +431,7 @@ describe("reclassify", () => {
       makeConfig("/tmp"),
       defaultIntentConfig().w5,
       new FreshStintClassifier(),
-      { from: FROM, now: "2026-09-05T00:00:00.000Z", log: () => {} },
+      { from: FROM, ...IDLE, log: () => {} },
     );
 
     const windows = () =>
@@ -417,8 +441,8 @@ describe("reclassify", () => {
         )
         .all();
     const stored = windows();
-    // Six seeded sessions, one window each, plus the two re-run windows of the reset sessions.
-    expect(stored.length).toBe(8);
+    // Seven seeded sessions, one window each, plus the two re-run windows of the reset sessions.
+    expect(stored.length).toBe(9);
     // A rebuild (what `tempad rebuild` and `scry`'s projection check do) gives the same rows.
     rebuildAll(database);
     expect(windows()).toEqual(stored);
@@ -435,7 +459,7 @@ describe("reclassify", () => {
         new FreshStintClassifier(),
         {
           from: FROM,
-          now: "2026-09-05T00:00:00.000Z",
+          ...IDLE,
           log: () => {},
         },
       );
@@ -510,7 +534,7 @@ describe("w5 backfill --reclassify", () => {
         spawn: () => {},
       });
 
-      expect(code).toBe(1);
+      expect(code).toBe(2);
       expect(output.join("\n")).toContain("VACUUM INTO");
       expect(output.join("\n")).toContain("--backup");
       expect(counts(database)).toEqual(before);
@@ -537,7 +561,9 @@ describe("w5 backfill --reclassify", () => {
 
       const text = output.join("\n");
       expect(code).toBe(0);
-      expect(text).toContain("sessions=2 protected=3 would retract traces=2 stints=2 quests=1");
+      expect(text).toContain(
+        "sessions=2 protected=4 (on a confirmed quest=1, declared=1, answered or assigned by a person=1, not written by w5=1) would retract traces=2 stints=2 quests=2 and close questions=0 continuations=0",
+      );
       expect(text).toContain("protected s-declared (declared)");
       expect(counts(database)).toEqual(before);
     } finally {
@@ -565,7 +591,7 @@ describe("w5 backfill --reclassify", () => {
 
       expect(existsSync(backup)).toBe(true);
       expect(output[0]).toContain("backup written");
-      expect(output.join("\n")).toContain("reclassify: sessions=2 protected=3 retracted traces=2");
+      expect(output.join("\n")).toContain("reclassify: sessions=2 protected=4 retracted traces=2");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -617,12 +643,12 @@ describe("w5 backfill --reclassify", () => {
     ["--to alone", ["--to", FROM], "--to is only valid with --reclassify"],
     [
       "--to before --from",
-      ["--reclassify", "--from", FROM, "--to", "2026-09-03"],
+      ["--reclassify", "--from", FROM, "--to", "2026-09-03", "--dry-run"],
       "--to must be after --from",
     ],
     [
       "a --to that is no date",
-      ["--reclassify", "--from", FROM, "--to", "soon"],
+      ["--reclassify", "--from", FROM, "--to", "soon", "--dry-run"],
       "--to needs an ISO 8601",
     ],
   ] as const) {
@@ -633,4 +659,447 @@ describe("w5 backfill --reclassify", () => {
       expect(result.output).toContain(message);
     });
   }
+});
+
+/** A question the way `question.asked` writes it, brought to `state`. */
+function seedQuestion(
+  database: TestDatabase,
+  store: EventStore,
+  input: {
+    id: string;
+    traceId: string;
+    sessionId: string;
+    state: "watching" | "asked" | "expired" | "answered" | "resolved_by_context";
+    kind?: string;
+  },
+) {
+  applyIncremental(
+    database,
+    store.append({
+      actor: "system",
+      kind: "question.asked",
+      subject: input.id,
+      sessionId: input.sessionId,
+      payload: { trace: input.traceId, text: "why?", kind: input.kind ?? "belongs", guess: "g" },
+    }),
+  );
+  if (input.state === "watching") return;
+  if (input.state === "answered") {
+    append(database, store, "hero", "question.answered", input.id, { answeredBy: "hero" });
+    return;
+  }
+  if (input.state === "resolved_by_context") {
+    append(database, store, "system", "question.answered", input.id, { answeredBy: "context" });
+    return;
+  }
+  if (input.state === "asked") {
+    append(database, store, "system", "question.promoted", input.id, { turnsAtAsk: 1 });
+    return;
+  }
+  append(database, store, "system", "question.expired", input.id, {});
+}
+
+const questionStates = (database: TestDatabase) =>
+  Object.fromEntries(
+    (
+      database.query("SELECT id, state FROM questions ORDER BY id").all() as {
+        id: string;
+        state: string;
+      }[]
+    ).map((row) => [row.id, row.state]),
+  );
+
+describe("questions about retracted traces", () => {
+  function seedQuestions() {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    seedInferred(database, store, "s-inferred");
+    for (const state of ["watching", "asked", "expired", "resolved_by_context"] as const) {
+      seedQuestion(database, store, {
+        id: `Qn-${state}`,
+        traceId: "T-s-inferred",
+        sessionId: "s-inferred",
+        state,
+      });
+    }
+    return { database, store };
+  }
+
+  test("a reclassify closes the unanswered ones with an event and leaves the answered one as it was", async () => {
+    const { database } = seedQuestions();
+
+    const result = await reclassify(
+      database,
+      makeConfig("/tmp"),
+      defaultIntentConfig().w5,
+      new FreshStintClassifier(),
+      { from: FROM, ...IDLE, log: () => {} },
+    );
+
+    expect(result.reset.questions).toBe(3);
+    expect(questionStates(database)).toEqual({
+      "Qn-asked": "resolved_by_context",
+      "Qn-expired": "resolved_by_context",
+      "Qn-resolved_by_context": "resolved_by_context",
+      "Qn-watching": "resolved_by_context",
+    });
+    const closing = database
+      .query(
+        "SELECT subject, actor, json_extract(payload, '$.reason') AS reason FROM events WHERE kind = 'question.answered' AND actor = 'backfill' ORDER BY subject",
+      )
+      .all();
+    expect(closing).toEqual(
+      ["Qn-asked", "Qn-expired", "Qn-watching"].map((subject) => ({
+        subject,
+        actor: "backfill",
+        reason: RECLASSIFY_REASON,
+      })),
+    );
+  });
+
+  test("the questions table still equals a replay of the events", async () => {
+    const { database } = seedQuestions();
+    await reclassify(
+      database,
+      makeConfig("/tmp"),
+      defaultIntentConfig().w5,
+      new FreshStintClassifier(),
+      { from: FROM, ...IDLE, log: () => {} },
+    );
+    const columns = "id, trace_id, session_id, state, answered_by, answer";
+    const rows = () => database.query(`SELECT ${columns} FROM questions ORDER BY id`).all();
+    const stored = rows();
+
+    rebuildAll(database);
+
+    expect(rows()).toEqual(stored);
+  });
+
+  test("tempad review lists none of them, even ones a plain retraction left expired", () => {
+    const { database, store } = seedQuestions();
+    // Data from before the reset closed questions: the trace is retracted, the question is not.
+    append(database, store, "backfill", "retracted", "T-s-inferred", {
+      retracts: "T-s-inferred",
+      reason: "duplicate backfill window",
+    });
+    const output: string[] = [];
+
+    runReviewCommand([], {
+      database,
+      config: makeConfig("/tmp"),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => output.push(line),
+      spawn: () => {},
+    });
+
+    expect(output.join("\n")).not.toContain("Qn-expired");
+  });
+
+  test("the hook neither watches nor asks a question about a retracted trace", () => {
+    const { database, store } = seedQuestions();
+    append(database, store, "backfill", "retracted", "T-s-inferred", {
+      retracts: "T-s-inferred",
+      reason: "duplicate backfill window",
+    });
+    const config = defaultIntentConfig().w5;
+
+    const result = advanceQuestions(store, database, config, {
+      sessionId: "s-inferred",
+      now: "2026-10-01T00:00:00.000Z",
+      turnsSinceLastRun: 50,
+      sessionStintMinutes: 60,
+      resolvedByContext: [],
+    });
+
+    expect(result.asked).toEqual([]);
+    expect(result.expired).toEqual([]);
+    expect(questionStates(database)["Qn-watching"]).toBe("watching");
+    expect(questionStates(database)["Qn-asked"]).toBe("asked");
+  });
+
+  test("an asked question about a retracted trace does not reach w5 context", async () => {
+    const { database, store } = seedQuestions();
+    const live: string[] = [];
+    await runW5Command(["context", "--session", "s-inferred"], {
+      database,
+      config: makeConfig("/tmp"),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => live.push(line),
+      spawn: () => {},
+    });
+    append(database, store, "backfill", "retracted", "T-s-inferred", {
+      retracts: "T-s-inferred",
+      reason: "duplicate backfill window",
+    });
+    const output: string[] = [];
+
+    await runW5Command(["context", "--session", "s-inferred"], {
+      database,
+      config: makeConfig("/tmp"),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => output.push(line),
+      spawn: () => {},
+    });
+
+    expect(output.join("\n")).not.toContain("Qn-asked");
+    // Control: the same question is rendered while its trace is live.
+    expect(live.join("\n")).toContain("Qn-asked");
+  });
+
+  test("tempad answer refuses a question about a retracted trace and writes nothing", async () => {
+    const { database, store } = seedQuestions();
+    append(database, store, "backfill", "retracted", "T-s-inferred", {
+      retracts: "T-s-inferred",
+      reason: "duplicate backfill window",
+    });
+    const before = counts(database);
+
+    const code = await runIntentCommand(["answer", "Qn-expired", "--belongs"], {
+      database,
+      config: makeConfig("/tmp"),
+      intentConfig: defaultIntentConfig(),
+      stdout: () => {},
+    });
+
+    expect(code).toBe(1);
+    expect(counts(database)).toEqual(before);
+    expect(questionStates(database)["Qn-expired"]).toBe("expired");
+  });
+});
+
+describe("protection", () => {
+  test("a session that ended within the idle threshold of now is still active, one at the threshold is not", () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    const now = "2026-10-01T12:00:00.000Z";
+    seedInferred(database, store, "s-live", { endedAt: "2026-10-01T11:16:00.000Z" }); // 44 min
+    seedInferred(database, store, "s-idle", { endedAt: "2026-10-01T11:15:00.000Z" }); // 45 min
+
+    const plan = planReclassify(database, { from: FROM, now, activeMinutes: 45 });
+
+    expect(plan.protectedSessions).toEqual([{ sessionId: "s-live", reason: "still active" }]);
+    expect(plan.sessions.map((session) => session.id)).toEqual(["s-idle"]);
+    expect(plan.reset.traces.map((trace) => trace.id)).toEqual(["T-s-idle"]);
+  });
+
+  test("a session whose only person-made event is the answer to one of its questions is protected", () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    seedInferred(database, store, "s-inferred");
+    seedInferred(database, store, "s-answered");
+    seedQuestion(database, store, {
+      id: "Qn-answered",
+      traceId: "T-s-answered",
+      sessionId: "s-answered",
+      state: "answered",
+    });
+    // `tempad answer --belongs` writes nothing else: no event on the trace or the stint.
+    expect(
+      database
+        .query(
+          "SELECT COUNT(*) AS n FROM events WHERE actor = 'hero' AND subject IN ('T-s-answered', 'A-s-answered')",
+        )
+        .get(),
+    ).toEqual({ n: 0 });
+
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
+
+    expect(plan.protectedSessions).toEqual([
+      { sessionId: "s-answered", reason: "answered or assigned by a person" },
+    ]);
+    expect(plan.sessions.map((session) => session.id)).toEqual(["s-inferred"]);
+  });
+
+  test("an unconfirmed quest only w5 touched does not protect its session", () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    seedInferred(database, store, "s-inferred");
+
+    const plan = planReclassify(database, { from: FROM, ...IDLE });
+
+    expect(plan.protectedSessions).toEqual([]);
+    expect(plan.reset.questIds).toEqual(["Q-s-inferred"]);
+  });
+});
+
+describe("applyReset", () => {
+  test("a surviving stint that continued a retracted one loses the link by an event", async () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    seedInferred(database, store, "s-inferred");
+    // A person-recorded session (protected) resumed the inferred stint.
+    seedInferred(database, store, "s-manual", { traceActor: "hero" });
+    append(database, store, "hook", "stint.opened", "A-next", {
+      outcome: "resumed",
+      quest: "Q-s-manual",
+      continues: "A-s-inferred",
+    });
+    applyIncremental(
+      database,
+      store.append({
+        actor: "hero",
+        kind: "trace.relinked",
+        subject: "T-s-manual",
+        payload: { stint: "A-next", reason: "test" },
+      }),
+    );
+    const continues = () =>
+      database.query("SELECT id, continues FROM stints WHERE id = 'A-next'").get();
+    expect(continues()).toEqual({ id: "A-next", continues: "A-s-inferred" });
+
+    await reclassify(
+      database,
+      makeConfig("/tmp"),
+      defaultIntentConfig().w5,
+      new FreshStintClassifier(),
+      { from: FROM, ...IDLE, log: () => {} },
+    );
+
+    expect(liveIds(database, "stints")).toContain("A-next");
+    expect(continues()).toEqual({ id: "A-next", continues: null });
+    expect(
+      database.query("SELECT actor FROM events WHERE kind = 'stint.continuation_cleared'").all(),
+    ).toEqual([{ actor: "backfill" }]);
+    // The projection is a function of the events: a rebuild gives the same stints.
+    const stints = () => database.query("SELECT id, continues FROM stints ORDER BY id").all();
+    const stored = stints();
+    rebuildAll(database);
+    expect(stints()).toEqual(stored);
+  });
+
+  test("clears the session note of every touched session and no other", () => {
+    const database = openDatabase(":memory:");
+    const store = new EventStore(database);
+    ensureTables(database);
+    append(database, store, "hero", "hero.created", "H1", { name: "Saulo" });
+    seedInferred(database, store, "s-inferred");
+    seedInferred(database, store, "s-other");
+    for (const id of ["s-inferred", "s-other"]) {
+      database
+        .query(
+          "INSERT INTO w5_runs (session_id, last_run_at, last_message_ts, session_note) VALUES (?, ?, ?, 'a note')",
+        )
+        .run(id, FROM, FROM);
+    }
+    const plan = planReset(database, [
+      { id: "T-s-inferred", stint_id: "A-s-inferred", session_id: "s-inferred" },
+    ]);
+
+    applyReset(database, plan, { reason: RECLASSIFY_REASON, clearWindowCoverage: false });
+
+    expect(
+      database.query("SELECT session_id, session_note FROM w5_runs ORDER BY session_id").all(),
+    ).toEqual([
+      { session_id: "s-inferred", session_note: null },
+      { session_id: "s-other", session_note: "a note" },
+    ]);
+  });
+});
+
+describe("w5 backfill --reclassify, the lock and the flags", () => {
+  async function runCli(args: string[], options: { lock?: boolean; backend?: "api" } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-reclassify-lock-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedWorld(database, new EventStore(database));
+      const intentConfig = defaultIntentConfig();
+      intentConfig.w5.claudeCommand = "/usr/bin/false";
+      if (options.backend) intentConfig.w5.backend = options.backend;
+      const lockPath = join(dir, "w5.lock");
+      // This process's own pid: alive, so the lock is never judged stale.
+      if (options.lock) writeFileSync(lockPath, String(process.pid));
+      const before = counts(database);
+      const output: string[] = [];
+      const code = await runW5Command(["backfill", ...args], {
+        database,
+        config: makeConfig(dir),
+        intentConfig,
+        stdout: (line) => output.push(line),
+        spawn: () => {},
+      });
+      return {
+        code,
+        text: output.join("\n"),
+        unchanged: JSON.stringify(counts(database)) === JSON.stringify(before),
+        lockLeft: existsSync(lockPath),
+        dir,
+      };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("a held runner lock stops it before the backup, exit 1, nothing changed", async () => {
+    const run = await runCli(["--reclassify", "--from", FROM, "--backup", "before.db"], {
+      lock: true,
+    });
+    expect(run.code).toBe(1);
+    expect(run.text).toContain("runner lock is held");
+    expect(run.unchanged).toBe(true);
+    // The lock is the other runner's: it is left alone.
+    expect(run.lockLeft).toBe(true);
+  });
+
+  test("it releases the lock when the run ends", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tempad-reclassify-lock-"));
+    try {
+      const database = openDatabase(":memory:");
+      seedWorld(database, new EventStore(database));
+      const intentConfig = defaultIntentConfig();
+      intentConfig.w5.claudeCommand = "/usr/bin/false";
+
+      await runW5Command(
+        ["backfill", "--reclassify", "--from", FROM, "--backup", join(dir, "before.db")],
+        {
+          database,
+          config: makeConfig(dir),
+          intentConfig,
+          stdout: () => {},
+          spawn: () => {},
+        },
+      );
+
+      expect(existsSync(join(dir, "before.db"))).toBe(true);
+      expect(existsSync(join(dir, "w5.lock"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("--dry-run --backup together is a usage error, exit 2, and takes no lock", async () => {
+    const run = await runCli(["--reclassify", "--from", FROM, "--dry-run", "--backup", "x.db"]);
+    expect(run.code).toBe(2);
+    expect(run.text).toContain("usage: tempad w5 backfill");
+    expect(run.text).toContain("--dry-run writes nothing");
+    expect(run.unchanged).toBe(true);
+  });
+
+  test("--dry-run works without ANTHROPIC_API_KEY on the api backend, and a real run says it is missing", async () => {
+    const dry = await runCli(["--reclassify", "--from", FROM, "--dry-run"], { backend: "api" });
+    expect(dry.code).toBe(0);
+    expect(dry.text).toContain("reclassify (dry run)");
+
+    const real = await runCli(["--reclassify", "--from", FROM, "--backup", "before.db"], {
+      backend: "api",
+    });
+    expect(real.code).toBe(1);
+    expect(real.text).toContain("ANTHROPIC_API_KEY not set");
+    expect(real.unchanged).toBe(true);
+  });
+
+  test("--dry-run does not take the lock, so it works while a runner holds it", async () => {
+    const run = await runCli(["--reclassify", "--from", FROM, "--dry-run"], { lock: true });
+    expect(run.code).toBe(0);
+    expect(run.lockLeft).toBe(true);
+  });
 });

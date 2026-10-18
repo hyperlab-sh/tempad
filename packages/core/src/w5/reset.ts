@@ -13,6 +13,10 @@ export interface ResetResult {
   traces: number;
   stints: number;
   quests: number;
+  /** Open questions about the retracted traces, closed. */
+  questions: number;
+  /** Surviving stints whose `continues` pointed at a retracted stint, cleared. */
+  continuations: number;
 }
 
 /** What a reset would retract, computed without writing anything. */
@@ -22,6 +26,13 @@ export interface ResetPlan {
   stintIds: string[];
   /** Unconfirmed quests left with no live stint once `stintIds` are retracted. */
   questIds: string[];
+  /**
+   * Questions about the retracted traces that nobody answered (`watching`, `asked`
+   * or `expired`), closed so neither the hook nor `tempad review` raises them.
+   */
+  questionIds: string[];
+  /** Live stints that stay but continue a stint in `stintIds`. */
+  continuationIds: string[];
   /** Sessions whose `w5_runs.session_note` and `w5_windows` rows are cleared. */
   sessionIds: string[];
 }
@@ -42,6 +53,21 @@ export interface ResetOptions {
    * Confirmed quests never are. Unset: every such quest.
    */
   mayRetractQuest?: (questId: string) => boolean;
+}
+
+/** Questions about these traces that were never answered (a person's answer or the context's). */
+function openQuestionsOf(database: Database, traceIds: string[]): string[] {
+  if (traceIds.length === 0) return [];
+  return (
+    database
+      .query(
+        `SELECT id FROM questions
+          WHERE trace_id IN (SELECT value FROM json_each(?))
+            AND state IN ('watching', 'asked', 'expired')
+          ORDER BY rowid ASC`,
+      )
+      .all(JSON.stringify(traceIds)) as { id: string }[]
+  ).map((row) => row.id);
 }
 
 /**
@@ -95,7 +121,23 @@ export function planReset(
     if (!liveStints.some((stint) => !retractedStintIds.has(stint.id))) questIds.push(questId);
   }
 
-  return { traces, stintIds, questIds, sessionIds };
+  const questionIds = openQuestionsOf(database, [...retractedTraceIds]);
+
+  const continuationIds =
+    stintIds.length === 0
+      ? []
+      : (
+          database
+            .query(
+              `SELECT id FROM stints
+                WHERE retracted_at IS NULL AND continues IN (SELECT value FROM json_each(?))`,
+            )
+            .all(JSON.stringify(stintIds)) as { id: string }[]
+        )
+          .map((row) => row.id)
+          .filter((id) => !retractedStintIds.has(id));
+
+  return { traces, stintIds, questIds, questionIds, continuationIds, sessionIds };
 }
 
 /**
@@ -125,6 +167,30 @@ export function applyReset(
     for (const trace of plan.traces) retract(trace.id);
     for (const stintId of plan.stintIds) retract(stintId);
     for (const questId of plan.questIds) retract(questId);
+    // A question about a retracted trace is void. `resolved_by_context` is the
+    // terminal state nothing lists or asks, and the event carries the reason.
+    for (const questionId of plan.questionIds) {
+      applyIncremental(
+        database,
+        store.append({
+          actor: "backfill",
+          kind: "question.answered",
+          subject: questionId,
+          payload: { answeredBy: "context", reason: options.reason },
+        }),
+      );
+    }
+    for (const stintId of plan.continuationIds) {
+      applyIncremental(
+        database,
+        store.append({
+          actor: "backfill",
+          kind: "stint.continuation_cleared",
+          subject: stintId,
+          payload: { reason: options.reason },
+        }),
+      );
+    }
     for (const sessionId of plan.sessionIds) {
       database.query("UPDATE w5_runs SET session_note = NULL WHERE session_id = ?").run(sessionId);
       if (options.clearWindowCoverage) {
@@ -137,5 +203,7 @@ export function applyReset(
     traces: plan.traces.length,
     stints: plan.stintIds.length,
     quests: plan.questIds.length,
+    questions: plan.questionIds.length,
+    continuations: plan.continuationIds.length,
   };
 }

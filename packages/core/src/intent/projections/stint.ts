@@ -159,6 +159,11 @@ export const stintProjection: Projection = {
           .query("UPDATE traces SET stint_id = ? WHERE id = ?")
           .run(String(payload.stint), event.subject);
         return;
+      case "stint.continuation_cleared":
+        // The stint it continued was retracted (a reclassify), so the link would
+        // lead nowhere. The event keeps the old link in history.
+        database.query("UPDATE stints SET continues = NULL WHERE id = ?").run(event.subject);
+        return;
       case "question.asked":
         database
           .query(

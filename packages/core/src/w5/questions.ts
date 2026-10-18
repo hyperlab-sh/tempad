@@ -80,7 +80,9 @@ function hasRecentAsk(
 
 function hasUnansweredAsked(database: Database, sessionId: string): boolean {
   const row = database
-    .query("SELECT id FROM questions WHERE session_id = ? AND state = 'asked' LIMIT 1")
+    .query(
+      `SELECT id FROM questions WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED} LIMIT 1`,
+    )
     .get(sessionId) as { id: string } | null;
   return row !== null;
 }
@@ -122,6 +124,15 @@ function promoteQuestion(
     }),
   );
 }
+
+/**
+ * SQL for a `questions` row whose trace is not retracted. A question about a trace
+ * that no longer exists (a reclassify or dedupe retracted it) is void: the hook must
+ * not ask it, `tempad review` not list it. A question whose trace row is missing
+ * altogether is kept, as before.
+ */
+export const TRACE_NOT_RETRACTED = `NOT EXISTS (SELECT 1 FROM traces
+   WHERE traces.id = questions.trace_id AND traces.retracted_at IS NOT NULL)`;
 
 function expireQuestion(
   store: EventStore,
@@ -199,7 +210,7 @@ export function advanceQuestions(
     .query(
       `SELECT id, trace_id, session_id, kind, state, turns_watched, turns_at_ask, is_switch
          FROM questions
-        WHERE session_id = ? AND state = 'watching'
+        WHERE session_id = ? AND state = 'watching' AND ${TRACE_NOT_RETRACTED}
         ORDER BY rowid ASC`,
     )
     .all(input.sessionId) as RawQuestionRow[];
@@ -279,7 +290,7 @@ export function advanceQuestions(
     .query(
       `SELECT id, trace_id, session_id, kind, state, turns_watched, turns_at_ask, is_switch
          FROM questions
-        WHERE session_id = ? AND state = 'asked'`,
+        WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED}`,
     )
     .all(input.sessionId) as RawQuestionRow[];
 
