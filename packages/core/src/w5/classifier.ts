@@ -133,12 +133,16 @@ export interface ClassifierSegment {
   quest?: string | null;
   /**
    * Declared mode: which stint the segment lands on, as one of `"P<n>.<m>"` (a
-   * plan item of its quest), `"S<n>"` (a stint already open in the session), or
-   * `"new: <one line>"` (nothing listed fits). One field with a structural
-   * prefix rather than three optionals, because the candidates now come from two
-   * different sources that the value itself has to disambiguate.
+   * plan item of its quest), `"S<n>"` (a stint already open in the session),
+   * `"new: <one line>"` (nothing listed fits) or `"segment:<n>"` (the stint an
+   * earlier segment of the same response opened, `parseSegmentReference`).
+   * `null` is a segment that named no selector at all: `applyResult` may then
+   * place it on the previous segment's stint (the same-outcome rule) before it
+   * opens one. One field with a structural prefix rather than three optionals,
+   * because the candidates now come from two different sources that the value
+   * itself has to disambiguate.
    */
-  stint?: string;
+  stint?: string | null;
   /**
    * Inference mode only: a listed stint's id, or `"segment:<n>"` for the stint an
    * earlier segment of the same response landed on (`parseSegmentReference`).
@@ -214,7 +218,12 @@ export const DEFAULT_NEW_STINT_REASON = "classifier gave no reason";
  */
 const SEGMENT_REFERENCE = /^segment\s*[:#]?\s*(\d+)$/i;
 
-const SEGMENT_REFERENCE_FIELDS = ["matchedStint", "continuesStint", "matchedQuest"] as const;
+const SEGMENT_REFERENCE_FIELDS = [
+  "matchedStint",
+  "continuesStint",
+  "matchedQuest",
+  "stint",
+] as const;
 
 /** The 1-based segment position a `"segment:<n>"` value names, else null. */
 export function parseSegmentReference(value: unknown): number | null {
@@ -232,6 +241,9 @@ export function parseSegmentReference(value: unknown): number | null {
  * missing selector, and a null `matchedQuest` is no opinion.
  */
 function renumberSegmentReferences(kept: { segment: unknown; position: number }[]): void {
+  // Runs in both modes: a declared segment's `stint` takes references exactly
+  // like the inference selectors, since a stint an earlier segment of the same
+  // response opened has no alias the model could name instead.
   const renumbered = new Map(kept.map(({ position }, index) => [position, index + 1]));
   for (const [index, { segment }] of kept.entries()) {
     if (typeof segment !== "object" || segment === null) continue;
@@ -400,6 +412,9 @@ interface DeclaredAliases {
  * outcome verbatim.
  */
 function isKnownStintSelector(selector: string, aliases: DeclaredAliases): boolean {
+  // A reference that survived renumbering points at an earlier kept segment,
+  // which `applyResult`'s ledger resolves; it is not the validator's to judge.
+  if (parseSegmentReference(selector) !== null) return true;
   if (selector.startsWith("new: ")) return selector.slice("new: ".length).trim() !== "";
   if (selector.startsWith("P")) return aliases.plans.has(selector);
   if (selector.startsWith("S")) return aliases.openStints.has(selector);
@@ -548,11 +563,23 @@ function validateSegment(
   if (mode === "declared") {
     // One field with a structural prefix, so there is no "exactly one of three"
     // rule left to reconcile: the value either parses against a listed candidate
-    // or is repaired into a new stint named by the segment itself.
-    if (typeof segment.stint !== "string") {
-      problems.push(`${where}.stint: expected string`);
-    } else if (declaredAliases !== null && !isKnownStintSelector(segment.stint, declaredAliases)) {
+    // or is repaired into a new stint named by the segment itself. `null` is a
+    // segment that named no selector (or whose reference was cleared): it stays
+    // null so `applyResult` can first try the same-outcome rule on it.
+    if (
+      segment.stint !== undefined &&
+      segment.stint !== null &&
+      typeof segment.stint !== "string"
+    ) {
+      problems.push(`${where}.stint: expected string or null`);
+    } else if (
+      declaredAliases !== null &&
+      typeof segment.stint === "string" &&
+      !isKnownStintSelector(segment.stint, declaredAliases)
+    ) {
       segment.stint = `new: ${typeof segment.what === "string" ? segment.what : ""}`;
+      counters.selectorDefaulted += 1;
+    } else if (declaredAliases !== null && segment.stint == null) {
       counters.selectorDefaulted += 1;
     }
   } else {
@@ -693,7 +720,7 @@ export function validateResult(raw: unknown, window?: ClassifierWindow): Classif
   const kept = (raw as { segments: unknown[] }).segments
     .map((segment, index) => ({ segment, position: index + 1 }))
     .filter(({ segment }) => bounds === null || repairBounds(segment, bounds, repairs) === "keep");
-  if (mode === "inferred") renumberSegmentReferences(kept);
+  renumberSegmentReferences(kept);
   const segments = kept.map(({ segment }) => segment);
   for (const [index, segment] of segments.entries()) {
     validateSegment(segment, index, problems, bounds, counters, aliases, mode, declaredAliases);

@@ -51,10 +51,11 @@ export interface AppliedSummary {
    */
   questAttachedOnMatched: number;
   /**
-   * Inference mode: segments that landed on a stint or quest an earlier segment
-   * of the same window opened or reached, through a `"segment:<n>"` reference,
-   * the same-outcome rule (`isSwitch: false` with no stint named) or a repeated
-   * proposed quest title (`resolveWithinWindow`).
+   * Segments that landed on a stint or quest an earlier segment of the same
+   * window opened or reached, through a `"segment:<n>"` reference, the
+   * same-outcome rule (`isSwitch: false` with no stint named) or a repeated
+   * proposed quest title -- in inference mode through `resolveWithinWindow`,
+   * in declared mode through the resolver's own ledger.
    */
   sameWindowReuse: number;
 }
@@ -690,7 +691,7 @@ function resolveStintForSegment(
  * the rule that nothing here creates, proposes, reassigns or branches a quest is
  * unchanged.
  *
- * `segment.stint` arrives as one of three prefixed shapes:
+ * `segment.stint` arrives as one of four prefixed shapes:
  *
  * - `P<n>.<m>` — a plan item of the segment's quest. A plan item is not a row
  *   until the first segment names it; `planStints` keeps the one stint per
@@ -700,19 +701,34 @@ function resolveStintForSegment(
  * - `S<n>` — a stint already open in the session, reused exactly as
  *   `matchedStint` did, including attaching a quest only when it has none.
  * - `new: <text>` — nothing listed fits; the text is the new stint's outcome.
+ * - `segment:<n>` — the stint an earlier segment of this same response opened
+ *   (1-based), which has no alias the model could name; the same mechanism
+ *   inference mode's `resolveWithinWindow` uses. A reference that names
+ *   nothing (out of range, or built by hand without validation) opens a new
+ *   stint and counts `unknownStintId`, exactly as an unknown alias does.
+ *
+ * A segment with no selector at all (`stint: null`, the validator's repair for
+ * a missing value or a cleared reference) continues the previous segment's
+ * stint whenever it is not a switch and the quest is unchanged, and an explicit
+ * `new:` is overridden the same way when the segment names the previous stint's
+ * own quest -- the model had no way to name a stint this window just opened.
  *
  * An alias the window never offered resolves to nothing and opens a new stint,
  * exactly as a fabricated id did before.
  */
 /**
- * Trims, collapses internal whitespace, and lowercases an outcome for
- * `new:` reuse matching. A model that rephrases the same stint's outcome
- * with different capitalization or spacing across windows is plausible
- * variance, not a genuinely new outcome, so both sides of the comparison go
- * through this before being compared.
+ * Trims, collapses internal whitespace, lowercases, and drops trailing
+ * punctuation for `new:` reuse matching. A model that rephrases the same
+ * stint's outcome with different capitalization, spacing or a full stop
+ * across windows is plausible variance, not a genuinely new outcome, so both
+ * sides of the comparison go through this before being compared.
  */
 function normalizeOutcome(outcome: string): string {
-  return outcome.trim().replace(/\s+/g, " ").toLowerCase();
+  return outcome
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:!?\u2026]+$/u, "")
+    .toLowerCase();
 }
 
 function resolveStintForSegmentDeclared(
@@ -725,6 +741,8 @@ function resolveStintForSegmentDeclared(
   openStintAliases: Record<string, string>,
   planAliases: Record<string, string>,
   planStints: Map<string, string>,
+  landed: { stintId: string; questId: string | null }[],
+  onReuse: (line: string) => void,
 ): ResolvedStint {
   const selector = segment.stint ?? "";
 
@@ -772,6 +790,38 @@ function resolveStintForSegmentDeclared(
       questAttachedOnMatched: false,
     };
   };
+
+  // Checked before the `S` prefix, which a capitalized reference
+  // ("Segment #1") would otherwise swallow as an unknown alias.
+  const reference = parseSegmentReference(selector);
+  if (reference !== null) {
+    const landedStint = reference >= 1 ? landed[reference - 1] : undefined;
+    if (landedStint === undefined) {
+      return { ...open(segment.what), unknownStintId: true };
+    }
+    onReuse(`named segment ${reference}`);
+    return reuse(landedStint.stintId, readStint(database, landedStint.stintId)?.questId ?? null);
+  }
+
+  // The same outcome as the previous segment: a stint this window just opened
+  // has no alias yet, so a segment that named no selector at all continues it
+  // whenever the quest is unchanged, and an explicit `new:` naming the previous
+  // stint's own quest is overridden the same way (its outcome text is kept on
+  // the existing stint, where the segment's `what` lands as a trace anyway).
+  const previous = landed.at(-1);
+  if (
+    previous !== undefined &&
+    !segment.isSwitch &&
+    questId === previous.questId &&
+    (selector === "" || (questId !== null && selector.startsWith("new: ")))
+  ) {
+    onReuse(
+      selector === ""
+        ? `same outcome as segment ${landed.length}`
+        : `same outcome as segment ${landed.length}, discarded ${JSON.stringify(selector)}`,
+    );
+    return reuse(previous.stintId, readStint(database, previous.stintId)?.questId ?? null);
+  }
 
   if (selector.startsWith("new: ")) {
     const outcome = selector.slice("new: ".length).trim();
@@ -1056,6 +1106,13 @@ export function applyResult(
           window.openStintAliases ?? {},
           window.planAliases ?? {},
           planStints,
+          ledger.landed,
+          (line) => {
+            summary.sameWindowReuse += 1;
+            options.log(
+              `w5 stint resolved within window: session ${window.sessionId}, segment ${index + 1} ${line}`,
+            );
+          },
         )
       : resolveStintForSegment(store, database, heroId, segment, segment.startedAt, attachable);
 
@@ -1072,8 +1129,11 @@ export function applyResult(
       for (const landed of ledger.landed) {
         if (landed.stintId === stintId) landed.questId = questId;
       }
-      ledger.landed.push({ stintId, questId });
     }
+    // Both modes keep the ledger: a later declared segment names what an
+    // earlier one landed on through `segment:<n>` or the same-outcome rule,
+    // exactly as an inferred one does through `resolveWithinWindow`.
+    ledger.landed.push({ stintId, questId });
     if (unknownStintId) {
       summary.unknownStintIds += 1;
       options.log(

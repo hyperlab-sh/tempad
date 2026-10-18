@@ -3554,6 +3554,211 @@ describe("applyResult in declared mode", () => {
     expect(opened.planIndex).toBeNull();
   });
 
+  test("a segment:N reference lands on the stint an earlier segment opened", () => {
+    const database = openDatabase(":memory:");
+    const { store, questId } = seedDeclared(database);
+    const log: string[] = [];
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: chase the flaky rerun",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "segment:1",
+          }),
+        ],
+        sessionNote: null,
+      },
+      { ...declaredOptions, log: (line) => log.push(line) },
+    );
+
+    // One stint for both segments: the second names what the first opened,
+    // which has no alias the model could otherwise write.
+    expect(summary.stintsOpened).toBe(1);
+    expect(summary.sameWindowReuse).toBe(1);
+    expect(log.some((line) => line.includes("named segment 1"))).toBe(true);
+    const rows = database
+      .query("SELECT stint_id as stintId FROM traces WHERE stint_id != 'A1' ORDER BY started_at")
+      .all() as { stintId: string; questId: string | null }[];
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.stintId)).size).toBe(1);
+    const stint = database
+      .query("SELECT quest_id as questId FROM stints WHERE id != 'A1'")
+      .get() as { questId: string | null };
+    expect(stint.questId).toBe(questId);
+  });
+
+  test("a segment reference that names nothing opens a new stint and counts unknownStintId", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seedDeclared(database);
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      { segments: [segment({ stint: "segment:4" })], sessionNote: null },
+      declaredOptions,
+    );
+
+    expect(summary.stintsOpened).toBe(1);
+    expect(summary.unknownStintIds).toBe(1);
+  });
+
+  test("a segment with no stint and no switch continues the previous segment's stint", () => {
+    const database = openDatabase(":memory:");
+    const { store, questId } = seedDeclared(database);
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: chase the flaky rerun",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: null,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    expect(summary.stintsOpened).toBe(1);
+    expect(summary.sameWindowReuse).toBe(1);
+    const traces = database
+      .query("SELECT stint_id as stintId FROM traces WHERE stint_id != 'A1'")
+      .all() as { stintId: string }[];
+    expect(new Set(traces.map((trace) => trace.stintId)).size).toBe(1);
+    const stint = database
+      .query("SELECT quest_id as questId FROM stints WHERE id != 'A1'")
+      .get() as { questId: string | null };
+    expect(stint.questId).toBe(questId);
+  });
+
+  test("an explicit new: naming the previous stint's quest joins it, logging the discarded outcome", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seedDeclared(database);
+    const log: string[] = [];
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: chase the flaky rerun",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "new: keep chasing the flaky rerun",
+          }),
+        ],
+        sessionNote: null,
+      },
+      { ...declaredOptions, log: (line) => log.push(line) },
+    );
+
+    // The model had no way to name the stint segment 1 just opened, so the
+    // second `new:` on the same quest joins it instead of splitting the work.
+    expect(summary.stintsOpened).toBe(1);
+    expect(summary.sameWindowReuse).toBe(1);
+    expect(
+      log.some(
+        (line) =>
+          line.includes("same outcome as segment 1") &&
+          line.includes("new: keep chasing the flaky rerun"),
+      ),
+    ).toBe(true);
+  });
+
+  test("an explicit new: with a switch still opens its own stint", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seedDeclared(database);
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: chase the flaky rerun",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "new: something else entirely",
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    expect(summary.stintsOpened).toBe(2);
+    expect(summary.sameWindowReuse).toBe(0);
+  });
+
+  test("a new: whose text matches an earlier segment's outcome ignoring punctuation reuses its stint", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seedDeclared(database);
+
+    const summary = applyResult(
+      store,
+      database,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: capture 3 admin screenshots",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "new: Capture 3 admin screenshots!",
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+
+    // A switch stops the same-outcome rule, but the `new:` text match still
+    // recognizes its own rephrasing (capitalized, trailing bang) and reuses
+    // the stint rather than opening a second one for the same outcome.
+    expect(summary.stintsOpened).toBe(1);
+    const traces = database
+      .query("SELECT stint_id as stintId FROM traces WHERE stint_id != 'A1'")
+      .all() as { stintId: string }[];
+    expect(new Set(traces.map((trace) => trace.stintId)).size).toBe(1);
+  });
+
   test("a subagent may place a segment on one of the parent's active quests", () => {
     const database = openDatabase(":memory:");
     const { store, heroId, questId } = seed(database);
