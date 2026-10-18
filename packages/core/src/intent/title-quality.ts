@@ -74,17 +74,26 @@ const DUPLICATE_STRIP_WORDS = new Set(["the", "a", "an", "for", "of"]);
 /** Generic words as the tokenizer sees them ("follow-up" -> "follow", "up"). */
 const GENERIC_TOKENS = new Set(GENERIC_WORDS.flatMap((word) => tokenize(word)));
 
+/**
+ * Title tokens, lowercased: every run of letters/digits (Unicode, so CJK and
+ * accented words survive as content), keeping `#`, `+` and an internal dot so
+ * language tokens stay distinct (`c#`, `c++`, `node.js`); `net` keeps a
+ * leading dot stripped (`.NET`). All other punctuation separates tokens,
+ * like whitespace does.
+ */
 function tokenize(value: string): string[] {
   return value
     .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length > 0);
+    .split(/[^\p{L}\p{N}+#.]+/u)
+    .map((token) => token.replace(/^\.+/, "").replace(/\.+$/, ""))
+    .filter((token) => /\p{L}|\p{N}/u.test(token));
 }
 
 /**
  * Case-, whitespace- and punctuation-insensitive title with the words
  * "the/a/an/for/of" dropped: two titles that normalize to the same string are
- * the same title ("Fix the sync token" == "fix sync, token").
+ * the same title ("Fix the sync token" == "fix sync, token"). Language-token
+ * punctuation survives tokenization, so `C#` and `C++` stay distinct.
  */
 function normalizeForDuplicate(title: string): string {
   return tokenize(title)
@@ -92,23 +101,7 @@ function normalizeForDuplicate(title: string): string {
     .join(" ");
 }
 
-/**
- * A technical identifier in the title as written: an uppercase acronym
- * (`JWT`, `SSH`, `TTL`) or a letter-digit mix (`S3`, `marko2`). These make a
- * short title concrete ("Fix JWT TTL") even though every token is 3 letters
- * or less, so shortness alone must not flag them.
- */
-function isTechnicalIdentifier(raw: string): boolean {
-  return /^[A-Z]{2,}[0-9]*$/.test(raw) || /^[A-Za-z]+[0-9]+[A-Za-z0-9]*$/.test(raw);
-}
-
 /** Raw whitespace-separated words of the title as written (case kept). */
-function rawWords(title: string): string[] {
-  return title
-    .trim()
-    .split(/\s+/)
-    .filter((word) => word.length > 0);
-}
 
 /**
  * Judge a proposed quest title against the existing quests the caller chose to
@@ -120,15 +113,14 @@ function rawWords(title: string): string[] {
  *     one of the existing titles, or equality after additionally stripping the
  *     words "the/a/an/for/of". The existing quest's id is suggested, never
  *     enforced: the caller creates the quest anyway.
- * (b) vague -- the title matches a code (`S1`, `42`), or is made only of
- *     generic words ("fix stuff and things") and stop words, or is short
- *     without anything concrete in it. Shortness is a supporting signal,
- *     never a verdict on its own: a short title that names a specific object
- *     ("Fix deadlocks", "Rotate credentials") or carries a technical
- *     identifier ("Fix JWT TTL", "Add SSH key") is ok. Concretely, the third
- *     rule fires only when the title has at most 3 words, none longer than 3
- *     letters, and none is a technical identifier (an uppercase acronym like
- *     `JWT`/`SSH` or a letter-digit mix like `S3`).
+ * (b) vague -- the title matches a code (`S1`, `42`), is made only of
+ *     generic words ("fix stuff and things") and stop words, or says nothing
+ *     but stop words ("and of it"). Word count and word length are never a
+ *     verdict on their own: a short title that names any concrete object
+ *     ("Add ssh key", "Fix jwt ttl", case irrelevant), a technical token
+ *     ("Fix C# bug", "Fix C++ bug") or a non-Latin subject
+ *     ("修复同步令牌刷新") is ok, because any token that is neither generic
+ *     nor a stop word is content the verifier can match work against.
  * (c) otherwise ok.
  */
 export function judgeTitleQuality(
@@ -162,10 +154,8 @@ export function judgeTitleQuality(
   if (contentTokens.length > 0 && contentTokens.every((token) => GENERIC_TOKENS.has(token))) {
     return { verdict: "vague", reason: "only generic words" };
   }
-  const longest = tokens.reduce((max, token) => Math.max(max, token.length), 0);
-  const hasTechnical = rawWords(trimmed).some((word) => isTechnicalIdentifier(word));
-  if (tokens.length <= 3 && longest <= 3 && !hasTechnical) {
-    return { verdict: "vague", reason: "short title with nothing specific in it" };
+  if (contentTokens.length === 0) {
+    return { verdict: "vague", reason: "only stop words" };
   }
 
   return { verdict: "ok", reason: "" };

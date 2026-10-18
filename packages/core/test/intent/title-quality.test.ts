@@ -20,16 +20,23 @@ const ROWS: { title: string; verdict: TitleVerdictKind; note?: string }[] = [
   { title: "cleanup", verdict: "vague" },
   { title: "follow up", verdict: "vague" },
   { title: "fix the bug", verdict: "vague" }, // only generic words + stop word
-  // Short title with nothing specific in it (shortness alone is not a verdict).
-  { title: "fix the api", verdict: "vague" },
-  { title: "run db fix", verdict: "vague" },
-  // Review r1 counterexamples: short titles that name a concrete object or a
-  // technical identifier are ok.
+  // A title that names any concrete object is ok no matter how short, and
+  // regardless of case: every token that is neither generic nor a stop word
+  // is content the verifier can match work against (r2).
+  { title: "fix the api", verdict: "ok" }, // api is a concrete object here
+  { title: "run db fix", verdict: "ok" },
+  // Review r1/r2 counterexamples: short titles that name a concrete object or
+  // a technical token are ok, case- and script-insensitively.
   { title: "Fix deadlocks", verdict: "ok" },
   { title: "Rotate credentials", verdict: "ok" },
   { title: "Upgrade PostgreSQL", verdict: "ok" },
-  { title: "Add SSH key", verdict: "ok" }, // uppercase acronym makes it concrete
-  { title: "Fix JWT TTL", verdict: "ok" }, // uppercase acronyms make it concrete
+  { title: "Add SSH key", verdict: "ok" },
+  { title: "Add ssh key", verdict: "ok" }, // case is irrelevant
+  { title: "Fix JWT TTL", verdict: "ok" },
+  { title: "Fix jwt ttl", verdict: "ok" }, // case is irrelevant
+  { title: "Fix C# bug", verdict: "ok" }, // language token
+  { title: "Fix C++ bug", verdict: "ok" }, // language token
+  { title: "修复同步令牌刷新", verdict: "ok" }, // non-Latin words are content
   { title: "Back up S3 buckets", verdict: "ok" }, // letter-digit identifier
   // Only generic words (longer than 3 words, long words present).
   { title: "fix stuff and things", verdict: "vague" },
@@ -100,14 +107,23 @@ describe("judgeTitleQuality", () => {
       });
     });
 
-    test("C# and C++ normalize to the same token (known, documented collision)", () => {
-      // Punctuation is stripped for the duplicate comparison, so the tokenizer
-      // cannot tell the two languages apart. Accepted for now: an exact-title
-      // duplicate only suggests a reword, never blocks the declaration.
+    test("C# and C++ stay distinct titles", () => {
+      // Language-token punctuation survives normalization, so the tokenizer
+      // can tell the two languages apart (r2).
       expect(
         judgeTitleQuality("Install the C# compiler", [
           { id: "q3", title: "Install the C++ compiler" },
         ]).verdict,
+      ).toBe("ok");
+      // ...while the same language token in different cases still collides.
+      expect(
+        judgeTitleQuality("install the c# compiler", [
+          { id: "q4", title: "Install the C# compiler" },
+        ]).verdict,
+      ).toBe("duplicate");
+      expect(
+        judgeTitleQuality("Use Node.js streams", [{ id: "q5", title: "use node.js streams" }])
+          .verdict,
       ).toBe("duplicate");
     });
   });
