@@ -1,10 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireLock,
+  CLEARING_STALE_MS,
   checkLock,
+  clearingPathFor,
   clearStaleLock,
   LOCK_MAX_HOLD_HOURS,
   lockPid,
@@ -12,6 +22,7 @@ import {
   releaseLock,
   STALE_LOCK_MINUTES,
   touchLock,
+  tryClearStaleLock,
 } from "../../src/w5/lock";
 
 const NOW = Date.parse("2026-10-17T12:00:00.000Z");
@@ -192,7 +203,7 @@ describe("acquireLock and releaseLock", () => {
       const lockPath = join(directory, "w5.lock");
       const script = `
         import { acquireLock } from ${JSON.stringify(join(import.meta.dir, "../../src/w5/lock"))};
-        while (Date.now() < Number(process.argv[2])) {}
+        while (Date.now() < Number(process.argv[1])) {}
         console.log(acquireLock(process.argv[1]) ? "won" : "lost");
         await Bun.sleep(300);
       `;
@@ -268,5 +279,171 @@ describe("a lock that vanishes mid-check is no lock", () => {
 
   test("clearStaleLock on a missing lock does nothing", () => {
     expect(clearStaleLock("/nonexistent-tempad-dir/w5.lock", () => {}, { now: NOW })).toBe(false);
+  });
+});
+
+describe("tryClearStaleLock", () => {
+  test("a lock another run replaced after the first verdict is not removed", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        afterJudgedStale: () => {
+          rmSync(path);
+          writeFileSync(path, String(process.pid));
+          utimesSync(path, new Date(NOW), new Date(NOW));
+        },
+      });
+      expect(outcome).toBe("not-stale");
+      expect(lockPid(path)).toBe(process.pid);
+      expect(existsSync(clearingPathFor(path))).toBe(false);
+    });
+  });
+
+  test("skips while another run holds the clearing handoff, leaving both files alone", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      writeFileSync(clearingPathFor(path), String(process.pid));
+      const outcome = tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false });
+      expect(outcome).toBe("contended");
+      expect(existsSync(path)).toBe(true);
+      expect(existsSync(clearingPathFor(path))).toBe(true);
+    });
+  });
+
+  test("removes an abandoned handoff and still skips that run", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(process.pid));
+      const abandoned = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(clearing, abandoned, abandoned);
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe(
+        "contended",
+      );
+      expect(existsSync(clearing)).toBe(false);
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe("cleared");
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a grace of 0 clears a dead runner's fresh lock but never a pid-less one", () => {
+    withLock("4242", 0, (path) => {
+      const options = { now: NOW, isAlive: () => false, deadRunnerGraceMinutes: 0 };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
+    });
+    withLock("", 0, (path) => {
+      const options = { now: NOW, isAlive: () => false, deadRunnerGraceMinutes: 0 };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("not-stale");
+      expect(existsSync(path)).toBe(true);
+    });
+  });
+});
+
+describe("racing processes over a stale lock: exactly one takes it", () => {
+  const RACERS = 8;
+  const LOCK_MODULE = JSON.stringify(join(import.meta.dir, "../../src/w5/lock"));
+  const SYNC_LOCK_MODULE = JSON.stringify(join(import.meta.dir, "../../src/sync/lock"));
+
+  /**
+   * Every racer spins to the same instant, judges the stale lock, and sleeps 100 ms before it
+   * takes the clearing handoff and again before it unlinks. The second sleep is the window in
+   * which, without the handoff, every racer has judged the lock stale a second time: one
+   * unlinks it and takes a fresh lock, the next unlinks that live lock and takes its own.
+   * It prints `won` only when it holds the lock afterwards, then stays alive long enough that a
+   * winner's lock is not judged dead by a slower racer.
+   */
+  const w5Racer = `
+    import { acquireLock, clearStaleLock } from ${LOCK_MODULE};
+    while (Date.now() < Number(process.argv[2])) {}
+    clearStaleLock(process.argv[1], () => {}, { afterJudgedStale: () => Bun.sleepSync(100), beforeUnlink: () => Bun.sleepSync(100) });
+    console.log(acquireLock(process.argv[1]) ? "won" : "lost");
+    await Bun.sleep(1000);
+  `;
+  const syncRacer = `
+    import { acquireSyncLock } from ${SYNC_LOCK_MODULE};
+    while (Date.now() < Number(process.argv[1])) {}
+    const lock = acquireSyncLock(process.argv[2], () => {}, { afterJudgedDead: () => Bun.sleepSync(100), beforeUnlink: () => Bun.sleepSync(100) });
+    console.log(lock.held ? "won" : "lost");
+    await Bun.sleep(1000);
+  `;
+
+  async function race(script: string, args: (startAt: string) => string[]): Promise<string[]> {
+    const startAt = String(Date.now() + 2000);
+    const racers = Array.from({ length: RACERS }, () =>
+      Bun.spawn(["bun", "--no-env-file", "-e", script, ...args(startAt)], {
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    return Promise.all(
+      racers.map(async (racer) => {
+        const [out, err] = await Promise.all([
+          new Response(racer.stdout).text(),
+          new Response(racer.stderr).text(),
+        ]);
+        if (err.trim()) throw new Error(`racer failed: ${err}`);
+        return out.trim();
+      }),
+    );
+  }
+
+  function expectOneWinner(results: string[]): void {
+    expect(results.filter((result) => result === "won")).toHaveLength(1);
+    expect(results.filter((result) => result === "lost")).toHaveLength(RACERS - 1);
+  }
+
+  async function withDirectory(run: (directory: string) => Promise<void>): Promise<void> {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-lock-stale-race-"));
+    try {
+      await run(directory);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  const old = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+
+  const w5Cases: { name: string; content: () => string; ageMinutes: number }[] = [
+    {
+      name: "its runner is gone",
+      content: () => String(deadPid()),
+      ageMinutes: STALE_LOCK_MINUTES + 1,
+    },
+    { name: "it holds no pid", content: () => "", ageMinutes: STALE_LOCK_MINUTES + 1 },
+    {
+      name: "it is past the hold ceiling with a live pid",
+      content: () => String(process.pid),
+      ageMinutes: LOCK_MAX_HOLD_HOURS * 60 + 1,
+    },
+  ];
+
+  for (const { name, content, ageMinutes } of w5Cases) {
+    test(`w5.lock, ${name}`, async () => {
+      await withDirectory(async (directory) => {
+        const lockPath = join(directory, "w5.lock");
+        writeFileSync(lockPath, content());
+        utimesSync(lockPath, old(ageMinutes), old(ageMinutes));
+        expectOneWinner(await race(w5Racer, (startAt) => [lockPath, startAt]));
+        expect(readdirSync(directory).sort()).toEqual(["w5.lock"]);
+      });
+    });
+  }
+
+  test("sync.lock, its runner is gone (no grace)", async () => {
+    await withDirectory(async (directory) => {
+      writeFileSync(join(directory, ".env"), "");
+      writeFileSync(join(directory, "sync.lock"), String(deadPid()));
+      expectOneWinner(await race(syncRacer, (startAt) => [startAt, directory]));
+      expect(readdirSync(directory).sort()).toEqual([".env", "sync.lock"]);
+    });
+  });
+
+  test("sync.lock, it holds no pid and is older than the grace", async () => {
+    await withDirectory(async (directory) => {
+      writeFileSync(join(directory, ".env"), "");
+      const lockPath = join(directory, "sync.lock");
+      writeFileSync(lockPath, "");
+      utimesSync(lockPath, old(STALE_LOCK_MINUTES + 1), old(STALE_LOCK_MINUTES + 1));
+      expectOneWinner(await race(syncRacer, (startAt) => [startAt, directory]));
+    });
   });
 });

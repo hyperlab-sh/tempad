@@ -1,6 +1,5 @@
 import {
   closeSync,
-  existsSync,
   openSync,
   readFileSync,
   statSync,
@@ -45,6 +44,20 @@ export interface LockCheck {
   ageMinutes: number;
   /** Which rule made it stale; absent when it is not. */
   reason?: "past-ceiling" | "no-pid" | "runner-gone";
+  /** The pid the lock named when the verdict was `runner-gone`. */
+  pid?: number;
+}
+
+export interface LockCheckOptions {
+  now?: number;
+  isAlive?: (pid: number) => boolean;
+  /**
+   * How long a lock whose runner is gone is left alone before it counts as stale; defaults to
+   * `STALE_LOCK_MINUTES`. `sync.lock` passes 0: a sync killed by a signal leaves its lock
+   * behind, and the grace would make every run in the next half hour skip. It never applies to
+   * a lock with no pid, which may be a holder that has not written its pid yet.
+   */
+  deadRunnerGraceMinutes?: number;
 }
 
 /**
@@ -52,15 +65,14 @@ export interface LockCheck {
  * runner that wrote it is gone, or when it is older than `LOCK_MAX_HOLD_HOURS`
  * whatever its pid says. Age alone is not enough: a laptop that sleeps through
  * a job wakes with a lock that looks 30 minutes old and a runner that is fine.
- * A lock that vanishes before it can be read (another runner cleared or released
- * it) is no lock: not stale, nothing to clear.
+ * A lock naming this process is never judged dead. A lock that vanishes before
+ * it can be read (another runner cleared or released it) is no lock: not stale,
+ * nothing to clear.
  */
-export function checkLock(
-  lockPath: string,
-  options: { now?: number; isAlive?: (pid: number) => boolean } = {},
-): LockCheck {
+export function checkLock(lockPath: string, options: LockCheckOptions = {}): LockCheck {
   const now = options.now ?? Date.now();
   const isAlive = options.isAlive ?? pidIsAlive;
+  const deadRunnerGrace = options.deadRunnerGraceMinutes ?? STALE_LOCK_MINUTES;
   let modifiedMs: number;
   try {
     modifiedMs = statSync(lockPath).mtimeMs;
@@ -68,48 +80,127 @@ export function checkLock(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { stale: false, ageMinutes: 0 };
     throw error;
   }
-  const ageMinutes = (now - modifiedMs) / 60_000;
-  if (ageMinutes < STALE_LOCK_MINUTES) return { stale: false, ageMinutes };
+  // a file stamped a few ms ahead of the clock reads as negative age; with a 0 grace that is not 'old enough'
+  const ageMinutes = Math.max(0, now - modifiedMs) / 60_000;
   if (ageMinutes >= LOCK_MAX_HOLD_HOURS * 60) {
     return { stale: true, ageMinutes, reason: "past-ceiling" };
   }
   const pid = lockPid(lockPath);
-  if (pid === null) return { stale: true, ageMinutes, reason: "no-pid" };
-  if (!isAlive(pid)) return { stale: true, ageMinutes, reason: "runner-gone" };
-  return { stale: false, ageMinutes };
+  if (pid === null) {
+    return ageMinutes >= STALE_LOCK_MINUTES
+      ? { stale: true, ageMinutes, reason: "no-pid" }
+      : { stale: false, ageMinutes };
+  }
+  if (pid === process.pid || isAlive(pid)) return { stale: false, ageMinutes };
+  return ageMinutes >= deadRunnerGrace
+    ? { stale: true, ageMinutes, reason: "runner-gone", pid }
+    : { stale: false, ageMinutes };
 }
 
+/** The critical section is microseconds; a clearing lock older than this was abandoned, whatever its pid says. */
+export const CLEARING_STALE_MS = 10_000;
+
+/** The handoff file that serializes clearing `lockPath`. */
+export function clearingPathFor(lockPath: string): string {
+  return `${lockPath}.clearing`;
+}
+
+/** Test seams: what runs between judging the lock stale and taking the handoff, and between the second judgment and the unlink. */
+export interface ClearStaleLockOptions extends LockCheckOptions {
+  name?: string;
+  afterJudgedStale?: () => void;
+  beforeUnlink?: () => void;
+}
+
+export type ClearOutcome =
+  /** Not stale, or gone: nothing to clear. */
+  | "not-stale"
+  /** This call removed the stale lock. */
+  | "cleared"
+  /** Another run holds the clearing handoff (or just abandoned one): skip this run's work. */
+  | "contended";
+
 /**
- * Removes the lock when it is stale; returns whether it did. Check, then unlink:
- * two runners can both judge one lock stale and both remove it, and one may
- * unlink a lock the other has just taken. That is harmless. The lock only saves
- * duplicate work; what guarantees a job is applied once is its claim
- * (`holdsClaim`, `src/w5/jobs.ts`), which a lost lock does not touch.
+ * Removes the lock when it is stale, atomically with respect to other runs doing the same.
+ *
+ * Check-then-unlink is not enough: two runs can both judge one lock stale, one unlinks it and
+ * takes a fresh lock, and the other then unlinks that live lock and takes its own, so both run.
+ * So the clear is serialized by `<lock>.clearing`, taken with `O_EXCL` and held only while the
+ * lock is judged again and unlinked. The second judgment is what makes the first one safe to
+ * act on: a lock another run took in between is fresh (or names a live runner) and is left
+ * alone, and nothing else unlinks a lock file that exists (`O_EXCL` creation fails while it
+ * does, and `releaseLock` only removes its own pid's). A run that finds the handoff taken
+ * returns `contended` instead of waiting: the critical section takes microseconds, and whoever
+ * holds it is doing this very clear. A handoff left by a clearer that died inside that window is
+ * removed by the next run (that run is `contended` too) once its pid is gone or it is older than
+ * `CLEARING_STALE_MS`, whatever its pid says (a crash before the pid was written, or a reused
+ * live pid, would otherwise block every run forever); two runs removing that abandoned handoff
+ * at once is the one remaining race, and it needs a crash inside the critical section first.
+ * `releaseLock` unlinks by path after reading the pid, so a holder past the hold ceiling
+ * releasing at the very moment it is cleared can still take down the lock a third run just
+ * acquired; that needs a runner that held the lock for over six hours and is harmless to
+ * correctness (a job is applied once by its claim, `holdsClaim`, `src/w5/jobs.ts`; the lock only
+ * saves duplicate work).
  */
+export function tryClearStaleLock(
+  lockPath: string,
+  log: (line: string) => void,
+  options: ClearStaleLockOptions = {},
+): ClearOutcome {
+  if (!checkLock(lockPath, options).stale) return "not-stale";
+  options.afterJudgedStale?.();
+
+  const clearingPath = clearingPathFor(lockPath);
+  if (!acquireLock(clearingPath)) {
+    if (clearingIsStale(clearingPath, options.isAlive ?? pidIsAlive)) removeIfPresent(clearingPath);
+    return "contended";
+  }
+  try {
+    const { stale, ageMinutes, reason, pid } = checkLock(lockPath, options);
+    if (!stale) return "not-stale";
+    const why = {
+      "past-ceiling": `older than the ${LOCK_MAX_HOLD_HOURS}h hold ceiling, whatever its pid`,
+      "no-pid": "no pid in it",
+      "runner-gone": `its runner is not running (pid ${pid})`,
+      undefined: "stale",
+    }[String(reason)];
+    log(
+      `${options.name ?? "w5.lock"} is stale (${Math.round(ageMinutes)}m untouched, ${why}), removing`,
+    );
+    options.beforeUnlink?.();
+    removeIfPresent(lockPath);
+    return "cleared";
+  } finally {
+    releaseLock(clearingPath);
+  }
+}
+
+/** `tryClearStaleLock` for a caller that only wants to know whether this call removed the lock. */
 export function clearStaleLock(
   lockPath: string,
   log: (line: string) => void,
-  options: { now?: number; isAlive?: (pid: number) => boolean; name?: string } = {},
+  options: ClearStaleLockOptions = {},
 ): boolean {
-  if (!existsSync(lockPath)) return false;
-  const { stale, ageMinutes, reason } = checkLock(lockPath, options);
-  if (!stale) return false;
-  const why = {
-    "past-ceiling": `older than the ${LOCK_MAX_HOLD_HOURS}h hold ceiling, whatever its pid`,
-    "no-pid": "no pid in it",
-    "runner-gone": "its runner is not running",
-    undefined: "stale",
-  }[String(reason)];
-  log(
-    `${options.name ?? "w5.lock"} is stale (${Math.round(ageMinutes)}m untouched, ${why}), removing`,
-  );
+  return tryClearStaleLock(lockPath, log, options) === "cleared";
+}
+
+function clearingIsStale(clearingPath: string, isAlive: (pid: number) => boolean): boolean {
   try {
-    unlinkSync(lockPath);
+    if (Date.now() - statSync(clearingPath).mtimeMs > CLEARING_STALE_MS) return true;
+  } catch {
+    return false; // gone already: whoever held it finished
+  }
+  const clearer = lockPid(clearingPath);
+  return clearer !== null && clearer !== process.pid && !isAlive(clearer);
+}
+
+function removeIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
   } catch (error) {
-    // already gone: another runner cleared it first
+    // already gone: another run cleared it first
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  return true;
 }
 
 /** Marks the lock as held right now; a runner calls it before each job. */

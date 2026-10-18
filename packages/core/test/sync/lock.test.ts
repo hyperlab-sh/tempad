@@ -60,7 +60,9 @@ describe("acquireSyncLock", () => {
     const lines: string[] = [];
     using lock = acquireSyncLock(home, (line) => lines.push(line));
     expect(lock.held).toBe(true);
-    expect(lines).toEqual([`sync.lock was left by a sync that is gone (pid ${pid}), removing`]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toStartWith("sync.lock is stale (");
+    expect(lines[0]).toContain(`its runner is not running (pid ${pid})`);
     expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
   });
 
