@@ -2117,46 +2117,83 @@ describe("segments of one inference window reach what earlier segments opened", 
     expect(confidence.confidence).toBeLessThanOrEqual(0.5);
   });
 
-  test("a quest id in a stint slot prefers this window's stint over a closed one of the quest in recentStints", () => {
+  test.each([
+    { name: "and no matchedQuest", matchedQuest: null },
+    // The likeliest shape: the model names the quest in both slots.
+    { name: "and the same quest in matchedQuest", matchedQuest: "Q1" },
+  ])(
+    "a quest id in a stint slot $name prefers this window's stint over a closed one of the quest in recentStints",
+    ({ matchedQuest }) => {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES ('OLD', 'Q1', 'earlier contracts', '2026-10-03T00:00:00.000Z', '2026-10-03T01:00:00.000Z', 'idle', 1)",
+        )
+        .run();
+      const candidates: ClassifierWindow = {
+        ...offerTwoQuests(database),
+        recentStints: [
+          {
+            stintId: "OLD",
+            what: "earlier contracts",
+            why: "x",
+            questId: "Q1",
+            questTitle: "Ship marko-ui",
+            openedAt: "2026-10-03T00:00:00.000Z",
+            lastTraceEndedAt: "2026-10-03T01:00:00.000Z",
+            closedAt: "2026-10-03T01:00:00.000Z",
+            closeReason: "idle",
+          },
+        ],
+      };
+
+      // Before: segment 2 continued OLD (a link to another session's closed
+      // stint) while segment 1's stint of Q1 was still open in this window.
+      run(
+        database,
+        store,
+        [
+          segmentAt(1, { matchedQuest: "Q1" }),
+          segmentAt(2, { matchedStint: "Q1", matchedQuest, newStintReason: null }),
+        ],
+        candidates,
+      );
+
+      expect(sessionStints(database)).toEqual([
+        { id: expect.any(String), questId: "Q1", continues: null, traces: 2 },
+      ]);
+    },
+  );
+
+  test("a quest id in a stint slot lands on the latest of the window's stints of that quest", () => {
     const database = openDatabase(":memory:");
     const { store } = seed(database);
-    database
-      .query(
-        "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES ('OLD', 'Q1', 'earlier contracts', '2026-10-03T00:00:00.000Z', '2026-10-03T01:00:00.000Z', 'idle', 1)",
-      )
-      .run();
-    const candidates: ClassifierWindow = {
-      ...offerTwoQuests(database),
-      recentStints: [
-        {
-          stintId: "OLD",
-          what: "earlier contracts",
-          why: "x",
-          questId: "Q1",
-          questTitle: "Ship marko-ui",
-          openedAt: "2026-10-03T00:00:00.000Z",
-          lastTraceEndedAt: "2026-10-03T01:00:00.000Z",
-          closedAt: "2026-10-03T01:00:00.000Z",
-          closeReason: "idle",
-        },
-      ],
-    };
 
-    // Before: segment 2 continued OLD (a link to another session's closed
-    // stint) while segment 1's stint of Q1 was still open in this window.
-    run(
+    // Segment 2 opens a second stint of Q1 on purpose (a switch with its own
+    // reason); segment 3 naming Q1 continues the one in flight, segment 2's.
+    const { logs } = run(
       database,
       store,
       [
         segmentAt(1, { matchedQuest: "Q1" }),
-        segmentAt(2, { matchedStint: "Q1", newStintReason: null }),
+        segmentAt(2, {
+          matchedQuest: "Q1",
+          newStintReason: "a second deliverable of the brief",
+          isSwitch: true,
+        }),
+        segmentAt(3, { matchedStint: "Q1", newStintReason: null, isSwitch: true }),
       ],
-      candidates,
+      offerTwoQuests(database),
     );
 
-    expect(sessionStints(database)).toEqual([
-      { id: expect.any(String), questId: "Q1", continues: null, traces: 2 },
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      ["Q1", 1],
+      ["Q1", 2],
     ]);
+    expect(
+      logs.some((line) => line.includes("stint selector named quest Q1, on segment 2's stint")),
+    ).toBe(true);
   });
 
   test("a quest id in continuesStint lands on the same window's stint too", () => {
