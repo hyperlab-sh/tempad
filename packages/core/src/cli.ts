@@ -272,11 +272,13 @@ async function runSyncCommand(args: string[]): Promise<number> {
     }
     return runRejoinCommand(values.rejoin);
   }
-  // One collecting sync at a time: a scheduled run that overlaps a manual one skips.
+  // One collecting sync at a time: a scheduled run that overlaps a manual one skips. A plain
+  // sync exits 0 (nothing is wrong, the other run is doing the work); `--push`/`--pull` exit 75
+  // (EX_TEMPFAIL) because a script that asked for exactly that push got nothing.
   using syncLock = acquireSyncLock(tempadHome());
   if (!syncLock.held) {
     console.error(SYNC_BUSY_MESSAGE);
-    return 0;
+    return directional ? 75 : 0;
   }
   const needs: ConfigKey[] = [...new Set(selected.flatMap((collector) => collector.needs))];
   // Push sync needs the host tag and the server token, and only when [sync] is enabled:

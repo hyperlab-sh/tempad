@@ -48,10 +48,39 @@ describe("acquireSyncLock", () => {
     expect(existsSync(join(home, "sync.lock"))).toBe(true);
   });
 
-  test("a lock left by a crashed run is cleared once it is 30 minutes old and its pid is gone", async () => {
+  test("a lock whose holder was killed is cleared at once, not after the 30 minute grace", async () => {
+    const home = configuredHome();
+    const pid = await deadPid();
+    writeFileSync(join(home, "sync.lock"), String(pid));
+    const lines: string[] = [];
+    using lock = acquireSyncLock(home, (line) => lines.push(line));
+    expect(lock.held).toBe(true);
+    expect(lines).toEqual([`sync.lock was left by a sync that is gone (pid ${pid}), removing`]);
+    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
+  });
+
+  test("a SIGKILLed sync leaves a lock the next sync clears", async () => {
+    const home = configuredHome();
+    const child = Bun.spawn(["sleep", "60"]);
+    writeFileSync(join(home, "sync.lock"), String(child.pid));
+    {
+      using blocked = acquireSyncLock(home);
+      expect(blocked.held).toBe(false);
+    }
+    child.kill("SIGKILL");
+    await child.exited;
+    using lock = acquireSyncLock(home);
+    expect(lock.held).toBe(true);
+  });
+
+  test("a lock with no pid yet is not a dead holder: fresh it blocks, 30 minutes old the age rule clears it", () => {
     const home = configuredHome();
     const lockPath = join(home, "sync.lock");
-    writeFileSync(lockPath, String(await deadPid()));
+    writeFileSync(lockPath, "");
+    {
+      using fresh = acquireSyncLock(home);
+      expect(fresh.held).toBe(false);
+    }
     const old = new Date(Date.now() - 31 * 60_000);
     utimesSync(lockPath, old, old);
     const lines: string[] = [];
@@ -62,9 +91,9 @@ describe("acquireSyncLock", () => {
     expect(lines[0]).not.toContain("w5.lock");
   });
 
-  test("a fresh lock of a dead pid still blocks (the age rule keeps a sleeping laptop's run safe)", async () => {
+  test("a fresh lock holding this process's own pid is held, not cleared", () => {
     const home = configuredHome();
-    writeFileSync(join(home, "sync.lock"), String(await deadPid()));
+    writeFileSync(join(home, "sync.lock"), String(process.pid));
     using lock = acquireSyncLock(home);
     expect(lock.held).toBe(false);
   });
@@ -120,6 +149,16 @@ describe("tempad sync while another sync runs", () => {
     expect(result.stdout).toBe("");
     expect(existsSync(join(home, "tempad.db"))).toBe(false);
     expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
+  });
+
+  test("--push and --pull exit 75 (temporary failure): a script that asked for the push got nothing", async () => {
+    const home = configuredHome();
+    writeFileSync(join(home, "sync.lock"), String(process.pid));
+    for (const flag of ["--push", "--pull"]) {
+      const result = await tempad(["sync", flag], home);
+      expect(result.code).toBe(75);
+      expect(result.stderr.trim()).toBe(SYNC_BUSY_MESSAGE);
+    }
   });
 
   test("--forget and --rejoin are local and ignore the lock", async () => {
