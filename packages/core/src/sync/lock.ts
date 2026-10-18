@@ -5,7 +5,9 @@ import {
   acquireLock,
   CLEARING_STALE_MS,
   clearingPathFor,
+  lockPid,
   releaseLock,
+  touchLock,
   tryClearStaleLock,
 } from "../w5/lock.ts";
 
@@ -36,11 +38,21 @@ export interface SyncLock {
 
 export const SYNC_LOCK_FILE = "sync.lock";
 
+/**
+ * The held lock is touched this often, so a sync that outlives the 6 h hold ceiling (a first
+ * sync of a large history) is not judged stale and taken over, as `w5 run` touches its lock
+ * before every job. Not touched while the event loop is blocked, which is the same as a dead
+ * runner for the ceiling's purposes.
+ */
+export const SYNC_LOCK_TOUCH_MS = 5 * 60_000;
+
 export const SYNC_CLEARING_FILE = clearingPathFor(SYNC_LOCK_FILE);
 export { CLEARING_STALE_MS };
 
 /** Test seams: what runs around clearing a lock judged dead (`ClearStaleLockOptions`), and the liveness check. */
 export interface SyncLockHooks {
+  /** How often the held lock is touched; defaults to `SYNC_LOCK_TOUCH_MS`. */
+  touchIntervalMs?: number;
   afterJudgedDead?: () => void;
   beforeUnlink?: () => void;
   isAlive?: (pid: number) => boolean;
@@ -64,9 +76,15 @@ export function acquireSyncLock(
   });
   if (outcome === "contended") return busy;
   if (!acquireLock(lockPath)) return busy;
+  const toucher = setInterval(() => {
+    // only our own lock: one cleared under us and retaken is another run's
+    if (lockPid(lockPath) === process.pid) touchLock(lockPath);
+  }, hooks.touchIntervalMs ?? SYNC_LOCK_TOUCH_MS);
+  toucher.unref();
   return {
     held: true,
     [Symbol.dispose]() {
+      clearInterval(toucher);
       releaseLock(lockPath);
     },
   };

@@ -528,6 +528,8 @@ describe("status on macOS", () => {
       command: [box.runtime, "--no-env-file", box.script, "sync"],
       bunVersion: null,
       bunPinned: null,
+      bunCheckoutPin: null,
+      bunViaProtoShim: false,
       logPath: log,
       problems: [],
     });
@@ -1114,6 +1116,40 @@ describe("the Bun version a scheduled job runs", () => {
       expect(readBunPin(box.script)).toBeNull();
     });
 
+    test("the search stops at the repository root: a .prototools above the checkout is not its pin", () => {
+      const box = sandbox();
+      prototools(box.root, 'bun = "9.9.9"\n');
+      // a worktree's .git is a file, a clone's a directory
+      writeFileSync(join(box.root, "checkout", ".git"), "gitdir: /elsewhere\n");
+      expect(readBunPin(box.script)).toBeNull();
+      // the root's own .prototools is still read: the stop comes after the file is checked
+      const source = prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+      expect(readBunPin(box.script)).toEqual({ version: "1.4.2", source });
+    });
+
+    test("a pin in a package under the repository root is found from packages/core, the pin is at the root", () => {
+      const box = sandbox();
+      const core = join(box.root, "checkout", "packages", "core");
+      mkdirSync(join(core, "src"), { recursive: true });
+      writeFileSync(join(core, "package.json"), "{}");
+      writeFileSync(join(core, "src", "cli.ts"), "");
+      mkdirSync(join(box.root, "checkout", ".git"));
+      const source = prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+      expect(readBunPin(join(core, "src", "cli.ts"))).toEqual({ version: "1.4.2", source });
+    });
+
+    test("the search stops at the root of a package installed under node_modules", () => {
+      const box = sandbox();
+      prototools(box.root, 'bun = "9.9.9"\n');
+      const installed = join(box.root, "global", "node_modules", "@hyperlab.sh", "tempad");
+      mkdirSync(join(installed, "src"), { recursive: true });
+      writeFileSync(join(installed, "package.json"), "{}");
+      writeFileSync(join(installed, "src", "cli.ts"), "");
+      expect(readBunPin(join(installed, "src", "cli.ts"))).toBeNull();
+      const source = prototools(installed, 'bun = "1.4.2"\n');
+      expect(readBunPin(join(installed, "src", "cli.ts"))).toEqual({ version: "1.4.2", source });
+    });
+
     test("the pin passes through as written, so a range or alias reaches proto unchanged", () => {
       const box = sandbox();
       prototools(join(box.root, "checkout"), 'bun = "1.4"\n');
@@ -1387,6 +1423,83 @@ describe("the Bun version a scheduled job runs", () => {
       expect(text).toContain("does not start (exit 1: This project requires Bun 1.4.2");
       expect(text).toContain("it is pinned to 1.4.2");
       expect(text).toContain("bun: pinned to 1.4.2 (PROTO_BUN_VERSION)");
+    });
+
+    describe("the checkout's pin moved since install", () => {
+      function installedOnShim(box: Sandbox, baked: typeof pin | null) {
+        const shims = join(box.home, ".proto", "shims");
+        mkdirSync(shims, { recursive: true });
+        const shim = join(shims, "bun");
+        writeFileSync(shim, "");
+        schedule(box, "darwin", ["install"], runner(), {
+          resolveEntry: () => ({ runtime: shim, script: box.script, bunPin: baked }),
+        });
+        return recording(
+          { stdout: `${baked?.version ?? "1.3.14"}\n` },
+          { "launchctl print": { stdout: LAUNCHD_PRINT } },
+        );
+      }
+
+      test("a changed pin is a problem naming both versions and the fix, and exits 1", () => {
+        const box = sandbox();
+        const asked = installedOnShim(box, { version: "1.3.14", source: "/old/.prototools" });
+        const source = prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+        const result = schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run });
+        expect(result.code).toBe(1);
+        const parsed = JSON.parse(result.out.join("\n"));
+        expect(parsed).toMatchObject({
+          bunPinned: "1.3.14",
+          bunCheckoutPin: "1.4.2",
+          bunViaProtoShim: true,
+        });
+        expect(parsed.problems).toEqual([
+          `${source} now pins Bun 1.4.2, but the job is pinned to 1.3.14; run \`tempad schedule install\` to update it`,
+        ]);
+      });
+
+      test("a job installed with no pin, in a checkout that has one since, is told to reinstall too", () => {
+        const box = sandbox();
+        const asked = installedOnShim(box, null);
+        prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+        const result = schedule(box, "darwin", ["status"], { calls: [], run: asked.run });
+        expect(result.code).toBe(1);
+        expect(result.out.join("\n")).toContain(
+          "but the job carries no pin; run `tempad schedule install`",
+        );
+      });
+
+      test("the same pin is no problem; a pin that was removed leaves the job as it was", () => {
+        const box = sandbox();
+        const asked = installedOnShim(box, { version: "1.4.2", source: "/x/.prototools" });
+        const file = prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+        expect(
+          JSON.parse(
+            schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run }).out.join(
+              "\n",
+            ),
+          ).problems,
+        ).toEqual([]);
+        rmSync(file);
+        const after = schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run });
+        expect(JSON.parse(after.out.join("\n")).problems).toEqual([]);
+        expect(JSON.parse(after.out.join("\n")).bunCheckoutPin).toBeNull();
+      });
+
+      test("a job on a runtime that is not the proto shim never compares pins", () => {
+        const box = sandbox();
+        schedule(box, "darwin", ["install"], runner());
+        prototools(join(box.root, "checkout"), 'bun = "1.4.2"\n');
+        const asked = recording(
+          { stdout: "1.3.14\n" },
+          { "launchctl print": { stdout: LAUNCHD_PRINT } },
+        );
+        const result = schedule(box, "darwin", ["status", "--json"], { calls: [], run: asked.run });
+        expect(JSON.parse(result.out.join("\n"))).toMatchObject({
+          bunCheckoutPin: null,
+          bunViaProtoShim: false,
+          problems: [],
+        });
+      });
     });
 
     test("a runtime that no longer exists is not run, and the missing file is the one problem", () => {

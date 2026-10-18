@@ -203,7 +203,7 @@ describe("acquireLock and releaseLock", () => {
       const lockPath = join(directory, "w5.lock");
       const script = `
         import { acquireLock } from ${JSON.stringify(join(import.meta.dir, "../../src/w5/lock"))};
-        while (Date.now() < Number(process.argv[1])) {}
+        while (Date.now() < Number(process.argv[2])) {}
         console.log(acquireLock(process.argv[1]) ? "won" : "lost");
         await Bun.sleep(300);
       `;
@@ -309,18 +309,48 @@ describe("tryClearStaleLock", () => {
     });
   });
 
-  test("removes an abandoned handoff and still skips that run", () => {
+  test("an abandoned handoff (its clearer is dead) is removed and the same call then clears", () => {
     withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
       const clearing = clearingPathFor(path);
-      writeFileSync(clearing, String(process.pid));
+      writeFileSync(clearing, String(deadPid()));
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: (pid) => pid === 0 })).toBe(
+        "cleared",
+      );
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a handoff with no pid is left for 10 s, then removed and the same call clears", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "");
+      const options = { now: NOW, isAlive: () => false };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(existsSync(clearing)).toBe(true);
       const abandoned = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
       utimesSync(clearing, abandoned, abandoned);
-      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe(
-        "contended",
-      );
-      expect(existsSync(clearing)).toBe(false);
-      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe("cleared");
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
       expect(existsSync(path)).toBe(false);
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a handoff whose clearer is alive is kept past 10 s (a stopped clearer) and removed only after the 30 minute rule", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "4343");
+      // 4242 (the lock's runner) is gone, 4343 (the clearer, or a reused pid) is alive
+      const options = { now: NOW, isAlive: (pid: number) => pid === 4343 };
+      const tenSecondsOld = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(clearing, tenSecondsOld, tenSecondsOld);
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(existsSync(clearing)).toBe(true);
+      expect(existsSync(path)).toBe(true);
+
+      const old = new Date(Date.now() - (STALE_LOCK_MINUTES + 1) * 60_000);
+      utimesSync(clearing, old, old);
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
       expect(existsSync(clearing)).toBe(false);
     });
   });
@@ -344,8 +374,10 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
   const SYNC_LOCK_MODULE = JSON.stringify(join(import.meta.dir, "../../src/sync/lock"));
 
   /**
-   * Every racer spins to the same instant, judges the stale lock, and sleeps 100 ms before it
-   * takes the clearing handoff and again before it unlinks. The second sleep is the window in
+   * Every racer waits for the same instant, judges the stale lock, and waits for fixed later
+   * instants (absolute, so a racer that started late still joins) before it takes the clearing
+   * handoff and again before it unlinks, each racer 40 ms after the one before it. The second
+   * wait is the window in
    * which, without the handoff, every racer has judged the lock stale a second time: one
    * unlinks it and takes a fresh lock, the next unlinks that live lock and takes its own.
    * It prints `won` only when it holds the lock afterwards, then stays alive long enough that a
@@ -353,23 +385,33 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
    */
   const w5Racer = `
     import { acquireLock, clearStaleLock } from ${LOCK_MODULE};
-    while (Date.now() < Number(process.argv[2])) {}
-    clearStaleLock(process.argv[1], () => {}, { afterJudgedStale: () => Bun.sleepSync(100), beforeUnlink: () => Bun.sleepSync(100) });
+    const startAt = Number(process.argv[2]);
+    const waitUntil = (time) => Bun.sleepSync(Math.max(0, time - Date.now()));
+    waitUntil(startAt);
+    clearStaleLock(process.argv[1], () => {}, {
+      afterJudgedStale: () => waitUntil(startAt + 300),
+      beforeUnlink: () => waitUntil(startAt + 600 + 40 * Number(process.argv[3])),
+    });
     console.log(acquireLock(process.argv[1]) ? "won" : "lost");
-    await Bun.sleep(1000);
+    await Bun.sleep(300);
   `;
   const syncRacer = `
     import { acquireSyncLock } from ${SYNC_LOCK_MODULE};
-    while (Date.now() < Number(process.argv[1])) {}
-    const lock = acquireSyncLock(process.argv[2], () => {}, { afterJudgedDead: () => Bun.sleepSync(100), beforeUnlink: () => Bun.sleepSync(100) });
+    const startAt = Number(process.argv[1]);
+    const waitUntil = (time) => Bun.sleepSync(Math.max(0, time - Date.now()));
+    waitUntil(startAt);
+    const lock = acquireSyncLock(process.argv[2], () => {}, {
+      afterJudgedDead: () => waitUntil(startAt + 300),
+      beforeUnlink: () => waitUntil(startAt + 600 + 40 * Number(process.argv[3])),
+    });
     console.log(lock.held ? "won" : "lost");
-    await Bun.sleep(1000);
+    await Bun.sleep(300);
   `;
 
   async function race(script: string, args: (startAt: string) => string[]): Promise<string[]> {
-    const startAt = String(Date.now() + 2000);
-    const racers = Array.from({ length: RACERS }, () =>
-      Bun.spawn(["bun", "--no-env-file", "-e", script, ...args(startAt)], {
+    const startAt = String(Date.now() + 800);
+    const racers = Array.from({ length: RACERS }, (_, index) =>
+      Bun.spawn(["bun", "--no-env-file", "-e", script, ...args(startAt), String(index)], {
         stdout: "pipe",
         stderr: "pipe",
       }),

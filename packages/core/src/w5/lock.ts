@@ -132,10 +132,11 @@ export type ClearOutcome =
  * does, and `releaseLock` only removes its own pid's). A run that finds the handoff taken
  * returns `contended` instead of waiting: the critical section takes microseconds, and whoever
  * holds it is doing this very clear. A handoff left by a clearer that died inside that window is
- * removed by the next run (that run is `contended` too) once its pid is gone or it is older than
- * `CLEARING_STALE_MS`, whatever its pid says (a crash before the pid was written, or a reused
- * live pid, would otherwise block every run forever); two runs removing that abandoned handoff
- * at once is the one remaining race, and it needs a crash inside the critical section first.
+ * removed by the next run, which then retries its own clear once, when its pid is gone, when it
+ * names no pid and is older than `CLEARING_STALE_MS`, or when it names a live pid and is older than
+ * `STALE_LOCK_MINUTES` (a stopped clearer is not abandoned after 10 s, but a reused pid would
+ * otherwise block every run forever); two runs removing that abandoned handoff at once is the one
+ * remaining race, and it needs a crash inside the critical section first.
  * `releaseLock` unlinks by path after reading the pid, so a holder past the hold ceiling
  * releasing at the very moment it is cleared can still take down the lock a third run just
  * acquired; that needs a runner that held the lock for over six hours and is harmless to
@@ -152,8 +153,11 @@ export function tryClearStaleLock(
 
   const clearingPath = clearingPathFor(lockPath);
   if (!acquireLock(clearingPath)) {
-    if (clearingIsStale(clearingPath, options.isAlive ?? pidIsAlive)) removeIfPresent(clearingPath);
-    return "contended";
+    // An abandoned handoff is removed and the clear tried once more, so the run that finds one
+    // does not report a holder that is not there; a second failure means someone else is clearing.
+    if (!clearingIsStale(clearingPath, options.isAlive ?? pidIsAlive)) return "contended";
+    removeIfPresent(clearingPath);
+    if (!acquireLock(clearingPath)) return "contended";
   }
   try {
     const { stale, ageMinutes, reason, pid } = checkLock(lockPath, options);
@@ -184,14 +188,25 @@ export function clearStaleLock(
   return tryClearStaleLock(lockPath, log, options) === "cleared";
 }
 
+/**
+ * A handoff is abandoned when its clearer is gone: its pid is dead, or it names no pid (a crash
+ * before the pid was written) and is older than `CLEARING_STALE_MS`. A clearer whose pid is alive
+ * keeps the handoff for `STALE_LOCK_MINUTES`, not 10 s: a process stopped between its second
+ * judgment and its unlink (SIGSTOP, a sleeping laptop) is still the clearer and would, once
+ * resumed, unlink whatever lock exists by then. Only a pid reused by an unrelated process
+ * outlives that, and the age ends it.
+ */
 function clearingIsStale(clearingPath: string, isAlive: (pid: number) => boolean): boolean {
+  let ageMs: number;
   try {
-    if (Date.now() - statSync(clearingPath).mtimeMs > CLEARING_STALE_MS) return true;
+    ageMs = Date.now() - statSync(clearingPath).mtimeMs;
   } catch {
     return false; // gone already: whoever held it finished
   }
   const clearer = lockPid(clearingPath);
-  return clearer !== null && clearer !== process.pid && !isAlive(clearer);
+  if (clearer === null) return ageMs > CLEARING_STALE_MS;
+  if (clearer !== process.pid && !isAlive(clearer)) return true;
+  return ageMs > STALE_LOCK_MINUTES * 60_000;
 }
 
 function removeIfPresent(path: string): void {

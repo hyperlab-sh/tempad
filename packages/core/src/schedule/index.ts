@@ -8,7 +8,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { collectors } from "../collect/index.ts";
 import { ENV_VARS, readDotEnv } from "../config/env.ts";
@@ -174,7 +174,7 @@ export function resolveRuntime(
 /**
  * The `bun` a `.prototools` above `script` pins: the nearest file (proto walks up the same way)
  * with a string `bun` key, which is what proto would resolve from a working directory in that
- * checkout. Null when there is none, so a global install without a pin keeps proto's default.
+ * checkout, searching no further than the project root (below). Null when there is none, so a global install without a pin keeps proto's default.
  * The value is passed through as written (`1.4.2`, `1.4`, `latest`); proto reads all of them.
  */
 export function readBunPin(script: string): BunPin | null {
@@ -191,6 +191,17 @@ export function readBunPin(script: string): BunPin | null {
       } catch {
         // an unreadable .prototools pins nothing; proto itself would complain when it runs
       }
+    }
+    // Stop where the project ends, so a `.prototools` in some ancestor of the checkout or of an
+    // installed copy (`~/.prototools`) is not mistaken for the project's pin: the repository root
+    // (a `.git` directory, or a file in a worktree), or the root of a package installed under
+    // `node_modules`. A checkout's own `packages/core/package.json` is not a stop: its pin is above.
+    if (existsSync(join(directory, ".git"))) return null;
+    if (
+      existsSync(join(directory, "package.json")) &&
+      directory.split(sep).includes("node_modules")
+    ) {
+      return null;
     }
     const parent = dirname(directory);
     if (parent === directory) return null;
@@ -550,6 +561,10 @@ export interface ScheduleStatus {
   bunVersion: string | null;
   /** The `PROTO_BUN_VERSION` the definition carries; null when it carries none. */
   bunPinned: string | null;
+  /** The pin the checkout holds now (`.prototools` above the job's entry script); null when none or the job is not on the proto shim. */
+  bunCheckoutPin: string | null;
+  /** Whether the job's runtime is the proto shim, the only one a pin steers. */
+  bunViaProtoShim: boolean;
   logPath: string;
   /** Things to fix: a missing runtime or entry, a failed last run, an unreachable manager. */
   problems: string[];
@@ -610,7 +625,22 @@ function inspectJobBun(
 ): void {
   status.bunPinned = environment.PROTO_BUN_VERSION ?? null;
   const runtime = status.command?.[0];
-  if (runtime === undefined || !isAbsolute(runtime) || !existsSync(runtime)) return;
+  if (runtime === undefined || !isAbsolute(runtime)) return;
+  status.bunViaProtoShim = isProtoShim(runtime, context.environment);
+  const script = status.command?.[2];
+  if (status.bunViaProtoShim && script !== undefined && isAbsolute(script)) {
+    // The pin is baked in at install time; a checkout that moved to another Bun since leaves the job on the old one.
+    const current = readBunPin(script);
+    status.bunCheckoutPin = current?.version ?? null;
+    if (current !== null && current.version !== status.bunPinned) {
+      status.problems.push(
+        `${current.source} now pins Bun ${current.version}, but the job ${
+          status.bunPinned === null ? "carries no pin" : `is pinned to ${status.bunPinned}`
+        }; run \`tempad schedule install\` to update it`,
+      );
+    }
+  }
+  if (!existsSync(runtime)) return;
   const home = environment.TEMPAD_HOME ?? tempadHomeOf(context.environment).path;
   const result = context.run(runtime, ["--version"], {
     env: {
@@ -650,6 +680,8 @@ function statusLaunchd(context: ScheduleContext, paths: SchedulePaths): Schedule
     command: text === null ? null : parseLaunchdCommand(text),
     bunVersion: null,
     bunPinned: null,
+    bunCheckoutPin: null,
+    bunViaProtoShim: false,
     logPath,
     problems: text === null ? [] : commandProblems(parseLaunchdCommand(text)),
   };
@@ -699,6 +731,8 @@ function statusSystemd(context: ScheduleContext, paths: SchedulePaths): Schedule
     command,
     bunVersion: null,
     bunPinned: null,
+    bunCheckoutPin: null,
+    bunViaProtoShim: false,
     logPath: syncLogPath(context.environment),
     problems: serviceText === null ? [] : commandProblems(command),
   };
@@ -758,7 +792,6 @@ function statusSystemd(context: ScheduleContext, paths: SchedulePaths): Schedule
 }
 
 function formatBun(status: ScheduleStatus): string | null {
-  const viaShim = basename(dirname(status.command?.[0] ?? "")) === "shims";
   if (status.bunVersion === null) {
     return status.bunPinned === null
       ? null
@@ -767,7 +800,7 @@ function formatBun(status: ScheduleStatus): string | null {
   const how =
     status.bunPinned !== null
       ? ` (pinned by PROTO_BUN_VERSION=${status.bunPinned})`
-      : viaShim
+      : status.bunViaProtoShim
         ? " (proto shim, no pin: proto's default decides)"
         : "";
   return `bun: ${status.bunVersion}${how}`;
