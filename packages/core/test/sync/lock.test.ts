@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireSyncLock, SYNC_BUSY_MESSAGE, SYNC_CLEARING_FILE } from "../../src/sync/lock";
+import {
+  acquireSyncLock,
+  CLEARING_STALE_MS,
+  SYNC_BUSY_MESSAGE,
+  SYNC_CLEARING_FILE,
+} from "../../src/sync/lock";
 
 const CLI = join(import.meta.dir, "..", "..", "src", "cli.ts");
 const directories: string[] = [];
@@ -149,6 +154,57 @@ describe("acquireSyncLock", () => {
     expect(existsSync(join(home, SYNC_CLEARING_FILE))).toBe(false);
     using second = acquireSyncLock(home);
     expect(second.held).toBe(true);
+  });
+
+  test("a pid-less clearing lock is left alone while fresh, then removed once older than the critical section", async () => {
+    const home = configuredHome();
+    const deadLock = String(await deadPid());
+    writeFileSync(join(home, "sync.lock"), deadLock);
+    const clearingPath = join(home, SYNC_CLEARING_FILE);
+    writeFileSync(clearingPath, "");
+    {
+      using fresh = acquireSyncLock(home);
+      expect(fresh.held).toBe(false);
+    }
+    expect(existsSync(clearingPath)).toBe(true);
+
+    const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+    utimesSync(clearingPath, old, old);
+    {
+      using stale = acquireSyncLock(home);
+      expect(stale.held).toBe(false);
+    }
+    expect(existsSync(clearingPath)).toBe(false);
+    // The dead lock was never touched by the run that only removed the clearing lock.
+    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(deadLock);
+    using next = acquireSyncLock(home);
+    expect(next.held).toBe(true);
+  });
+
+  test("an old clearing lock naming a live process (a reused pid) is removed too", async () => {
+    const home = configuredHome();
+    writeFileSync(join(home, "sync.lock"), String(await deadPid()));
+    const clearingPath = join(home, SYNC_CLEARING_FILE);
+    const sleeper = Bun.spawn(["sleep", "60"]);
+    try {
+      writeFileSync(clearingPath, String(sleeper.pid));
+      {
+        using fresh = acquireSyncLock(home);
+        expect(fresh.held).toBe(false);
+      }
+      expect(existsSync(clearingPath)).toBe(true);
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(clearingPath, old, old);
+      {
+        using stale = acquireSyncLock(home);
+        expect(stale.held).toBe(false);
+      }
+      expect(existsSync(clearingPath)).toBe(false);
+      using next = acquireSyncLock(home);
+      expect(next.held).toBe(true);
+    } finally {
+      sleeper.kill("SIGKILL");
+    }
   });
 
   test("the clearing lock is released after a clear", async () => {

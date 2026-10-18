@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { isConfigured } from "../config/env.ts";
 import { acquireLock, clearStaleLock, lockPid, pidIsAlive, releaseLock } from "../w5/lock.ts";
@@ -25,7 +25,9 @@ import { acquireLock, clearStaleLock, lockPid, pidIsAlive, releaseLock } from ".
  * pid, and nothing can replace a lock file that exists: `O_EXCL` creation fails while it does,
  * and its dead holder cannot release it. A run that finds the clearing lock taken skips (it
  * returns `held: false`) instead of waiting. A clearing lock left by a clearer that died inside
- * that microsecond window is removed by the next run (and that run skips); two runs removing it
+ * that microsecond window is removed by the next run (and that run skips) once its pid is gone or
+ * it is older than `CLEARING_STALE_MS`, whatever its pid says (a crash before the pid was written,
+ * or a reused live pid, would otherwise block every sync forever); two runs removing it
  * at once is the one remaining race, and it needs a crash in the critical section first. A reused
  * live pid can keep a dead run's lock until the 6 h ceiling.
  */
@@ -38,6 +40,8 @@ export interface SyncLock {
 export const SYNC_LOCK_FILE = "sync.lock";
 
 export const SYNC_CLEARING_FILE = "sync.lock.clearing";
+/** The clearing critical section is microseconds; a clearing lock older than this was abandoned, whatever its pid says. */
+export const CLEARING_STALE_MS = 10_000;
 
 /** Test seams: what runs between a run judging the lock dead and clearing it, and the liveness check. */
 export interface SyncLockHooks {
@@ -81,10 +85,10 @@ function clearDeadHolderLock(
 
   const clearingPath = `${lockPath}.clearing`;
   if (!acquireLock(clearingPath)) {
-    // Taken: another run is clearing. Taken by a clearer that died: remove it, skip this run.
-    const clearer = lockPid(clearingPath);
-    if (clearer !== null && clearer !== process.pid && !isAlive(clearer))
-      removeIfPresent(clearingPath);
+    // Taken: another run is clearing, and the critical section takes microseconds. One that is
+    // older than that, or whose pid is gone, was left by a clearer that died (possibly before it
+    // wrote its pid, or with a pid since reused): remove it, and skip this run.
+    if (clearingIsStale(clearingPath, isAlive)) removeIfPresent(clearingPath);
     return false;
   }
   try {
@@ -96,6 +100,16 @@ function clearDeadHolderLock(
     releaseLock(clearingPath);
   }
   return true;
+}
+
+function clearingIsStale(clearingPath: string, isAlive: (pid: number) => boolean): boolean {
+  try {
+    if (Date.now() - statSync(clearingPath).mtimeMs > CLEARING_STALE_MS) return true;
+  } catch {
+    return false; // gone already: whoever held it finished
+  }
+  const clearer = lockPid(clearingPath);
+  return clearer !== null && clearer !== process.pid && !isAlive(clearer);
 }
 
 function removeIfPresent(path: string): void {

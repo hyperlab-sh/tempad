@@ -969,6 +969,20 @@ describe("the Bun the job runs under proto", () => {
     ).toBe(bunBin);
   });
 
+  test("the directory execPath lives in is skipped, so a later stable entry wins over it", () => {
+    const box = sandbox();
+    const dir = join(box.root, "elsewhere");
+    const exec = bunIn(dir);
+    const bunBin = bunIn(join(box.home, ".bun", "bin"));
+    expect(
+      resolveRuntime(
+        { HOME: box.home, PATH: `${dir}:${join(box.home, ".bun", "bin")}` },
+        exec,
+        () => false,
+      ).runtime,
+    ).toBe(bunBin);
+  });
+
   test("a PATH with the tools directory and nothing stable falls back to $PROTO_HOME/shims/bun, default ~/.proto/shims", () => {
     const box = sandbox();
     const tools = join(box.home, ".proto", "tools", "bun", "1.4.2");
