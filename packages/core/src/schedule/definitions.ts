@@ -138,7 +138,7 @@ Description=Run tempad sync every hour
 
 [Timer]
 OnActiveSec=${SYSTEMD_FIRST_RUN}
-OnUnitActiveSec=1h
+OnCalendar=hourly
 Persistent=true
 Unit=${SYSTEMD_UNIT}.service
 

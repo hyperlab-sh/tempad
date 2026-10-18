@@ -95,13 +95,13 @@ StandardError=append:/Users/me/.tempad/logs/sync.log
 `);
   });
 
-  test("exact timer content: first run soon after activation, then hourly, persistent", () => {
+  test("exact timer content: first run soon after activation, then on the hour, catching up after downtime", () => {
     expect(renderSystemdTimer()).toBe(`[Unit]
 Description=Run tempad sync every hour
 
 [Timer]
 OnActiveSec=1min
-OnUnitActiveSec=1h
+OnCalendar=hourly
 Persistent=true
 Unit=tempad-sync.service
 

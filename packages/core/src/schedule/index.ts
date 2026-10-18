@@ -8,8 +8,10 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { collectors } from "../collect/index.ts";
+import { ENV_VARS, readDotEnv } from "../config/env.ts";
 import { commandUsageText } from "../usage.ts";
 import { isUnstableInstallPath } from "../w5/hooks.ts";
 import {
@@ -28,8 +30,8 @@ export const SCHEDULE_USAGE = `usage: ${commandUsageText("schedule")}`;
 
 /** Where the tool dirs a scheduled job needs usually live, appended after the caller's own `PATH`. */
 const FALLBACK_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
-const BOOTSTRAP_ATTEMPTS = 3;
-const BOOTSTRAP_RETRY_MS = 300;
+const BOOTSTRAP_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_MS = 500;
 
 /** Anything the operator can fix; printed as one line, exit 1. */
 export class ScheduleError extends Error {
@@ -58,6 +60,13 @@ export const runCommand: CommandRunner = (command, args) => {
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 };
 
+export interface ResolvedEntry {
+  runtime: string;
+  script: string;
+  /** Things the operator should know about the choice; printed by `install`. */
+  warnings?: string[];
+}
+
 export interface ScheduleContext {
   platform: NodeJS.Platform;
   /** Read for `HOME`, `XDG_CONFIG_HOME`, `TEMPAD_HOME` and `PATH`; never `os.homedir()`, which a test cannot redirect. */
@@ -66,7 +75,7 @@ export interface ScheduleContext {
   uid: number | null;
   run: CommandRunner;
   /** The tempad the user invoked: runtime and entry script. Throws `ScheduleError` when it cannot be pinned down. */
-  resolveEntry: () => { runtime: string; script: string };
+  resolveEntry: () => ResolvedEntry;
   sleep: (milliseconds: number) => void;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
@@ -77,16 +86,66 @@ function sleepSync(milliseconds: number): void {
 }
 
 /**
- * The tempad the user invoked: the running Bun binary and the real path of its entry script
- * (`argv[1]` with symlinks resolved, so `~/.local/bin/tempad -> .../src/cli.ts` and a global
- * install both land on the `cli.ts` that actually runs). Refuses a copy that sits where bun
+ * Directories whose `bun` survives a Bun upgrade: the proto shim directory, bun's own bin and the
+ * package managers' prefixes. A binary under `~/.proto/tools/bun/<version>/` does not.
+ */
+function stableRuntimeDirectories(home: string): string[] {
+  return [
+    join(home, ".proto", "shims"),
+    join(home, ".bun", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ];
+}
+
+/**
+ * The Bun the job runs. `process.execPath` is the binary in use, but under proto or a version
+ * manager it is `~/.proto/tools/bun/1.4.2/bun`, which the next upgrade deletes. So prefer the
+ * `bun` the caller's `PATH` finds first when it lives in a stable directory (the shim then picks
+ * the version, from the job's working directory); otherwise fall back to `execPath`, with a
+ * warning when its path carries a version.
+ */
+export function resolveRuntime(
+  environment: NodeJS.ProcessEnv,
+  execPath: string,
+  isUnstable: (path: string) => boolean,
+): { runtime: string; warning: string | null } {
+  const stable = stableRuntimeDirectories(environment.HOME ?? "").map((directory) =>
+    directory.replace(/\/+$/, ""),
+  );
+  for (const entry of (environment.PATH ?? "").split(delimiter)) {
+    if (!isAbsolute(entry)) continue;
+    const candidate = join(entry, "bun");
+    if (!existsSync(candidate)) continue;
+    if (stable.includes(entry.replace(/\/+$/, ""))) return { runtime: candidate, warning: null };
+    break;
+  }
+  if (isUnstable(execPath)) {
+    throw new ScheduleError(
+      `${execPath} is a disposable Bun (a temp directory or a cache); run \`tempad schedule install\` with a Bun installed in ~/.bun/bin, ~/.proto/shims, /opt/homebrew/bin or /usr/local/bin`,
+    );
+  }
+  const versioned = /\/\d+\.\d+\.\d+(\/|$)/.test(execPath);
+  return {
+    runtime: execPath,
+    warning: versioned
+      ? `the job pins ${execPath}, which has a version in its path and breaks when that Bun is upgraded away; put bun on PATH in ~/.bun/bin or ~/.proto/shims, or run \`tempad schedule install\` again after an upgrade`
+      : null,
+  };
+}
+
+/**
+ * The tempad the user invoked: a stable Bun (`resolveRuntime`) and the real path of its entry
+ * script (`argv[1]` with symlinks resolved, so `~/.local/bin/tempad -> .../src/cli.ts` and a
+ * global install both land on the `cli.ts` that actually runs). Refuses a copy that sits where bun
  * clears things (the `bunx` cache, the temp directory): the job would break once it is gone.
  */
 export function resolveInvokedEntry(
   argv: readonly string[] = process.argv,
-  runtime: string = process.execPath,
+  execPath: string = process.execPath,
   isUnstable: (path: string) => boolean = isUnstableInstallPath,
-): { runtime: string; script: string } {
+  environment: NodeJS.ProcessEnv = process.env,
+): ResolvedEntry {
   const invoked = argv[1];
   if (invoked === undefined) throw new ScheduleError("cannot tell which tempad is running");
   let script: string;
@@ -98,12 +157,13 @@ export function resolveInvokedEntry(
   if (!statSync(script).isFile() || !/\.[cm]?[jt]s$/.test(script)) {
     throw new ScheduleError(`the tempad entry ${script} is not a script bun can run`);
   }
-  if (isUnstable(script) || isUnstable(runtime)) {
+  if (isUnstable(script)) {
     throw new ScheduleError(
       `${script} is a disposable copy of tempad (the bunx cache or a temp directory); install it first with \`bun add -g @hyperlab.sh/tempad\` and run \`tempad schedule install\` from there`,
     );
   }
-  return { runtime, script };
+  const { runtime, warning } = resolveRuntime(environment, execPath, isUnstable);
+  return { runtime, script, warnings: warning === null ? [] : [warning] };
 }
 
 function homeOf(environment: NodeJS.ProcessEnv): string {
@@ -112,7 +172,10 @@ function homeOf(environment: NodeJS.ProcessEnv): string {
   return home;
 }
 
-/** `TEMPAD_HOME` as the CLI resolves it (a leading `~` expanded), or the default under `HOME`. */
+/**
+ * `TEMPAD_HOME` as the CLI resolves it (a leading `~` expanded), or the default under `HOME`. A
+ * relative value is made absolute against the current directory: the job starts somewhere else.
+ */
 function tempadHomeOf(environment: NodeJS.ProcessEnv): { path: string; explicit: boolean } {
   const home = homeOf(environment);
   const configured = environment.TEMPAD_HOME;
@@ -123,7 +186,7 @@ function tempadHomeOf(environment: NodeJS.ProcessEnv): { path: string; explicit:
       : configured.startsWith("~/")
         ? join(home, configured.slice(2))
         : configured;
-  return { path: expanded, explicit: true };
+  return { path: resolve(expanded), explicit: true };
 }
 
 export function syncLogPath(environment: NodeJS.ProcessEnv): string {
@@ -197,16 +260,40 @@ function jobPath(runtime: string, environment: NodeJS.ProcessEnv): string {
   return [...new Set(entries.filter((entry) => entry !== "" && isAbsolute(entry)))].join(delimiter);
 }
 
-function buildJob(context: ScheduleContext): ScheduleJob {
-  const { runtime, script } = context.resolveEntry();
+/**
+ * Variables the scheduled job needs that are set in this shell but missing from `TEMPAD_HOME/.env`:
+ * the job inherits nothing from the shell, so `sync` would fail or skip a source there. Only the
+ * ones the collectors (and push sync) read are checked, and only when set, so a clean shell is quiet.
+ */
+function shellOnlyVariables(environment: NodeJS.ProcessEnv, home: string): string[] {
+  const keys = new Set<string>(["ghToken", "syncToken", "hostSlug"]);
+  for (const collector of collectors.values()) for (const key of collector.needs) keys.add(key);
+  const fileValues = readDotEnv(home);
+  return ENV_VARS.filter((variable) => keys.has(variable.key))
+    .map((variable) => variable.name)
+    .filter((name) => (environment[name] ?? "") !== "" && fileValues[name] === undefined);
+}
+
+function buildJob(context: ScheduleContext): { job: ScheduleJob; warnings: string[] } {
+  const { runtime, script, warnings = [] } = context.resolveEntry();
   const home = tempadHomeOf(context.environment);
+  const shellOnly = shellOnlyVariables(context.environment, home.path);
+  const allWarnings = [...warnings];
+  if (shellOnly.length > 0) {
+    allWarnings.push(
+      `${shellOnly.join(", ")} ${shellOnly.length === 1 ? "is" : "are"} set in this shell but not in ${join(home.path, ".env")}; the scheduled job does not see shell exports, so add ${shellOnly.length === 1 ? "it" : "them"} there`,
+    );
+  }
   return {
-    // `--no-env-file` is the CLI shebang's flag; a job started as `bun <script>` has to pass it itself.
-    command: [runtime, "--no-env-file", script, "sync"],
-    path: jobPath(runtime, context.environment),
-    tempadHome: home.explicit ? home.path : null,
-    workingDirectory: home.path,
-    logPath: syncLogPath(context.environment),
+    job: {
+      // `--no-env-file` is the CLI shebang's flag; a job started as `bun <script>` has to pass it itself.
+      command: [runtime, "--no-env-file", script, "sync"],
+      path: jobPath(runtime, context.environment),
+      tempadHome: home.explicit ? home.path : null,
+      workingDirectory: home.path,
+      logPath: syncLogPath(context.environment),
+    },
+    warnings: allWarnings,
   };
 }
 
@@ -604,7 +691,8 @@ export function runScheduleCommand(
           `tempad is not set up yet (${home}); run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal, before scheduling a sync`,
         );
       }
-      const job = buildJob(context);
+      const { job, warnings } = buildJob(context);
+      for (const warning of warnings) context.stderr(`warning: ${warning}`);
       mkdirSync(dirname(job.logPath), { recursive: true, mode: 0o700 });
       const lines =
         paths.manager === "launchd"

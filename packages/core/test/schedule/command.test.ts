@@ -19,6 +19,7 @@ import {
   type CommandRunner,
   probeSchedule,
   resolveInvokedEntry,
+  resolveRuntime,
   runScheduleCommand,
   type ScheduleContext,
   schedulePaths,
@@ -242,14 +243,14 @@ describe("install on macOS", () => {
     expect(scripted.calls.filter((call) => call.includes("bootstrap"))).toHaveLength(2);
   });
 
-  test("a bootstrap that keeps failing exits 1 with launchctl's message after three attempts", () => {
+  test("a bootstrap that keeps failing exits 1 with launchctl's message after five attempts", () => {
     const box = sandbox();
     const scripted = runner({
       "launchctl bootstrap": { status: 5, stderr: "Bootstrap failed: 5\nmore" },
     });
     const result = schedule(box, "darwin", ["install"], scripted);
     expect(result.code).toBe(1);
-    expect(scripted.calls.filter((call) => call.includes("bootstrap"))).toHaveLength(3);
+    expect(scripted.calls.filter((call) => call.includes("bootstrap"))).toHaveLength(5);
     expect(result.err).toEqual([
       `schedule: wrote ${plistPath(box)} but launchctl bootstrap failed (exit 5: Bootstrap failed: 5)`,
     ]);
@@ -309,7 +310,8 @@ describe("install on Linux", () => {
     expect(service).toContain(`ExecStart=${box.runtime} --no-env-file ${box.script} sync`);
     expect(service).toContain(`StandardOutput=append:${join(box.tempadHome, "logs", "sync.log")}`);
     const timer = readFileSync(join(unitDirectory(box), "tempad-sync.timer"), "utf8");
-    expect(timer).toContain("OnUnitActiveSec=1h");
+    expect(timer).toContain("OnCalendar=hourly");
+    expect(timer).not.toContain("OnUnitActiveSec");
     expect(timer).toContain("Persistent=true");
     expect(result.out.join("\n")).toContain("loginctl enable-linger");
   });
@@ -784,8 +786,12 @@ describe("resolveInvokedEntry", () => {
     const link = join(box.root, "bin", "tempad");
     mkdirSync(join(box.root, "bin"));
     symlinkSync(box.script, link);
-    const entry = resolveInvokedEntry(["bun", link], box.runtime, () => false);
-    expect(entry).toEqual({ runtime: box.runtime, script: join(statRealpath(box.script)) });
+    const entry = resolveInvokedEntry(["bun", link], box.runtime, () => false, noBunOnPath(box));
+    expect(entry).toEqual({
+      runtime: box.runtime,
+      script: join(statRealpath(box.script)),
+      warnings: [],
+    });
   });
 
   test("refuses a copy under the temp directory or the bunx cache, naming the fix", () => {
@@ -797,20 +803,159 @@ describe("resolveInvokedEntry", () => {
 
   test("a missing argv entry, a directory and a non-script are errors", () => {
     const box = sandbox();
-    expect(() => resolveInvokedEntry(["bun"], box.runtime, () => false)).toThrow(
+    expect(() => resolveInvokedEntry(["bun"], box.runtime, () => false, noBunOnPath(box))).toThrow(
       "cannot tell which tempad",
     );
-    expect(() => resolveInvokedEntry(["bun", box.root], box.runtime, () => false)).toThrow(
-      "not a script",
-    );
+    expect(() =>
+      resolveInvokedEntry(["bun", box.root], box.runtime, () => false, noBunOnPath(box)),
+    ).toThrow("not a script");
     const text = join(box.root, "notes.txt");
     writeFileSync(text, "");
-    expect(() => resolveInvokedEntry(["bun", text], box.runtime, () => false)).toThrow(
-      "not a script",
-    );
+    expect(() =>
+      resolveInvokedEntry(["bun", text], box.runtime, () => false, noBunOnPath(box)),
+    ).toThrow("not a script");
   });
 });
+
+function noBunOnPath(box: Sandbox): NodeJS.ProcessEnv {
+  return { HOME: box.home, PATH: "" };
+}
 
 function statRealpath(path: string): string {
   return realpathSync(path);
 }
+
+describe("the Bun the job runs", () => {
+  /** A directory on PATH holding an executable `bun`. */
+  function bunIn(directory: string): string {
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, "bun");
+    writeFileSync(path, "");
+    return path;
+  }
+
+  test("a bun from a stable directory on PATH wins over the versioned execPath", () => {
+    const box = sandbox();
+    const shim = bunIn(join(box.home, ".proto", "shims"));
+    const versioned = join(box.home, ".proto", "tools", "bun", "1.4.2", "bun");
+    const resolved = resolveRuntime(
+      { HOME: box.home, PATH: `/nonexistent:${join(box.home, ".proto", "shims")}:/usr/bin` },
+      versioned,
+      () => false,
+    );
+    expect(resolved).toEqual({ runtime: shim, warning: null });
+  });
+
+  test.each([[".bun/bin"], [".proto/shims"]])("~/%s counts as stable", (relative) => {
+    const box = sandbox();
+    const bun = bunIn(join(box.home, relative));
+    expect(
+      resolveRuntime(
+        { HOME: box.home, PATH: join(box.home, relative) },
+        "/x/1.4.2/bun",
+        () => false,
+      ).runtime,
+    ).toBe(bun);
+  });
+
+  test("the first bun on PATH decides: an unstable one earlier falls back to execPath, with a warning for a versioned path", () => {
+    const box = sandbox();
+    bunIn(join(box.root, "node_modules", ".bin"));
+    bunIn(join(box.home, ".bun", "bin"));
+    const versioned = "/opt/tools/bun/1.4.2/bun";
+    const resolved = resolveRuntime(
+      {
+        HOME: box.home,
+        PATH: `${join(box.root, "node_modules", ".bin")}:${join(box.home, ".bun", "bin")}`,
+      },
+      versioned,
+      () => false,
+    );
+    expect(resolved.runtime).toBe(versioned);
+    expect(resolved.warning).toContain(`pins ${versioned}`);
+    expect(resolved.warning).toContain("breaks when that Bun is upgraded away");
+  });
+
+  test("an execPath without a version in its path falls back quietly", () => {
+    const box = sandbox();
+    expect(resolveRuntime({ HOME: box.home, PATH: "" }, "/opt/custom/bun", () => false)).toEqual({
+      runtime: "/opt/custom/bun",
+      warning: null,
+    });
+  });
+
+  test("a relative PATH entry is never used, even holding a bun", () => {
+    const box = sandbox();
+    const resolved = resolveRuntime(
+      { HOME: box.home, PATH: "./bin:bin" },
+      "/opt/custom/bun",
+      () => false,
+    );
+    expect(resolved.runtime).toBe("/opt/custom/bun");
+  });
+
+  test("a disposable fallback Bun is refused", () => {
+    const box = sandbox();
+    expect(() =>
+      resolveRuntime({ HOME: box.home, PATH: "" }, "/tmp/x/bun", (path) => path.startsWith("/tmp")),
+    ).toThrow("disposable Bun");
+  });
+
+  test("install prints the runtime warning on stderr and still installs", () => {
+    const box = sandbox();
+    const result = schedule(box, "darwin", ["install"], runner(), {
+      resolveEntry: () => ({
+        runtime: box.runtime,
+        script: box.script,
+        warnings: ["the job pins /x/1.4.2/bun"],
+      }),
+    });
+    expect(result.code).toBe(0);
+    expect(result.err).toEqual(["warning: the job pins /x/1.4.2/bun"]);
+  });
+});
+
+describe("install warnings and TEMPAD_HOME", () => {
+  test("a needed variable set in the shell but missing from .env is warned about, by name, never by value", () => {
+    const box = sandbox({
+      extra: { MONDAY_API_TOKEN: "secret-value", GH_TOKEN: "other-secret", TZ: "UTC" },
+    });
+    writeFileSync(join(box.tempadHome, ".env"), "MONDAY_USER=1\n");
+    const result = schedule(box, "darwin", ["install"], runner());
+    expect(result.code).toBe(0);
+    expect(result.err).toEqual([
+      `warning: MONDAY_API_TOKEN, GH_TOKEN are set in this shell but not in ${join(box.tempadHome, ".env")}; the scheduled job does not see shell exports, so add them there`,
+    ]);
+    expect(result.err.join("")).not.toContain("secret-value");
+  });
+
+  test("variables already in .env, and shell variables sync never reads, stay quiet", () => {
+    const box = sandbox({ extra: { MONDAY_USER: "1", TZ: "UTC", SOMETHING_ELSE: "x" } });
+    writeFileSync(join(box.tempadHome, ".env"), "MONDAY_USER=1\n");
+    expect(schedule(box, "darwin", ["install"], runner()).err).toEqual([]);
+  });
+
+  test("a single variable reads in the singular", () => {
+    const box = sandbox({ extra: { HOST_SLUG: "mac" } });
+    const result = schedule(box, "darwin", ["install"], runner());
+    expect(result.err[0]).toContain("HOST_SLUG is set in this shell");
+    expect(result.err[0]).toContain("so add it there");
+  });
+
+  test("a relative TEMPAD_HOME is made absolute in the plist, working directory and log path", () => {
+    const box = sandbox({ extra: { TEMPAD_HOME: "rel-home" } });
+    const absolute = join(process.cwd(), "rel-home");
+    mkdirSync(absolute, { recursive: true });
+    try {
+      writeFileSync(join(absolute, ".env"), "");
+      const result = schedule(box, "darwin", ["install"], runner());
+      expect(result.code).toBe(0);
+      const plist = readFileSync(plistPath(box), "utf8");
+      expect(plist).toContain(`<key>TEMPAD_HOME</key>\n    <string>${absolute}</string>`);
+      expect(plist).toContain(`<string>${join(absolute, "logs", "sync.log")}</string>`);
+      expect(plist).not.toContain("<string>rel-home");
+    } finally {
+      rmSync(absolute, { recursive: true, force: true });
+    }
+  });
+});
