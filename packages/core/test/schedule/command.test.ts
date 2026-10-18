@@ -305,6 +305,7 @@ describe("install on Linux", () => {
     expect(scripted.calls).toEqual([
       "systemctl --user daemon-reload",
       "systemctl --user enable --now tempad-sync.timer",
+      "systemctl --user start --no-block tempad-sync.service",
     ]);
     const service = readFileSync(join(unitDirectory(box), "tempad-sync.service"), "utf8");
     expect(service).toContain(`ExecStart=${box.runtime} --no-env-file ${box.script} sync`);
@@ -312,6 +313,8 @@ describe("install on Linux", () => {
     const timer = readFileSync(join(unitDirectory(box), "tempad-sync.timer"), "utf8");
     expect(timer).toContain("OnCalendar=hourly");
     expect(timer).not.toContain("OnUnitActiveSec");
+    // The first run is the explicit start; a second trigger at activation would run two syncs.
+    expect(timer).not.toContain("OnActiveSec");
     expect(timer).toContain("Persistent=true");
     expect(result.out.join("\n")).toContain("loginctl enable-linger");
   });
@@ -356,6 +359,7 @@ describe("install on Linux", () => {
       "systemctl --user daemon-reload",
       "systemctl --user enable --now tempad-sync.timer",
       "systemctl --user restart tempad-sync.timer",
+      "systemctl --user start --no-block tempad-sync.service",
     ]);
   });
 
@@ -912,6 +916,96 @@ describe("the Bun the job runs", () => {
     });
     expect(result.code).toBe(0);
     expect(result.err).toEqual(["warning: the job pins /x/1.4.2/bun"]);
+  });
+});
+
+describe("the Bun the job runs under proto", () => {
+  function bunIn(directory: string): string {
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, "bun");
+    writeFileSync(path, "");
+    return path;
+  }
+
+  test("inside bun the shim has put ~/.proto/tools/bun/<v> ahead of ~/.proto/shims: the tools dir is skipped, the shim wins", () => {
+    const box = sandbox();
+    const tools = join(box.home, ".proto", "tools", "bun", "1.4.2");
+    const versioned = bunIn(tools);
+    const shim = bunIn(join(box.home, ".proto", "shims"));
+    const resolved = resolveRuntime(
+      { HOME: box.home, PATH: `${tools}:${join(box.home, ".proto", "shims")}:/usr/bin` },
+      versioned,
+      () => false,
+    );
+    expect(resolved).toEqual({ runtime: shim, warning: null });
+  });
+
+  test("skipping the tools directory lets a later stable entry win over the shim fallback", () => {
+    const box = sandbox();
+    const tools = join(box.home, ".proto", "tools", "bun", "1.4.2");
+    const versioned = bunIn(tools);
+    bunIn(join(box.home, ".proto", "shims"));
+    const bunBin = bunIn(join(box.home, ".bun", "bin"));
+    expect(
+      resolveRuntime(
+        { HOME: box.home, PATH: `${tools}:${join(box.home, ".bun", "bin")}` },
+        versioned,
+        () => false,
+      ).runtime,
+    ).toBe(bunBin);
+  });
+
+  test("any ~/.proto/tools entry is skipped, not only the one execPath lives in", () => {
+    const box = sandbox();
+    const otherVersion = join(box.home, ".proto", "tools", "bun", "1.3.14");
+    bunIn(otherVersion);
+    const bunBin = bunIn(join(box.home, ".bun", "bin"));
+    expect(
+      resolveRuntime(
+        { HOME: box.home, PATH: `${otherVersion}:${join(box.home, ".bun", "bin")}` },
+        "/opt/custom/bun",
+        () => false,
+      ).runtime,
+    ).toBe(bunBin);
+  });
+
+  test("a PATH with the tools directory and nothing stable falls back to $PROTO_HOME/shims/bun, default ~/.proto/shims", () => {
+    const box = sandbox();
+    const tools = join(box.home, ".proto", "tools", "bun", "1.4.2");
+    const versioned = bunIn(tools);
+    const shim = bunIn(join(box.home, ".proto", "shims"));
+    expect(resolveRuntime({ HOME: box.home, PATH: tools }, versioned, () => false).runtime).toBe(
+      shim,
+    );
+
+    const custom = join(box.root, "proto home");
+    const customTools = join(custom, "tools", "bun", "1.4.2");
+    const customVersioned = bunIn(customTools);
+    const customShim = bunIn(join(custom, "shims"));
+    expect(
+      resolveRuntime(
+        { HOME: box.home, PROTO_HOME: custom, PATH: customTools },
+        customVersioned,
+        () => false,
+      ).runtime,
+    ).toBe(customShim);
+  });
+
+  test("no shim and nothing stable: the versioned execPath with its warning", () => {
+    const box = sandbox();
+    const tools = join(box.home, ".proto", "tools", "bun", "1.4.2");
+    const versioned = bunIn(tools);
+    const resolved = resolveRuntime({ HOME: box.home, PATH: tools }, versioned, () => false);
+    expect(resolved.runtime).toBe(versioned);
+    expect(resolved.warning).toContain("breaks when that Bun is upgraded away");
+  });
+
+  test("the directory execPath lives in is skipped even when it is not a versioned one", () => {
+    const box = sandbox();
+    const dir = join(box.root, "elsewhere");
+    const exec = bunIn(dir);
+    const resolved = resolveRuntime({ HOME: box.home, PATH: `${dir}:/usr/bin` }, exec, () => false);
+    expect(resolved).toEqual({ runtime: exec, warning: null });
   });
 });
 

@@ -10,8 +10,6 @@ export const LAUNCHD_LABEL = "sh.hyperlab.tempad.sync";
 /** systemd unit name without the `.service`/`.timer` suffix. */
 export const SYSTEMD_UNIT = "tempad-sync";
 export const SYNC_INTERVAL_SECONDS = 3600;
-/** The timer's first run after it is activated (login, boot, `enable --now`): launchd's `RunAtLoad`. */
-const SYSTEMD_FIRST_RUN = "1min";
 
 /** What the scheduled job runs and where it logs. */
 export interface ScheduleJob {
@@ -137,7 +135,6 @@ export function renderSystemdTimer(): string {
 Description=Run tempad sync every hour
 
 [Timer]
-OnActiveSec=${SYSTEMD_FIRST_RUN}
 OnCalendar=hourly
 Persistent=true
 Unit=${SYSTEMD_UNIT}.service

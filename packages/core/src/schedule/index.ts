@@ -101,24 +101,40 @@ function stableRuntimeDirectories(home: string): string[] {
 /**
  * The Bun the job runs. `process.execPath` is the binary in use, but under proto or a version
  * manager it is `~/.proto/tools/bun/1.4.2/bun`, which the next upgrade deletes. So prefer the
- * `bun` the caller's `PATH` finds first when it lives in a stable directory (the shim then picks
- * the version, from the job's working directory); otherwise fall back to `execPath`, with a
- * warning when its path carries a version.
+ * `bun` the caller's `PATH` finds in a stable directory. Two entries are skipped, not trusted:
+ * the directory of `execPath` itself, and anything under `~/.proto/tools/` (the proto shim
+ * prepends its versioned tool directory to `PATH` before it execs bun, so inside bun that
+ * directory comes before `~/.proto/shims`). Under proto with nothing stable on `PATH`,
+ * `$PROTO_HOME/shims/bun` (default `~/.proto/shims/bun`) is checked directly. The first `bun`
+ * found in any other, unstable directory (`node_modules/.bin`) decides for the fallback. Through
+ * a shim the version comes from proto's resolution in the job's working directory
+ * (`TEMPAD_HOME`), that is proto's global default, not the checkout's `.prototools` pin.
+ * Otherwise `execPath`, with a warning when its path carries a version.
  */
 export function resolveRuntime(
   environment: NodeJS.ProcessEnv,
   execPath: string,
   isUnstable: (path: string) => boolean,
 ): { runtime: string; warning: string | null } {
-  const stable = stableRuntimeDirectories(environment.HOME ?? "").map((directory) =>
-    directory.replace(/\/+$/, ""),
-  );
+  const home = environment.HOME ?? "";
+  const trim = (path: string) => path.replace(/\/+$/, "");
+  const stable = stableRuntimeDirectories(home).map(trim);
+  const protoHome = trim(environment.PROTO_HOME || join(home, ".proto"));
+  const versionedRoots = [join(home, ".proto", "tools"), join(protoHome, "tools")].map(trim);
+  const skipped = new Set([trim(dirname(execPath))]);
+  const isVersioned = (entry: string) =>
+    versionedRoots.some((root) => entry === root || entry.startsWith(`${root}/`));
+
   for (const entry of (environment.PATH ?? "").split(delimiter)) {
-    if (!isAbsolute(entry)) continue;
+    if (!isAbsolute(entry) || skipped.has(trim(entry)) || isVersioned(trim(entry))) continue;
     const candidate = join(entry, "bun");
     if (!existsSync(candidate)) continue;
-    if (stable.includes(entry.replace(/\/+$/, ""))) return { runtime: candidate, warning: null };
+    if (stable.includes(trim(entry))) return { runtime: candidate, warning: null };
     break;
+  }
+  if (isVersioned(trim(dirname(execPath)))) {
+    const shim = join(protoHome, "shims", "bun");
+    if (existsSync(shim)) return { runtime: shim, warning: null };
   }
   if (isUnstable(execPath)) {
     throw new ScheduleError(
@@ -375,6 +391,9 @@ function installSystemd(
     ["--user", "enable", "--now", timer],
     // `enable --now` leaves a running timer on the schedule it was started with.
     ...(reinstall ? [["--user", "restart", timer]] : []),
+    // The timer fires on the hour; this is the first run now (launchd's `RunAtLoad`). `--no-block`
+    // because a oneshot `start` would wait for the whole sync.
+    ["--user", "start", "--no-block", `${SYSTEMD_UNIT}.service`],
   ];
   for (const args of steps) {
     const result = context.run("systemctl", args);
@@ -386,7 +405,7 @@ function installSystemd(
   }
   const lines = [
     `installed ${servicePath} and ${timerPath}`,
-    `enabled ${timer}: runs a minute after it starts, then every hour`,
+    `enabled ${timer}: first run started now, then every hour on the hour`,
   ];
   describeJob(job, lines);
   lines.push(
