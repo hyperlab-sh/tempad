@@ -1,0 +1,10 @@
+// Strings that name a command without being its usage: they must not trip the guard.
+prepareCommand("tempad sync --forget", []);
+const label = `tempad report ${kind}`;
+console.error("tempad setup: stdin is not a terminal");
+const hint = "run `tempad hero init` first";
+const recommendation = { command: "tempad w5 backfill --from 2026-01-01" };
+const trailing = 1; // "tempad rebuild <id>" in a comment
+/* "tempad rebuild <id>" in a block comment */
+const slash = "run /tempad:setup in Claude Code";
+const home = `tempad scry  ${report.generatedAt.slice(0, 16)} UTC`;

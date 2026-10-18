@@ -37,6 +37,7 @@ import { acquireSyncLock, SYNC_BUSY_MESSAGE } from "./sync/lock.ts";
 import { formatSyncSummary, runPushSync, SyncNotConfiguredError } from "./sync/run.ts";
 import {
   COMMAND_TREE,
+  checkPositionals,
   globalHelp,
   globalUsage,
   type HelpResolution,
@@ -72,6 +73,11 @@ const INTENT_COMMANDS = new Set([
 
 function printUsage(): void {
   for (const line of globalUsage()) console.error(line);
+}
+
+/** One command's usage lines on stderr, for an error that is about that command. */
+function printUsageFor(command: string): void {
+  for (const line of usageForPath([command])) console.error(line);
 }
 
 /**
@@ -210,7 +216,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
     // Node appends hints after the first sentence ("... place it at the end ..."); keep the sentence.
     const reason = (error.message.split("\n")[0] ?? "").split(". ")[0]?.replace(/\.$/, "");
     console.error(`sync: ${reason}.`);
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
   const { values, positionals } = parsed;
@@ -221,16 +227,16 @@ async function runSyncCommand(args: string[]): Promise<number> {
 
   if (source !== undefined && !collectors.has(source as Collector["name"])) {
     console.error(`sync: unknown source "${source}"`);
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
   if (directional && (source !== undefined || values.full)) {
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
   // --forget stands alone: it collects, pushes and pulls nothing.
   if (values.forget && (source !== undefined || values.full || directional)) {
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
   // --rejoin stands alone too, and --force only qualifies --forget.
@@ -238,11 +244,11 @@ async function runSyncCommand(args: string[]): Promise<number> {
     values.rejoin !== undefined &&
     (source !== undefined || values.full || directional || values.forget || values.force)
   ) {
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
   if (values.force && !values.forget) {
-    printUsage();
+    printUsageFor("sync");
     return 2;
   }
 
@@ -342,7 +348,7 @@ async function runReportCommand(args: string[]): Promise<number> {
   const kind = args[0];
 
   if (kind === undefined || !reports.has(kind as Report["kind"])) {
-    printUsage();
+    printUsageFor("report");
     return 2;
   }
 
@@ -363,7 +369,7 @@ async function runReportCommand(args: string[]): Promise<number> {
   });
 
   if (!values.from || !values.to) {
-    printUsage();
+    printUsageFor("report");
     return 2;
   }
 
@@ -372,7 +378,7 @@ async function runReportCommand(args: string[]): Promise<number> {
     values["pr-date"] !== "merged" &&
     values["pr-date"] !== "authored"
   ) {
-    printUsage();
+    printUsageFor("report");
     return 2;
   }
 
@@ -422,7 +428,7 @@ function skillDestinationFor(scope: string): string {
 export function runSkillCommand(args: string[]): number {
   const [action, ...rest] = args;
   if (action !== "install") {
-    printUsage();
+    printUsageFor("skill");
     return 2;
   }
   const { values } = parseArgs({
@@ -464,7 +470,7 @@ export async function runProjectCommand(args: string[], context: ProjectContext)
     });
     const path = positionals[0];
     if (!path || !values.name) {
-      printUsage();
+      printUsageFor("project");
       return 2;
     }
 
@@ -515,7 +521,7 @@ export async function runProjectCommand(args: string[], context: ProjectContext)
     });
     const path = positionals[0];
     if (!path) {
-      printUsage();
+      printUsageFor("project");
       return 2;
     }
     const rules = loadRules(tomlPath);
@@ -524,7 +530,7 @@ export async function runProjectCommand(args: string[], context: ProjectContext)
     return 0;
   }
 
-  printUsage();
+  printUsageFor("project");
   return 2;
 }
 
@@ -623,6 +629,8 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
     if (isHelpFlagRequest(rest)) {
       return printResolvedHelp({ ok: true, lines: usageForPath(walked.path) });
     }
+    const excess = checkPositionals(walked.path, rest);
+    if (excess !== null) return printResolvedHelp(excess);
   }
 
   // `setup` needs no configuration and opens no database: it creates them.

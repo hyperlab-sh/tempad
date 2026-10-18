@@ -189,7 +189,10 @@ describe("buildAdditionalContext", () => {
     ];
     const text = buildAdditionalContext(questions);
     expect(text).toContain("Q1");
-    expect(text).toContain("tempad answer Q1");
+    // A classifier question is not a belongs question: `answer --belongs` would exit 2.
+    expect(text).toContain('tempad answer Q1 --quest <id>|new:"<title>" --why "<reason>"');
+    expect(text).not.toContain("--belongs");
+    expect(text).not.toContain("<question-id>");
   });
 
   test("returns empty string for no questions", () => {
@@ -459,7 +462,7 @@ describe("verifier hand-back text", () => {
     expect(text).toBe(
       [
         "w5 has no declared quest for this session. Reply:",
-        '  tempad quest declare --session s1 --quest <id>|--new "<title>" --outcome "<text>" [--commitment ...] --by agent',
+        '  tempad quest declare --session s1 --quest <id>|--new "<title>" --outcome "<text>" --by agent',
       ].join("\n"),
     );
   });

@@ -1,6 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  ANSWER_BELONGS_FORM,
+  ANSWER_QUEST_FORM,
+  DECLARE_QUEST_FORM,
+  handbackForm,
+} from "../usage.ts";
 import type { QuestionRow } from "./questions";
 
 interface HookEntry {
@@ -270,18 +276,23 @@ export function buildBelongsHandback(
       : active.map((quest) => `${quest.title} [${quest.alias}]`).join(", ");
   return [
     `w5 thinks the last stretch is not part of your active quests (${quests}) (looks like: ${guess}). Reply:`,
-    `  tempad answer ${questionId} --belongs --why "<reason>"`,
+    `  ${handbackForm(ANSWER_BELONGS_FORM, "<question-id>", questionId)}`,
     "  or",
-    `  tempad answer ${questionId} --quest <id>|new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]`,
+    `  ${answerQuestForm(questionId)}`,
     "Ask the user if you are not sure.",
   ].join("\n");
+}
+
+/** The `--quest` form of `tempad answer` for one question: the only one valid for every kind. */
+export function answerQuestForm(questionId: string): string {
+  return handbackForm(ANSWER_QUEST_FORM, "<question-id>", questionId);
 }
 
 /** The hand-back for a session that has declared nothing yet. */
 export function buildDeclareHandback(sessionId: string): string {
   return [
     "w5 has no declared quest for this session. Reply:",
-    `  tempad quest declare --session ${sessionId} --quest <id>|--new "<title>" --outcome "<text>" [--commitment ...] --by agent`,
+    `  ${handbackForm(DECLARE_QUEST_FORM, "<id>", sessionId)}`,
   ].join("\n");
 }
 
@@ -323,7 +334,7 @@ export function buildAdditionalContext(
     lines.push(
       `w5 noticed a possible shift in what you're working on (question ${question.id}, ${question.kind}).`,
     );
-    lines.push(`To resolve it: tempad answer ${question.id} --quest <id|new:"title"> --why "…"`);
+    lines.push(`To resolve it: ${answerQuestForm(question.id)}`);
     lines.push("If you're not sure, keep working — it will follow up later.");
   }
   return lines.join("\n");

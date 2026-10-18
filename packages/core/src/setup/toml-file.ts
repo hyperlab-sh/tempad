@@ -1,4 +1,5 @@
 import { defaultIntentConfig } from "../intent/config.ts";
+import { usageText } from "../usage.ts";
 
 /**
  * A minimal `tempad.toml`: everything commented out, so a fresh home behaves exactly
@@ -30,7 +31,7 @@ export function renderTomlFile(): string {
 # Project rules map a working directory to an org/project and a display name.
 # A \`path\` rule matches one exact folder and everything under it; list path rules
 # before pattern rules, since the first match wins. Or run:
-#   tempad project register <path> --name "<display>"
+#   ${usageText("project register")}
 
 # [[projects]]
 # path = "~/work/my-project"
