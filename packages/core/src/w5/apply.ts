@@ -722,20 +722,17 @@ function resolveStintForSegment(
  * same stint's outcome with different capitalization, spacing or a single
  * trailing full stop or bang across windows is plausible variance, not a
  * genuinely new outcome, so both sides of the comparison go through this
- * before being compared. A *run* of marks or a path-like tail is a
- * meaningful technical token, never sentence punctuation: `..`, `done!!`
- * and `v1.2.` keep their punctuation, so `Resolve path .` and
- * `Resolve path ..` stay two different outcomes.
+ * before being compared. The mark is folded only when what precedes it is a
+ * plain alphanumeric word: anything else is a meaningful technical token,
+ * never sentence punctuation. `..` and `done!!` are runs, a standalone
+ * `path .` names a directory, and `C:\build.`, `v1.2.` and `1.2.` end
+ * path- or version-like tokens, so `Resolve path` and `Resolve path .`, or
+ * `Fix C:\build` and `Fix C:\build.`, stay two different outcomes.
  */
 function normalizeOutcome(outcome: string): string {
   let text = outcome.trim().replace(/\s+/g, " ");
-  if (/[.!?]$/.test(text) && !/[.!?]{2}$/.test(text)) {
-    const before = text.slice(0, -1);
-    const token = before.split(" ").pop() ?? "";
-    const pathLike = /[/.]/.test(token);
-    if (!pathLike) {
-      text = before.trimEnd();
-    }
+  if (/(?:^| )[A-Za-z0-9]+[.!?]$/.test(text)) {
+    text = text.slice(0, -1).trimEnd();
   }
   return text.toLowerCase();
 }
@@ -840,10 +837,15 @@ function resolveStintForSegmentDeclared(
     // closed in this session is the same outcome named twice, not a fresh one
     // -- without this, the same duplicate-screenshots outcome opened a new
     // stint every time the classifier phrased its `new:` the same way instead
-    // of naming the stint's own `S<n>` alias. Matching is on normalized text
-    // (trimmed, internal whitespace collapsed, case-insensitive) on both
-    // sides, since a model that rephrases the same outcome with different
-    // capitalization or spacing is plausible variance, not a new outcome.
+    // of naming the stint's own `S<n>` alias. Matching is keyed on
+    // `(quest, normalized outcome)`: both sides go through `normalizeOutcome`
+    // (trimmed, whitespace collapsed, case-insensitive, one lone sentence
+    // mark folded), since a model that rephrases the same outcome with
+    // different capitalization or spacing is plausible variance, and a stint
+    // whose quest differs from the segment's is never reused whatever the
+    // outcome text -- an identical `new:` on a different quest is that
+    // quest's work, and reusing the stint would put this segment's trace
+    // under the other quest.
     const openCandidates = database
       .query(
         `SELECT stints.id as id, stints.outcome as outcome, stints.quest_id as questId FROM stints
@@ -857,13 +859,14 @@ function resolveStintForSegmentDeclared(
       )
       .all(sessionId) as { id: string; outcome: string; questId: string | null }[];
     const openMatch = openCandidates.find(
-      (candidate) => normalizeOutcome(candidate.outcome) === normalizedOutcome,
+      (candidate) =>
+        candidate.questId === questId && normalizeOutcome(candidate.outcome) === normalizedOutcome,
     );
     if (openMatch !== undefined) return reuse(openMatch.id, openMatch.questId);
 
     const closedCandidates = database
       .query(
-        `SELECT stints.id as id, stints.outcome as outcome FROM stints
+        `SELECT stints.id as id, stints.outcome as outcome, stints.quest_id as questId FROM stints
           WHERE stints.closed_at IS NOT NULL
             AND stints.retracted_at IS NULL AND stints.dismissed_at IS NULL
             AND EXISTS (
@@ -872,9 +875,10 @@ function resolveStintForSegmentDeclared(
                  AND traces.session_id = ?)
           ORDER BY stints.closed_at DESC`,
       )
-      .all(sessionId) as { id: string; outcome: string }[];
+      .all(sessionId) as { id: string; outcome: string; questId: string | null }[];
     const closedMatch = closedCandidates.find(
-      (candidate) => normalizeOutcome(candidate.outcome) === normalizedOutcome,
+      (candidate) =>
+        candidate.questId === questId && normalizeOutcome(candidate.outcome) === normalizedOutcome,
     );
     if (closedMatch !== undefined) return open(outcome, undefined, closedMatch.id);
 

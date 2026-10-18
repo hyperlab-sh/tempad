@@ -1898,6 +1898,65 @@ describe("segments of one inference window reach what earlier segments opened", 
     expect(logs.some((line) => line.includes("again"))).toBe(true);
   });
 
+  test("proposals fold a single sentence mark but never a run or a technical tail (shared normalizer)", () => {
+    // `normalizeOutcome` is shared by the declared `new:` reuse and the
+    // inferred `proposalKey` (titles and outcomes): a single trailing mark
+    // after a plain word is variance, while runs, standalone dots and
+    // path/version-like tails are distinct technical tokens (r2 review).
+    const titleCases: Array<[string, string, number]> = [
+      ["Ship it", "Ship it.", 1],
+      ["Ship it!", "Ship it.", 1],
+      ["Ship it", "Ship it!!", 2],
+      ["Ship it", "Ship it...", 2],
+      ["Fix path C:\\build", "Fix path C:\\build.", 2],
+      ["Done", "Done .", 2],
+      ["bump 1.2", "bump 1.2.", 2],
+    ];
+    for (const [firstTitle, secondTitle, expectedQuests] of titleCases) {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      const { summary } = run(database, store, [
+        segmentAt(1, { proposedQuest: { ...proposal, title: firstTitle }, isSwitch: true }),
+        segmentAt(2, {
+          proposedQuest: { ...proposal, title: secondTitle },
+          newStintReason: "a second stretch the model names separately",
+          isSwitch: true,
+        }),
+      ]);
+      const quests = database
+        .query("SELECT COUNT(*) as count FROM quests WHERE id != 'Q1'")
+        .get() as { count: number };
+      expect([`${firstTitle} / ${secondTitle}`, quests.count]).toEqual([
+        `${firstTitle} / ${secondTitle}`,
+        expectedQuests,
+      ]);
+      expect(summary.questsProposed).toBe(expectedQuests);
+    }
+
+    // The outcome half of the key folds the same way.
+    const outcomeCases: Array<[string, string, number]> = [
+      ["green suite", "green suite.", 1],
+      ["green suite", "green suite!!", 2],
+    ];
+    for (const [firstOutcome, secondOutcome, expectedQuests] of outcomeCases) {
+      const database = openDatabase(":memory:");
+      const { store } = seed(database);
+      const { summary } = run(database, store, [
+        segmentAt(1, { proposedQuest: { ...proposal, outcome: firstOutcome }, isSwitch: true }),
+        segmentAt(2, {
+          proposedQuest: { ...proposal, outcome: secondOutcome },
+          newStintReason: "a second stretch the model names separately",
+          isSwitch: true,
+        }),
+      ]);
+      const quests = database
+        .query("SELECT COUNT(*) as count FROM quests WHERE id != 'Q1'")
+        .get() as { count: number };
+      expect(quests.count).toBe(expectedQuests);
+      expect(summary.questsProposed).toBe(expectedQuests);
+    }
+  });
+
   test("matchedQuest on the quest-less stint an earlier segment opened attaches it", () => {
     const database = openDatabase(":memory:");
     const { store } = seed(database);
@@ -3906,6 +3965,179 @@ describe("applyResult in declared mode", () => {
 
     expect(versionSummary.stintsOpened).toBe(2);
     expect(versionSummary.sameWindowReuse).toBe(0);
+  });
+
+  test("a standalone dot or a backslash path tail is a technical token, not sentence punctuation", () => {
+    const prepare = (database: ReturnType<typeof openDatabase>) => {
+      const seeded = seedDeclared(database);
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('Q2', 'hero', ?, 'Fix the flake', 'green suite', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run(seeded.heroId);
+      declareQuest(seeded.store, database, {
+        sessionId: "s1",
+        questId: "Q2",
+        plan: [],
+        scope: "session",
+        declaredBy: "agent",
+        at: "2026-09-04T13:30:00.000Z",
+        heroId: seeded.heroId,
+      });
+      return seeded;
+    };
+    const twoQuestWindow = (questId: string): ClassifierWindow => ({
+      ...declaredWindow,
+      activeQuests: [
+        { alias: "Q1", title: "Ship marko-ui", outcome: "86 components", plan: [] },
+        { alias: "Q2", title: "Fix the flake", outcome: "green suite", plan: [] },
+      ],
+      activeQuestAliases: { Q1: questId, Q2: "Q2" },
+    });
+
+    // `Resolve path` versus `Resolve path .`: the dot stands alone, so it is
+    // a directory token, not a sentence end (r2 review repro, both orders);
+    // `C:\build.` ends a backslash path, which is equally technical. Each
+    // pair must open two stints with the segment's own quest on each trace.
+    for (const [firstStint, secondStint] of [
+      ["new: Resolve path", "new: Resolve path ."],
+      ["new: Resolve path .", "new: Resolve path"],
+      ["new: Fix path C:\\build", "new: Fix path C:\\build."],
+      ["new: Fix path C:\\build.", "new: Fix path C:\\build"],
+    ] as const) {
+      const database = openDatabase(":memory:");
+      const { store, questId } = prepare(database);
+      const summary = applyResult(
+        store,
+        database,
+        twoQuestWindow(questId),
+        {
+          segments: [
+            segment({ quest: "Q1", stint: firstStint }),
+            segment({
+              startedAt: "2026-09-04T15:10:00.000Z",
+              endedAt: "2026-09-04T15:20:00.000Z",
+              quest: "Q2",
+              stint: secondStint,
+              isSwitch: true,
+            }),
+          ],
+          sessionNote: null,
+        },
+        declaredOptions,
+      );
+
+      expect(summary.stintsOpened).toBe(2);
+      expect(summary.sameWindowReuse).toBe(0);
+      const opened = database
+        .query("SELECT quest_id as questId FROM stints WHERE id != 'A1' ORDER BY opened_at ASC")
+        .all() as { questId: string | null }[];
+      expect(opened.map((stint) => stint.questId)).toEqual([questId, "Q2"]);
+    }
+
+    // Same quest on both segments: isolates the normalization itself from
+    // the quest key, since only the outcome text can tell the stints apart.
+    const sameQuest = openDatabase(":memory:");
+    const { store: singleStore } = prepare(sameQuest);
+    const sameQuestSummary = applyResult(
+      singleStore,
+      sameQuest,
+      declaredWindow,
+      {
+        segments: [
+          segment({
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:10:00.000Z",
+            stint: "new: Resolve path",
+          }),
+          segment({
+            startedAt: "2026-09-04T15:10:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            stint: "new: Resolve path .",
+            isSwitch: true,
+          }),
+        ],
+        sessionNote: null,
+      },
+      declaredOptions,
+    );
+    expect(sameQuestSummary.stintsOpened).toBe(2);
+    expect(sameQuestSummary.sameWindowReuse).toBe(0);
+  });
+
+  test("the same new: outcome on a different quest never reuses the other quest's stint", () => {
+    const prepare = (database: ReturnType<typeof openDatabase>) => {
+      const seeded = seedDeclared(database);
+      database
+        .query(
+          `INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at)
+           VALUES ('Q2', 'hero', ?, 'Fix the flake', 'green suite', 1, 1, 'started', '2026-09-01T00:00:00.000Z')`,
+        )
+        .run(seeded.heroId);
+      declareQuest(seeded.store, database, {
+        sessionId: "s1",
+        questId: "Q2",
+        plan: [],
+        scope: "session",
+        declaredBy: "agent",
+        at: "2026-09-04T13:30:00.000Z",
+        heroId: seeded.heroId,
+      });
+      return seeded;
+    };
+    const twoQuestWindow = (questId: string): ClassifierWindow => ({
+      ...declaredWindow,
+      activeQuests: [
+        { alias: "Q1", title: "Ship marko-ui", outcome: "86 components", plan: [] },
+        { alias: "Q2", title: "Fix the flake", outcome: "green suite", plan: [] },
+      ],
+      activeQuestAliases: { Q1: questId, Q2: "Q2" },
+    });
+
+    // Both quests, both orders: an identical `new:` on another quest is that
+    // quest's work, and the outcome text match must not reach across it
+    // (r2 review: the Q1 trace landed under Q2's stint).
+    for (const [firstQuest, secondQuest, expectedQuests] of [
+      ["Q1", "Q2", undefined],
+      ["Q2", "Q1", undefined],
+    ] as const) {
+      const database = openDatabase(":memory:");
+      const { store, questId } = prepare(database);
+      const summary = applyResult(
+        store,
+        database,
+        twoQuestWindow(questId),
+        {
+          segments: [
+            segment({ quest: firstQuest, stint: "new: wire the export button" }),
+            segment({
+              startedAt: "2026-09-04T15:10:00.000Z",
+              endedAt: "2026-09-04T15:20:00.000Z",
+              quest: secondQuest,
+              stint: "new: wire the export button",
+              isSwitch: true,
+            }),
+          ],
+          sessionNote: null,
+        },
+        declaredOptions,
+      );
+
+      expect(summary.stintsOpened).toBe(2);
+      expect(summary.sameWindowReuse).toBe(0);
+      const traces = database
+        .query("SELECT stint_id as stintId FROM traces WHERE stint_id != 'A1'")
+        .all() as { stintId: string }[];
+      expect(new Set(traces.map((trace) => trace.stintId)).size).toBe(2);
+      const opened = database
+        .query("SELECT quest_id as questId FROM stints WHERE id != 'A1' ORDER BY opened_at ASC")
+        .all() as { questId: string | null }[];
+      expect(opened.map((stint) => stint.questId)).toEqual(
+        firstQuest === "Q1" ? [questId, "Q2"] : ["Q2", questId],
+      );
+      void expectedQuests;
+    }
   });
 
   test("a new: whose text matches an earlier segment's outcome ignoring a lone trailing mark reuses its stint", () => {
