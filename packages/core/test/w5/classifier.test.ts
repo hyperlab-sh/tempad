@@ -377,6 +377,17 @@ describe("classifier", () => {
     expect(result.selectorDefaulted).toBe(1);
   });
 
+  test("validateResult normalizes a trigger key that is absent entirely to null", () => {
+    const segment: Record<string, unknown> = { ...good.segments[0], belongs: false, guess: "g" };
+    delete segment.trigger;
+    expect("trigger" in segment).toBe(false);
+
+    const result = validateResult({ segments: [segment] }, window);
+
+    expect(result.segments[0]?.trigger).toBeNull();
+    expect(result.segments[0]?.belongs).toBe(false);
+  });
+
   test("validateResult keeps a recognized quest sent alongside belongs: false and nulls an unknown one", () => {
     const result = validateResult(
       {

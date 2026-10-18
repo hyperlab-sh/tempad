@@ -245,13 +245,16 @@ describe("a doubt without a quoted trigger is recorded but never asked", () => {
 
     expect(questionRows(fixture.database)).toEqual([]);
     expect(summary.doubts).toBe(1);
+    expect(summary.doubtsSilent).toBe(1);
     expect(summary.questionsWatching).toBe(0);
     const row = doubtedStint(fixture.database);
     expect(row.doubt).toBe("a competitor comparison");
     expect(row.questId).toBe(fixture.questIds[0] as string);
     expect(
-      lines.some((line) =>
-        line.startsWith(`w5 doubt: session s1 stint ${row.stintId} guess "a competitor`),
+      lines.some(
+        (line) =>
+          line.startsWith(`w5 doubt: session s1 stint ${row.stintId} guess "a competitor`) &&
+          line.endsWith("(no question: no trigger)"),
       ),
     ).toBe(true);
   });
@@ -303,10 +306,94 @@ describe("a doubt without a quoted trigger is recorded but never asked", () => {
     expect(row.questId).toBe(fixture.questIds[1] as string);
   });
 
-  test("a quest-not-named doubt asks no question", async () => {
-    const fixture = await seed();
-    run(fixture, [segment({ guess: QUEST_NOT_NAMED_GUESS })]);
+  test("a quest-not-named doubt with a trigger still asks (2+ active quests, no alias)", async () => {
+    const fixture = await seed({ quests: 2 });
+    const validated = validateResult(
+      {
+        segments: [
+          {
+            startedAt: "2026-09-04T15:00:00.000Z",
+            endedAt: "2026-09-04T15:20:00.000Z",
+            what: "w",
+            why: "y",
+            belongs: true,
+            guess: null,
+            quest: null,
+            stint: "new: x",
+            isSwitch: false,
+            trigger: "a quoted sentence",
+            confidence: 0.9,
+          },
+        ],
+        sessionNote: null,
+      },
+      fixture.window,
+    );
+    expect(validated.segments[0]?.guess).toBe(QUEST_NOT_NAMED_GUESS);
+
+    const summary = applyResult(
+      fixture.store,
+      fixture.database,
+      fixture.window,
+      validated,
+      options,
+    );
+
+    expect(summary.doubtsSilent).toBe(0);
+    const [question, ...rest] = questionRows(fixture.database);
+    expect(rest).toEqual([]);
+    expect(question?.kind).toBe("belongs");
+    expect(question?.guess).toBe(QUEST_NOT_NAMED_GUESS);
+  });
+
+  test("a quest-not-named doubt without a trigger is silent and says why", async () => {
+    const fixture = await seed({ quests: 2 });
+    const lines: string[] = [];
+    const summary = run(
+      fixture,
+      [segment({ guess: QUEST_NOT_NAMED_GUESS, trigger: null })],
+      (line) => lines.push(line),
+    );
+
     expect(questionRows(fixture.database)).toEqual([]);
+    expect(summary.doubtsSilent).toBe(1);
+    expect(lines.some((line) => line.endsWith("(no question: no trigger)"))).toBe(true);
+  });
+
+  test("the w5 doubt line names the reason and doubtsSilent counts only silent doubts", async () => {
+    const fixture = await seed({ quests: 2 });
+    const lines: string[] = [];
+    const summary = run(
+      fixture,
+      [
+        segment({ trigger: null }),
+        segment({
+          startedAt: "2026-09-04T15:05:00.000Z",
+          endedAt: "2026-09-04T15:08:00.000Z",
+          what: "second",
+          stint: "new: second thing",
+          guess: UNRECOGNIZED_QUEST_ALIAS_GUESS,
+        }),
+        segment({
+          startedAt: "2026-09-04T15:10:00.000Z",
+          endedAt: "2026-09-04T15:15:00.000Z",
+          what: "third",
+          stint: "new: third thing",
+        }),
+      ],
+      (line) => lines.push(line),
+    );
+
+    const doubtLines = lines.filter((line) => line.startsWith("w5 doubt:"));
+    expect(doubtLines).toHaveLength(3);
+    expect(doubtLines[0]).toEndWith('guess "a competitor comparison" (no question: no trigger)');
+    expect(doubtLines[1]).toEndWith(
+      'guess "unrecognized quest alias" (no question: unrecognized alias)',
+    );
+    expect(doubtLines[2]).toEndWith('guess "a competitor comparison"');
+    expect(summary.doubts).toBe(3);
+    expect(summary.doubtsSilent).toBe(2);
+    expect(questionRows(fixture.database)).toHaveLength(1);
   });
 });
 
@@ -425,7 +512,7 @@ describe("rebuild", () => {
     expect(flag()).toBeNull();
   });
 
-  test("a doubt cleared by context resolution stays flagged after a rebuild", async () => {
+  test("a context-resolved doubt stays flagged after a rebuild", async () => {
     const fixture = await seed();
     run(fixture, [segment({})]);
     const traceId = doubtedStint(fixture.database).traceId;

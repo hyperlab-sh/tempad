@@ -768,6 +768,7 @@ async function runEvalCommand(args: string[], context: W5Context): Promise<numbe
   );
   context.stdout(`continues_links=${metrics.continuesLinks}`);
   context.stdout(`doubts=${metrics.doubts}`);
+  context.stdout(`doubts_silent=${metrics.doubtsSilent}`);
   context.stdout(`doubts_answered=${metrics.doubtsAnswered}`);
   context.stdout(`doubts_recorded=${metrics.doubtsRecorded}`);
   context.stdout(`traces_unattributed=${metrics.tracesUnattributed}`);

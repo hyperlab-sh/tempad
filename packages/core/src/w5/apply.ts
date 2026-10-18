@@ -12,7 +12,6 @@ import {
   type ClassifierWindow,
   DEFAULT_NEW_STINT_REASON,
   parseSegmentReference,
-  QUEST_NOT_NAMED_GUESS,
   UNRECOGNIZED_QUEST_ALIAS_GUESS,
 } from "./classifier";
 import { openStintContinuing } from "./lifecycle";
@@ -29,6 +28,12 @@ export interface AppliedSummary {
    * two meanings never coexist in the same summary.
    */
   doubts: number;
+  /**
+   * Declared mode: doubts recorded and logged but never asked, because the
+   * segment carried no quoted trigger or named an unrecognized quest alias.
+   * Counted whether or not asking is enabled; a subset of `doubts`.
+   */
+  doubtsSilent: number;
   unknownStintIds: number;
   /**
    * Inference mode: segments whose quest/stint selectors were repaired because
@@ -884,11 +889,17 @@ function resolveStintForSegmentDeclared(
   return open(segment.what);
 }
 
-const UNASKABLE_GUESSES = new Set([UNRECOGNIZED_QUEST_ALIAS_GUESS, QUEST_NOT_NAMED_GUESS]);
-
-function isAskableDoubt(segment: ClassifierSegment): boolean {
-  if (typeof segment.trigger !== "string" || segment.trigger.trim() === "") return false;
-  return !UNASKABLE_GUESSES.has(segment.guess ?? "");
+/**
+ * Why a doubt is recorded but never asked, or null when it may be. A guess of
+ * `UNRECOGNIZED_QUEST_ALIAS_GUESS` is the validator's own, not a judgement the
+ * model made; a doubt with no quoted trigger gives the human nothing to check.
+ * A missing quest with several active (`QUEST_NOT_NAMED_GUESS`) is a real doubt
+ * and asks when it has a trigger.
+ */
+function silentDoubtReason(segment: ClassifierSegment): "unrecognized alias" | "no trigger" | null {
+  if (segment.guess === UNRECOGNIZED_QUEST_ALIAS_GUESS) return "unrecognized alias";
+  if (typeof segment.trigger !== "string" || segment.trigger.trim() === "") return "no trigger";
+  return null;
 }
 
 export function applyResult(
@@ -907,6 +918,7 @@ export function applyResult(
     branches: 0,
     questionsWatching: 0,
     doubts: 0,
+    doubtsSilent: 0,
     unknownStintIds: 0,
     selectorRepaired: 0,
     questProposedOnMatched: 0,
@@ -1134,14 +1146,18 @@ export function applyResult(
       // summary and `tempad review` still show it; only the hand-back is gated.
       if (segment.belongs === false) {
         summary.doubts += 1;
-        options.log(
-          `w5 doubt: session ${window.sessionId} stint ${stintId} guess "${segment.guess ?? ""}"`,
-        );
         // A doubt the model did not back with a quoted trigger, or one the
-        // validator fabricated (the quest alias was unrecognized or never named),
-        // is recorded and logged but never asked: the human would be answering a
-        // question nobody could explain.
-        if (options.askingEnabled && isAskableDoubt(segment)) {
+        // validator made up from an unrecognized quest alias, is recorded and
+        // logged but never asked: the human would be answering a question nobody
+        // could explain. The log line says which, and `doubtsSilent` counts them.
+        const silentReason = silentDoubtReason(segment);
+        if (silentReason !== null) summary.doubtsSilent += 1;
+        options.log(
+          `w5 doubt: session ${window.sessionId} stint ${stintId} guess "${segment.guess ?? ""}"${
+            silentReason === null ? "" : ` (no question: ${silentReason})`
+          }`,
+        );
+        if (options.askingEnabled && silentReason === null) {
           askQuestion(store, database, {
             trace: traceId,
             sessionId: questionSessionId,

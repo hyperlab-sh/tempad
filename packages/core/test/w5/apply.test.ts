@@ -2578,7 +2578,9 @@ describe("applyResult in declared mode", () => {
     expect(trace.doubt).toBe("a competitor comparison");
     expect(
       lines.some((line) =>
-        /^w5 doubt: session s1 stint .+ guess "a competitor comparison"$/.test(line),
+        /^w5 doubt: session s1 stint .+ guess "a competitor comparison" \(no question: no trigger\)$/.test(
+          line,
+        ),
       ),
     ).toBe(true);
   });

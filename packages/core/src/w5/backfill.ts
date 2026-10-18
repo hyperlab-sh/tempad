@@ -45,6 +45,8 @@ export interface BackfillResult {
   windowsFailed: number;
   windowsSkipped: number;
   doubts: number;
+  /** Doubts recorded but not asked (no trigger, or an unrecognized alias); see `AppliedSummary`. */
+  doubtsSilent: number;
   unknownStintIds: number;
   overlapDropped: number;
   questProposedOnMatched: number;
@@ -251,6 +253,7 @@ export async function backfill(
   let windowsFailed = 0;
   let windowsSkipped = 0;
   let doubts = 0;
+  let doubtsSilent = 0;
   let unknownStintIds = 0;
   let overlapDropped = 0;
   let questProposedOnMatched = 0;
@@ -390,6 +393,7 @@ export async function backfill(
         stintMinMinutes: intentConfig.stintMinMinutes,
       });
       doubts += applied.doubts;
+      doubtsSilent += applied.doubtsSilent;
       unknownStintIds += applied.unknownStintIds;
       overlapDropped += result.overlapDropped ?? 0;
       questProposedOnMatched += applied.questProposedOnMatched;
@@ -442,6 +446,7 @@ export async function backfill(
     windowsFailed,
     windowsSkipped,
     doubts,
+    doubtsSilent,
     unknownStintIds,
     overlapDropped,
     questProposedOnMatched,
