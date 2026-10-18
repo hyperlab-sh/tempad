@@ -47,6 +47,7 @@ throttle_minutes = 5
     expect(config.w5.stintIdleMinutes).toBe(45);
     expect(config.w5.memoryHours).toBe(8);
     expect(config.w5.memoryStints).toBe(10);
+    expect(config.w5.memoryQuests).toBe(20);
     expect(config.w5.overlapMessages).toBe(3);
   });
 
@@ -261,6 +262,7 @@ describe("a [w5] key of the wrong type", () => {
       ["stint_min_minutes", "stintMinMinutes"],
       ["memory_hours", "memoryHours"],
       ["memory_stints", "memoryStints"],
+      ["memory_quests", "memoryQuests"],
       ["overlap_messages", "overlapMessages"],
     ];
     const toml = `[w5]\n${keys.map(([key]) => `${key} = "x"`).join("\n")}\n`;

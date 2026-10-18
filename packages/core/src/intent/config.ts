@@ -24,6 +24,7 @@ export interface W5Config {
   stintMinMinutes: number;
   memoryHours: number;
   memoryStints: number;
+  memoryQuests: number;
   overlapMessages: number;
   mode: (typeof W5_MODES)[number];
   inferenceFallback: boolean;
@@ -55,6 +56,7 @@ export function defaultIntentConfig(): IntentConfig {
       stintMinMinutes: 5,
       memoryHours: 8,
       memoryStints: 10,
+      memoryQuests: 20,
       overlapMessages: 3,
       mode: "declared",
       inferenceFallback: true,
@@ -259,6 +261,7 @@ export function loadIntentConfig(
       stintMinMinutes: amount("stint_min_minutes", config.w5.stintMinMinutes),
       memoryHours: amount("memory_hours", config.w5.memoryHours),
       memoryStints: count("memory_stints", config.w5.memoryStints),
+      memoryQuests: count("memory_quests", config.w5.memoryQuests),
       overlapMessages: count("overlap_messages", config.w5.overlapMessages),
       mode: parseChoice(w5.mode, W5_MODES, config.w5.mode, "[w5].mode", reporter),
       inferenceFallback: boolean("inference_fallback", config.w5.inferenceFallback),

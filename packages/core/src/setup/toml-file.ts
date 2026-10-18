@@ -25,6 +25,7 @@ export function renderTomlFile(): string {
 # stint_min_minutes = ${w5.stintMinMinutes}
 # memory_hours = ${w5.memoryHours}
 # memory_stints = ${w5.memoryStints}
+# memory_quests = ${w5.memoryQuests}
 # overlap_messages = ${w5.overlapMessages}
 # backfill_days = ${w5.backfillDays}
 

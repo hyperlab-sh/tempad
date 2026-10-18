@@ -8,7 +8,13 @@ import { buildWindow, findSessionFile } from "../../src/w5/window";
 
 registerAllProjections();
 
-const memoryInput = { maxMessages: 50, memoryHours: 8, memoryStints: 10, overlapMessages: 3 };
+const memoryInput = {
+  maxMessages: 50,
+  memoryHours: 8,
+  memoryStints: 10,
+  memoryQuests: 20,
+  overlapMessages: 3,
+};
 
 function seedSession(database: ReturnType<typeof openDatabase>) {
   database
@@ -1006,6 +1012,81 @@ describe("window slice as of the window's end", () => {
       insertQuest(database, "Q-retracted-before", { retractedAt: "2026-09-04T14:00:00.000Z" });
 
       expect(openIds(database).sort()).toEqual(["Q-merged-later", "Q-retracted-later", "Q-target"]);
+    });
+
+    test("the list is ranked session, then project, then the rest, each newest first, and capped", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      for (const id of ["Q-session-old", "Q-session-new", "Q-project", "Q-elsewhere", "Q-unused"]) {
+        insertQuest(database, id);
+      }
+      const use = (quest: string, session: string, place: string, at: string) => {
+        database
+          .query(
+            "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES (?, ?, 'work', ?, 1)",
+          )
+          .run(`S-${quest}-${at}`, quest, at);
+        database
+          .query(
+            `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
+             VALUES (?, ?, 'claude-code', ?, 'session', ?, ?, 'hero', 'w', 'w', ?, 'claude-code', 0.9, 'assistant', ?, ?)`,
+          )
+          .run(`T-${quest}-${at}`, `S-${quest}-${at}`, place, at, at, place, session, at);
+      };
+      use("Q-session-old", "s1", "personal/marko-ui", "2026-09-04T10:00:00.000Z");
+      use("Q-session-new", "s1", "personal/marko-ui", "2026-09-04T12:00:00.000Z");
+      // Newer than both session quests, but another session's: ranks below them.
+      use("Q-project", "s-other", "personal/marko-ui", "2026-09-04T15:00:00.000Z");
+      use("Q-elsewhere", "s-other", "personal/other", "2026-09-04T15:10:00.000Z");
+
+      const ids = (memoryQuests: number) =>
+        (buildWindow(database, { ...base, windowEnd, memoryQuests }).openQuests ?? []).map(
+          (quest) => quest.id,
+        );
+
+      expect(ids(10)).toEqual([
+        "Q-session-new",
+        "Q-session-old",
+        "Q-project",
+        "Q-elsewhere",
+        "Q-unused",
+      ]);
+      expect(ids(3)).toEqual(["Q-session-new", "Q-session-old", "Q-project"]);
+      expect(ids(1)).toEqual(["Q-session-new"]);
+      expect(ids(0)).toEqual([]);
+    });
+
+    test("a retracted trace does not make a quest relevant to the session", () => {
+      const database = openDatabase(":memory:");
+      ensureTables(database);
+      seedSession(database);
+      seedOpenStint(database);
+      insertQuest(database, "Q-other");
+      database
+        .query(
+          "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('S-other', 'Q-other', 'w', '2026-09-04T09:00:00.000Z', 1)",
+        )
+        .run();
+      insertTrace(database, {
+        id: "T-retracted",
+        stint: "S-other",
+        session: "s1",
+        startedAt: "2026-09-04T09:00:00.000Z",
+        what: "w",
+      });
+      database
+        .query(
+          "UPDATE traces SET retracted_at = '2026-09-04T09:30:00.000Z' WHERE id = 'T-retracted'",
+        )
+        .run();
+
+      const ids = (
+        buildWindow(database, { ...base, windowEnd, memoryQuests: 1 }).openQuests ?? []
+      ).map((quest) => quest.id);
+
+      // Q1 is the seeded quest of this session's stint; Q-other only has a retracted trace.
+      expect(ids).toEqual(["Q1"]);
     });
 
     test("lastStintAt ignores traces that started after the window", () => {

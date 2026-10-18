@@ -8,10 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `buildWindow` is about 20 times faster on a database with thousands of stints that never closed (1.7 s to under 0.1 s per window on real data): the latest trace of every stint comes from one ranked pass over `traces` instead of a correlated scan per stint. Ties on `ended_at` now break on trace id, so the slice is deterministic.
 - `tempad w5 backfill` (inference fallback) no longer fragments one stretch of work into a stint per window when the classifier mixes up the ids it is offered. A quest id named as the stint (or a stint id as the quest) now resolves to the session's stint of that quest, and a closed stint named as `matchedStint` becomes a `continues` link instead of an unlinked new stint. A genuinely unknown id still opens a new stint and counts in `unknown_activity_ids`.
 
 ### Changed
 
+- Inference-mode windows offer at most `[w5].memory_quests` open quests (default 20), ranked this session's, then the project's, then the rest, each newest first, instead of all of them (~475 quests, 66 KB of prompt on real data). Set it higher to restore the old behaviour; `0` offers none.
 - tempad now needs **Bun 1.4.2 or newer** (`engines.bun` was `>=1.3.14`). CI, `.prototools`, `.moon/toolchain.yml` and `packageManager` pin 1.4.2, the newest 1.4 patch older than two weeks, so local runs (which already got 1.4.x through the proto shim) and CI use one TOML parser. 1.3.14 accepted malformed `tempad.toml` that 1.4 rejects (`[w5` at end of file, `[sync]]`, a duplicate `[a]` table). If you are on 1.3.x, run `bun upgrade`.
 
 ### Added

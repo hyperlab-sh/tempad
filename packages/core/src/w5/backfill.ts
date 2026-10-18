@@ -362,6 +362,7 @@ export async function backfill(
         maxMessages: 5000,
         memoryHours: intentConfig.memoryHours,
         memoryStints: intentConfig.memoryStints,
+        memoryQuests: intentConfig.memoryQuests,
         overlapMessages: intentConfig.overlapMessages,
         windowEnd: endedAt,
       }),

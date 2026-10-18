@@ -20,6 +20,8 @@ export interface BuildWindowInput {
   maxMessages: number;
   memoryHours: number;
   memoryStints: number;
+  /** Cap on `openQuests` in inference mode; the list is ranked, see `buildWindow`. */
+  memoryQuests: number;
   overlapMessages: number;
   /**
    * The last message timestamp of the window being classified. Candidate
@@ -58,8 +60,20 @@ interface StintRow {
  * `--force` re-run or a gap-filling backfill sees, "latest" would otherwise be
  * a trace from the window's future, leaking its text and moving the stint to
  * that trace's session.
+ *
+ * The latest trace of every stint comes from one ranked pass over `traces`. It
+ * used to be a correlated subquery per stint, and `traces` has no index on
+ * `stint_id`: with ~2000 stints that never closed that was a full scan each, 1.4 s
+ * per window on real data.
  */
 const ACTIVITY_SLICE_SELECT = `
+  WITH ranked AS (
+    SELECT traces.stint_id, traces.what, traces.why, traces.ended_at, traces.session_id,
+           traces.place,
+           ROW_NUMBER() OVER (
+             PARTITION BY traces.stint_id ORDER BY traces.ended_at DESC, traces.id DESC) AS rank
+      FROM traces
+     WHERE traces.retracted_at IS NULL AND traces.started_at < ?)
   SELECT stints.id as stintId,
          latest.what as what,
          latest.why as why,
@@ -70,11 +84,7 @@ const ACTIVITY_SLICE_SELECT = `
          stints.closed_at as closedAt,
          stints.close_reason as closeReason
     FROM stints
-    JOIN traces latest ON latest.id = (
-           SELECT traces.id FROM traces
-            WHERE traces.stint_id = stints.id AND traces.retracted_at IS NULL
-              AND traces.started_at < ?
-            ORDER BY traces.ended_at DESC LIMIT 1)
+    JOIN ranked latest ON latest.stint_id = stints.id AND latest.rank = 1
     LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
    WHERE stints.retracted_at IS NULL
      AND stints.dismissed_at IS NULL`;
@@ -146,35 +156,69 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
   // happened, so it is never a candidate -- see `windowEnd` on `BuildWindowInput`.
   const windowEnd = input.windowEnd ?? new Date().toISOString();
 
+  // The open quests the classifier may match, ranked and capped at `memoryQuests`:
+  // on real data the full list was ~475 quests by full ULID, 66 KB of prompt and
+  // a 2 s `buildWindow`, and the model crossed quest and stint ids in it. The
+  // ones this session already worked on come first, then the project's, then the
+  // rest, each by most recent use, so what the model is likely to name survives
+  // the cap. A quest left out cannot be matched, so the classifier may propose a
+  // duplicate of it: `memory_quests` trades prompt size against that.
   const openQuests =
     mode === "inferred"
       ? (database
           .query(
-            `SELECT quests.id as id, quests.title as title, quests.outcome as outcome,
-              (SELECT MAX(traces.started_at) FROM traces
+            `WITH usage AS (
+               SELECT stints.quest_id AS questId,
+                      MAX(traces.started_at) AS lastStintAt,
+                      MAX(traces.session_id = ?) AS inSession,
+                      MAX(traces.place = ?) AS inProject
+                 FROM traces
                  JOIN stints ON stints.id = traces.stint_id
-                WHERE stints.quest_id = quests.id AND traces.started_at < ?) as lastStintAt
-         FROM quests
-        WHERE COALESCE(
-                (SELECT json_extract(events.payload, '$.state') FROM events
-                  WHERE events.kind = 'quest.lifecycle' AND events.subject = quests.id
-                    AND events.at <= ?
-                  ORDER BY events.uid DESC LIMIT 1),
-                'started') IN ('started', 'resumed')
-          AND (quests.merged_into IS NULL
-               OR NOT EXISTS (SELECT 1 FROM events
-                               WHERE events.kind = 'quest.merged' AND events.subject = quests.id
-                                 AND events.at <= ?))
-          AND (quests.retracted_at IS NULL OR quests.retracted_at > ?)
-          AND (quests.created_at <= ?
-               OR EXISTS (SELECT 1 FROM stints WHERE stints.quest_id = quests.id
-                             AND stints.opened_at < ?))
-          AND (
-            quests.owner_kind = 'hero'
-            OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)
-          )`,
+                WHERE traces.started_at < ? AND traces.retracted_at IS NULL
+                  AND stints.quest_id IS NOT NULL
+                GROUP BY stints.quest_id)
+            SELECT quests.id as id, quests.title as title, quests.outcome as outcome,
+                   usage.lastStintAt as lastStintAt
+              FROM quests
+              LEFT JOIN usage ON usage.questId = quests.id
+             WHERE COALESCE(
+                     (SELECT json_extract(events.payload, '$.state') FROM events
+                       WHERE events.kind = 'quest.lifecycle' AND events.subject = quests.id
+                         AND events.at <= ?
+                       ORDER BY events.uid DESC LIMIT 1),
+                     'started') IN ('started', 'resumed')
+               AND (quests.merged_into IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM events
+                                    WHERE events.kind = 'quest.merged' AND events.subject = quests.id
+                                      AND events.at <= ?))
+               AND (quests.retracted_at IS NULL OR quests.retracted_at > ?)
+               AND (quests.created_at <= ?
+                    OR EXISTS (SELECT 1 FROM stints WHERE stints.quest_id = quests.id
+                                  AND stints.opened_at < ?))
+               AND (
+                 quests.owner_kind = 'hero'
+                 OR quests.owner_id IN (SELECT id FROM parties WHERE slug = ?)
+               )
+             ORDER BY COALESCE(usage.inSession, 0) DESC,
+                      COALESCE(usage.inProject, 0) DESC,
+                      usage.lastStintAt IS NULL,
+                      usage.lastStintAt DESC,
+                      quests.created_at DESC,
+                      quests.id
+             LIMIT ?`,
           )
-          .all(windowEnd, windowEnd, windowEnd, windowEnd, windowEnd, windowEnd, session.org) as {
+          .all(
+            input.sessionId,
+            `${session.org}/${session.project}`,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            windowEnd,
+            session.org,
+            input.memoryQuests,
+          ) as {
           id: string;
           title: string;
           outcome: string | null;
