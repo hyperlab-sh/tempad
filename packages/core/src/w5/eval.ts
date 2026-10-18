@@ -250,6 +250,8 @@ export interface EvalMetrics {
   medianStintDurationMinutes: number;
   continuesLinks: number;
   doubts: number;
+  /** Doubts recorded but not asked (no quoted trigger, or an unrecognized quest alias). */
+  doubtsSilent: number;
   doubtsAnswered: number;
   /**
    * Traces with a non-null `doubt` in range -- the same fact `tempad review`
@@ -497,6 +499,7 @@ export async function runEval(options: EvalOptions): Promise<EvalMetrics> {
     medianStintDurationMinutes: median(durationsMinutes),
     continuesLinks: continuesCount.count,
     doubts: backfillResult.doubts,
+    doubtsSilent: backfillResult.doubtsSilent,
     doubtsAnswered: doubtsAnsweredCount.count,
     doubtsRecorded: doubtsRecordedCount.count,
     tracesUnattributed: tracesUnattributedCount.count,

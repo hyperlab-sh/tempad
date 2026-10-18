@@ -684,6 +684,7 @@ describe("runOnce drives a belongs question to the user", () => {
             ...(good.segments[0] as ClassifierResult["segments"][number]),
             belongs: false,
             guess: "a competitor comparison",
+            trigger: "let's compare with the competitor",
           },
         ],
         sessionNote: null,

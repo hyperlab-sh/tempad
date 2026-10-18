@@ -125,8 +125,10 @@ export interface ClassifierSegment {
   guess?: string | null;
   /**
    * Declared mode: the alias (`"Q1"`, or a parent's `"PQ1"`) of the active quest
-   * this segment serves. `null` only when `belongs` is false -- a segment that
-   * serves nothing declared has no quest to name.
+   * this segment serves. `null` only when `belongs` is false. A doubted segment
+   * keeps the alias it names when the window offered it; with none, `applyResult`
+   * keeps the stint on the session's current quest, so a doubt never leaves it
+   * without one.
    */
   quest?: string | null;
   /**
@@ -514,8 +516,16 @@ function validateSegment(
         segment.guess = UNSPECIFIED_GUESS;
         counters.guessDefaulted += 1;
       }
-      // A segment that serves nothing declared has no quest to name.
-      segment.quest = null;
+      // The quest the model judged the segment against stays: apply keeps the
+      // stint on it and flags the doubt, rather than orphaning the work. An alias
+      // the window never offered names nothing.
+      if (
+        typeof segment.quest !== "string" ||
+        declaredAliases === null ||
+        !declaredAliases.quests.has(segment.quest)
+      ) {
+        segment.quest = null;
+      }
     } else {
       if (segment.guess !== null) {
         // Repair, don't reject: a segment that belongs has no need to guess what

@@ -201,6 +201,17 @@ export const stintProjection: Projection = {
             "UPDATE questions SET state = ?, answered_at = ?, answer = ?, answered_by = ? WHERE id = ?",
           )
           .run(state, event.at, answer, answeredBy, event.subject);
+        // The hero settling a doubt (`--belongs` or `--quest`) clears the flag on
+        // its trace. A context resolution does not: nobody judged the segment.
+        // Expiry is a different event and never gets here, so an unanswered doubt
+        // keeps its flag.
+        if (state === "answered" && (payload.belongs === true || payload.quest)) {
+          database
+            .query(
+              "UPDATE traces SET doubt = NULL WHERE id = (SELECT trace_id FROM questions WHERE id = ?)",
+            )
+            .run(event.subject);
+        }
         return;
       }
       case "question.expired":
