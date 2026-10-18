@@ -63,7 +63,7 @@ interface UsageEntry {
  * The one copy of every usage text. The global list, `tempad help <path>` and
  * `<path> --help` all read it, and the `*_USAGE` constants of the commands derive from it.
  */
-const USAGE_ENTRIES: readonly UsageEntry[] = [
+export const USAGE_ENTRIES: readonly UsageEntry[] = [
   {
     paths: ["setup", "init"],
     text: "tempad setup [--non-interactive] [--home <dir>] [--force] [--no-verify] [--<variable> <value> ...]   (create TEMPAD_HOME with .env and tempad.toml)",
@@ -83,16 +83,19 @@ const USAGE_ENTRIES: readonly UsageEntry[] = [
   { paths: ["client add"], text: 'tempad client add <slug> "<name>"' },
   {
     paths: ["saga add"],
-    text: 'tempad saga add --owner hero|party:<slug> "<title>" [--statement]',
+    text: 'tempad saga add --owner hero|party:<slug> "<title>" [--statement "..."]',
   },
-  { paths: ["saga reword"], text: 'tempad saga reword <id> "<title>"' },
-  { paths: ["saga replace"], text: 'tempad saga replace <id> "<title>" --reason "..."' },
-  { paths: ["saga end"], text: "tempad saga end <id> --reason ..." },
+  { paths: ["saga reword"], text: 'tempad saga reword <id> "<title>" [--statement]' },
+  {
+    paths: ["saga replace"],
+    text: 'tempad saga replace <id> "<title>" [--statement] --reason "..."',
+  },
+  { paths: ["saga end"], text: "tempad saga end <id> --reason achieved|abandoned" },
   { paths: ["saga list"], text: "tempad saga list [--all] [--as-of <iso>]" },
   { paths: ["saga edit"], text: 'tempad saga edit <id> "<title>"' },
   {
     paths: ["quest add"],
-    text: 'tempad quest add --owner ... [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment]',
+    text: 'tempad quest add --owner hero|party:<slug> [--serves <id>] "<title>" [--outcome] [--done] [--due] [--budget Nh|Nm] [--commitment]',
   },
   { paths: ["quest reword"], text: 'tempad quest reword <id> "<title>" [--outcome]' },
   {
@@ -102,25 +105,23 @@ const USAGE_ENTRIES: readonly UsageEntry[] = [
   { paths: ["quest end"], text: "tempad quest end <id> --reason ..." },
   { paths: ["quest edit"], text: 'tempad quest edit <id> "<title>"' },
   {
-    paths: [
-      "quest confirm",
-      "quest merge",
-      "quest pause",
-      "quest resume",
-      "quest done",
-      "quest abandon",
-      "quest branch",
-      "quest return",
-    ],
-    text: "tempad quest confirm|merge|pause|resume|done|abandon|branch|return <id>",
+    paths: ["quest branch"],
+    text: 'tempad quest branch <id> --deviates-from <quest-id|stint-id> --trigger "..." [--kind ...] [--at <iso>]',
   },
+  { paths: ["quest confirm"], text: "tempad quest confirm <id>" },
+  { paths: ["quest merge"], text: "tempad quest merge <id> --into <id>" },
+  {
+    paths: ["quest pause", "quest resume", "quest done", "quest abandon"],
+    text: "tempad quest pause|resume|done|abandon <id> [--reason]",
+  },
+  { paths: ["quest return"], text: "tempad quest return <id> --to <quest-id>" },
   {
     paths: ["quest retract", "quest delete"],
     text: 'tempad quest retract <id> --reason "..." [--force]   (undo a quest created by mistake; alias: delete)',
   },
   {
     paths: ["quest declare"],
-    text: 'tempad quest declare --session <id> (--quest <id> | --new "<title>" --outcome "<text>" | --done <quest>) [--plan "a; b; c"] ...',
+    text: 'tempad quest declare --session <id> [--parent <id>] (--quest <id> | --new "<title>" --outcome "<text>" [--commitment promised|personal|exploratory] [--project <slug>] [--serves <saga id>] [--advances <quest id> | --deviates-from <quest id> --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown] [--origin <quest id> --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown] | --done <quest>) [--plan "a; b; c"] [--by agent|hero] [--at <iso>]',
   },
   {
     paths: ["quest list"],
@@ -136,7 +137,7 @@ const USAGE_ENTRIES: readonly UsageEntry[] = [
   { paths: ["impact import"], text: "tempad impact import <file.json>" },
   {
     paths: ["answer"],
-    text: 'tempad answer <question-id> (--belongs | --quest <id|new:"title">) [--why "..."]',
+    text: 'tempad answer <question-id> --belongs | --quest <id|new:"title"> [--why "..."] [--origin current --trigger "..." --kind waiting|blocker|curiosity|unknown]',
   },
   { paths: ["rebuild"], text: "tempad rebuild [--until <iso>]" },
   { paths: ["w5 enqueue"], text: "tempad w5 enqueue --session <id> [--forced]" },
@@ -178,6 +179,15 @@ export function usageText(path: string): string {
   const entry = USAGE_ENTRIES.find((candidate) => candidate.paths.includes(path));
   if (entry === undefined) throw new Error(`no usage text for "${path}"`);
   return entry.text;
+}
+
+/** `usage:` followed by every usage line of a command, for the group-level usage errors. */
+export function commandUsageText(command: string): string {
+  const lines = USAGE_ENTRIES.filter((entry) => commandOf(entry) === command).map(
+    (entry) => entry.text,
+  );
+  if (lines.length === 0) throw new Error(`no usage text for "${command}"`);
+  return lines.join("\nusage: ");
 }
 
 function commandOf(entry: UsageEntry): string {
@@ -227,7 +237,9 @@ export type HelpResolution =
  * Resolves `tempad help <tokens>` strictly: every token must be a known path part, so a
  * mistyped one is named in `message` and the nearest valid path's usage comes back with it.
  */
-export function resolveHelp(tokens: string[]): HelpResolution {
+export function resolveHelp(rawTokens: string[]): HelpResolution {
+  // `help w5 --help` asks for the same thing as `help w5`.
+  const tokens = rawTokens.filter((token) => token !== "--help" && token !== "-h");
   if (tokens.length === 0) return { ok: true, lines: globalHelp() };
   const [command] = tokens;
   if (command === undefined || !isTreePath([command])) {

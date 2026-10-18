@@ -218,6 +218,7 @@ async function runSyncCommand(args: string[]): Promise<number> {
   const directional = values.push || values.pull;
 
   if (source !== undefined && !collectors.has(source as Collector["name"])) {
+    console.error(`sync: unknown source "${source}"`);
     printUsage();
     return 2;
   }

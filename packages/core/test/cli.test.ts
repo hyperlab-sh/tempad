@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { Glob } from "bun";
 import { COMMAND_TREE, runSkillCommand, runSync } from "../src/cli.ts";
 import type { Collector, SyncSummary } from "../src/collect/types.ts";
 import { openDatabase } from "../src/db/database.ts";
@@ -471,6 +472,61 @@ describe("cli --help on every command and subcommand", () => {
         (path) => !usage.includes(path) && !table.some((other) => other.startsWith(`${path} `)),
       ),
     ).toEqual([]);
+  });
+
+  test("no usage text exists outside src/usage.ts", async () => {
+    const offenders: string[] = [];
+    for await (const file of new Glob("**/*.ts").scan(join(import.meta.dir, "..", "src"))) {
+      if (file === "usage.ts") continue;
+      const lines = readFileSync(join(import.meta.dir, "..", "src", file), "utf8").split("\n");
+      lines.forEach((line, index) => {
+        if (/["'`]usage: tempad /.test(line)) offenders.push(`${file}:${index + 1}`);
+      });
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("each path's help carries the options its command requires", async () => {
+    const sandbox = makeSandbox();
+    try {
+      for (const [path, expected] of [
+        [["quest", "merge"], "--into <id>"],
+        [["quest", "return"], "--to <quest-id>"],
+        [["quest", "branch"], "--deviates-from"],
+        [["quest", "pause"], "[--reason]"],
+        [["saga", "end"], "achieved|abandoned"],
+        [["saga", "reword"], "[--statement]"],
+        [["answer"], "--origin current"],
+        [["quest", "declare"], "--commitment promised|personal|exploratory"],
+      ] as const) {
+        const result = await runCli(sandbox, ["help", ...path]);
+        expect(result.stdout).toContain(expected);
+        expect(result.stdout).not.toContain("...  ");
+      }
+      // A usage error from the command prints the same text as its help.
+      configure(sandbox);
+      const error = await runCli(sandbox, ["quest", "merge"]);
+      const help = await runCli(sandbox, ["help", "quest", "merge"]);
+      expect(error.stderr).toContain(help.stdout.split("\n")[1]?.trim() ?? "missing");
+    } finally {
+      cleanup(sandbox);
+    }
+  });
+
+  test("`sync --full bogus` names the unknown source and `help w5 --help` is `help w5`", async () => {
+    const sandbox = makeSandbox();
+    try {
+      configure(sandbox);
+      const sync = await runCli(sandbox, ["sync", "--full", "bogus"]);
+      expect(sync.exitCode).toBe(2);
+      expect(sync.stderr).toContain('unknown source "bogus"');
+      const viaFlag = await runCli(sandbox, ["help", "w5", "--help"]);
+      const plain = await runCli(sandbox, ["help", "w5"]);
+      expect(viaFlag.exitCode).toBe(0);
+      expect(viaFlag.stdout).toBe(plain.stdout);
+    } finally {
+      cleanup(sandbox);
+    }
   });
 
   test("a command dropped from the table is unreachable, not run", async () => {
