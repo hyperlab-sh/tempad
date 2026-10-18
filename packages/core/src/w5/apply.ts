@@ -141,6 +141,15 @@ interface ResolvedStint {
   questAttachedOnMatched: boolean;
 }
 
+/**
+ * What a segment may attach a quest to: the open quests and this session's open
+ * stints the window offered.
+ */
+interface AttachTargets {
+  questIds: ReadonlySet<string>;
+  stintIds: ReadonlySet<string>;
+}
+
 interface StintState {
   questId: string | null;
   isOpen: boolean;
@@ -202,8 +211,16 @@ function resolveQuest(
  *   to disagree with, and leaving it unattached left the stint's traces
  *   unattributed and the same doubt repeating every window. The quest is attached
  *   the same way, but only when it is one of the open quests the window offered
- *   (`attachableQuestIds`); an id outside the list (garbled, abandoned, merged)
- *   stays a doubt.
+ *   and the stint is one of this session's open stints the window offered
+ *   (`attachable`); otherwise it stays a doubt. A quest id outside the list
+ *   (garbled, abandoned, merged) and a stint of another session or project, or
+ *   one the window never offered, are not this segment's to claim.
+ *
+ *   Attaching is not local to the segment: `traces` carry no quest of their own,
+ *   they take it from their stint, so one segment's `matchedQuest` puts every
+ *   earlier trace of the stint under that quest too. That is the point (they were
+ *   unattributed), and why it is limited to this session's stints; it is counted
+ *   (`questAttachedOnMatched`) and logged, never silent.
  */
 function reuseStint(
   store: EventStore,
@@ -212,12 +229,17 @@ function reuseStint(
   segment: ClassifierSegment,
   stintId: string,
   existingQuestId: string | null,
-  attachableQuestIds: ReadonlySet<string>,
+  attachable: AttachTargets,
 ): ResolvedStint {
   const matchedQuest = segment.matchedQuest ?? null;
   const proposedQuest = segment.proposedQuest ?? null;
 
-  if (existingQuestId === null && matchedQuest !== null && attachableQuestIds.has(matchedQuest)) {
+  if (
+    existingQuestId === null &&
+    matchedQuest !== null &&
+    attachable.questIds.has(matchedQuest) &&
+    attachable.stintIds.has(stintId)
+  ) {
     assignStint(store, database, stintId, matchedQuest, "hook");
     return {
       stintId,
@@ -382,7 +404,7 @@ function resolveStintForSegment(
   heroId: string,
   segment: ClassifierSegment,
   openedAt: string,
-  attachableQuestIds: ReadonlySet<string>,
+  attachable: AttachTargets,
 ): ResolvedStint {
   let unknownStintId = false;
 
@@ -404,7 +426,7 @@ function resolveStintForSegment(
         segment,
         segment.matchedStint,
         matched.questId,
-        attachableQuestIds,
+        attachable,
       );
     }
     if (matched !== null) {
@@ -430,7 +452,7 @@ function resolveStintForSegment(
         segment,
         segment.continuesStint,
         referenced.questId,
-        attachableQuestIds,
+        attachable,
       );
     } else {
       continues = segment.continuesStint;
@@ -751,7 +773,10 @@ export function applyResult(
 
   // The open quests the window offered: the only ones a matched stint with no
   // quest may be attached to when the classifier names one.
-  const attachableQuestIds = new Set((window.openQuests ?? []).map((quest) => quest.id));
+  const attachable: AttachTargets = {
+    questIds: new Set((window.openQuests ?? []).map((quest) => quest.id)),
+    stintIds: new Set(window.sessionOpenStints.map((stint) => stint.stintId)),
+  };
 
   for (const classified of result.segments) {
     const { segment, repairs } = declaredMode
@@ -789,14 +814,7 @@ export function applyResult(
           window.planAliases ?? {},
           planStints,
         )
-      : resolveStintForSegment(
-          store,
-          database,
-          heroId,
-          segment,
-          segment.startedAt,
-          attachableQuestIds,
-        );
+      : resolveStintForSegment(store, database, heroId, segment, segment.startedAt, attachable);
 
     if (stintOpened) summary.stintsOpened += 1;
     if (questCreated) summary.questsProposed += 1;

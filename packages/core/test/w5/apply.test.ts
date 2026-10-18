@@ -580,6 +580,98 @@ describe("applyResult", () => {
       expect(summary.questAttachedOnMatched).toBe(0);
     });
 
+    describe("a stint that is not this session's open stint", () => {
+      const seedOther = (database: ReturnType<typeof openDatabase>) => {
+        database
+          .query(
+            "INSERT INTO stints (id, quest_id, outcome, opened_at, revision) VALUES ('OTHER', NULL, 'someone else', '2026-09-04T13:00:00.000Z', 1)",
+          )
+          .run();
+        database
+          .query(
+            `INSERT INTO traces (id, stint_id, tool, place, source, started_at, ended_at, who, what, why, where_text, how, confidence, classified_by, session_id, recorded_at)
+             VALUES ('T-other', 'OTHER', 'claude-code', 'elsewhere', 'session', '2026-09-04T13:00:00.000Z', '2026-09-04T13:30:00.000Z', 'hero', 'someone else', 'w', 'x', 'claude-code', 0.9, 'assistant', 's-other', '2026-09-04T13:30:00.000Z')`,
+          )
+          .run();
+      };
+      const matchOther = (): ClassifierResult => ({
+        segments: [
+          {
+            ...baseMatched,
+            belongs: true,
+            guess: null,
+            matchedQuest: "Q1",
+            proposedQuest: null,
+            matchedStint: "OTHER",
+            continuesStint: null,
+            newStintReason: null,
+          },
+        ],
+        sessionNote: null,
+      });
+      const otherQuest = (database: ReturnType<typeof openDatabase>): string | null =>
+        (
+          database.query("SELECT quest_id FROM stints WHERE id = 'OTHER'").get() as {
+            quest_id: string | null;
+          }
+        ).quest_id;
+      const apply = (
+        database: ReturnType<typeof openDatabase>,
+        store: EventStore,
+        windowToApply: ClassifierWindow,
+      ) =>
+        applyResult(store, database, windowToApply, matchOther(), {
+          actor: "hook",
+          askingEnabled: false,
+          now: "2026-09-04T15:21:00.000Z",
+          log: () => {},
+          mode: "inferred",
+          stintMinMinutes: 5,
+        });
+
+      test("another session's stint the window never offered keeps no quest: still a doubt", () => {
+        const database = openDatabase(":memory:");
+        const { store } = seed(database);
+        seedOther(database);
+
+        const summary = apply(database, store, window);
+
+        expect(otherQuest(database)).toBeNull();
+        expect(summary.doubts).toBe(1);
+        expect(summary.questAttachedOnMatched).toBe(0);
+        expect(
+          database.query("SELECT COUNT(*) AS n FROM events WHERE kind = 'stint.assigned'").get(),
+        ).toEqual({ n: 0 });
+      });
+
+      test("another session's stint the window offered as recent is not attached either", () => {
+        const database = openDatabase(":memory:");
+        const { store } = seed(database);
+        seedOther(database);
+
+        const summary = apply(database, store, {
+          ...window,
+          recentStints: [
+            {
+              stintId: "OTHER",
+              what: "someone else",
+              why: "w",
+              questId: null,
+              questTitle: null,
+              openedAt: "2026-09-04T13:00:00.000Z",
+              lastTraceEndedAt: "2026-09-04T13:30:00.000Z",
+              closedAt: null,
+              closeReason: null,
+            },
+          ],
+        });
+
+        expect(otherQuest(database)).toBeNull();
+        expect(summary.doubts).toBe(1);
+        expect(summary.questAttachedOnMatched).toBe(0);
+      });
+    });
+
     test("a stint that already has another quest keeps it: still a doubt", () => {
       const database = openDatabase(":memory:");
       const { store, heroId } = seed(database);
