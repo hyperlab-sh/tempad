@@ -25,6 +25,7 @@ import {
   DECLARE_NEW_QUEST_FORM,
   documentedPaths,
   POSITIONAL_LIMITS,
+  usageBlock,
   usageForPath,
   usageText,
   walkPath,
@@ -632,7 +633,7 @@ describe("cli --help on every command and subcommand", () => {
     }
   });
 
-  test("each hand-back form uses only flags its command's usage entry documents, and has no bare pipe", () => {
+  test("each hand-back form uses only flags its command's usage entry documents, and has no pipe outside <...>", () => {
     for (const [form, path] of [
       [ANSWER_BELONGS_FORM, "answer"],
       [ANSWER_EXISTING_QUEST_FORM, "answer"],
@@ -645,8 +646,8 @@ describe("cli --help on every command and subcommand", () => {
       for (const flag of form.match(/--[\w-]+/g) ?? []) {
         expect(documented, `${flag} in ${form}`).toMatch(new RegExp(`${flag}(?![\\w-])`));
       }
-      // A `|` outside brackets and quotes would be a shell pipe when the line is copied.
-      expect(form.replace(/\[[^\]]*\]/g, "").replace(/"[^"]*"/g, ""), form).not.toContain("|");
+      // A `|` outside `<...>` and quotes would be a shell pipe when the line is copied.
+      expect(form.replace(/"[^"]*"/g, "").replace(/<[^>]*>/g, ""), form).not.toContain("|");
     }
   });
 
@@ -655,6 +656,13 @@ describe("cli --help on every command and subcommand", () => {
       .split("\n")
       .map((line) => line.trim());
     expect(lines).toHaveLength(3);
+    // The error block: `usage:` alone, then every form indented the same.
+    expect(usageBlock("answer").split("\n")).toEqual([
+      "usage:",
+      ...usageText("answer")
+        .split("\n")
+        .map((line) => `  ${line.trim()}`),
+    ]);
     expect(lines.filter((line) => line.includes("--origin"))).toEqual([
       expect.stringContaining('--quest new:"<title>"'),
     ]);

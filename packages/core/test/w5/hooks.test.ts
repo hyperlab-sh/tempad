@@ -445,7 +445,7 @@ describe("verifier hand-back text", () => {
         "w5 thinks the last stretch is not part of your active quests (Ship marko-ui [Q1], Fix the flake [Q2]) (looks like: a competitor comparison). Reply with one of:",
         '  tempad answer Q123 --belongs --why "<reason>"',
         '  tempad answer Q123 --quest <quest-id> --why "<reason>"',
-        '  tempad answer Q123 --quest new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind waiting|blocker|curiosity|unknown]',
+        '  tempad answer Q123 --quest new:"<title>" --why "<reason>" [--origin current --trigger "<sentence>" --kind <waiting|blocker|curiosity|unknown>]',
         "Ask the user if you are not sure.",
       ].join("\n"),
     );
