@@ -8,7 +8,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { collectors } from "../collect/index.ts";
 import { ENV_VARS, readDotEnv } from "../config/env.ts";
@@ -17,7 +17,9 @@ import { isUnstableInstallPath } from "../w5/hooks.ts";
 import {
   LAUNCHD_LABEL,
   parseLaunchdCommand,
+  parseLaunchdEnvironment,
   parseSystemdCommand,
+  parseSystemdEnvironment,
   renderLaunchdPlist,
   renderSystemdService,
   renderSystemdTimer,
@@ -48,11 +50,21 @@ export interface CommandResult {
   stderr: string;
 }
 
-/** Runs `launchctl`/`systemctl`. Injected, so tests never reach the real service manager. */
-export type CommandRunner = (command: string, args: string[]) => CommandResult;
+export interface CommandOptions {
+  /** The whole environment of the child (not merged with ours). */
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
 
-export const runCommand: CommandRunner = (command, args) => {
-  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000 });
+/** Runs `launchctl`/`systemctl`/the job's Bun. Injected, so tests never reach the real service manager. */
+export type CommandRunner = (
+  command: string,
+  args: string[],
+  options?: CommandOptions,
+) => CommandResult;
+
+export const runCommand: CommandRunner = (command, args, options = {}) => {
+  const result = spawnSync(command, args, { encoding: "utf8", timeout: 30_000, ...options });
   if (result.error !== undefined) {
     const missing = (result.error as NodeJS.ErrnoException).code === "ENOENT";
     return { status: missing ? 127 : null, stdout: "", stderr: result.error.message };
@@ -60,9 +72,17 @@ export const runCommand: CommandRunner = (command, args) => {
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 };
 
+/** The Bun version the checkout pins in `.prototools`, and the file it was read from. */
+export interface BunPin {
+  version: string;
+  source: string;
+}
+
 export interface ResolvedEntry {
   runtime: string;
   script: string;
+  /** Set when the runtime is a proto shim and a `.prototools` above the entry pins Bun. */
+  bunPin?: BunPin | null;
   /** Things the operator should know about the choice; printed by `install`. */
   warnings?: string[];
 }
@@ -107,9 +127,10 @@ function stableRuntimeDirectories(home: string): string[] {
  * directory comes before `~/.proto/shims`). Under proto with nothing stable on `PATH`,
  * `$PROTO_HOME/shims/bun` (default `~/.proto/shims/bun`) is checked directly. The first `bun`
  * found in any other, unstable directory (`node_modules/.bin`) decides for the fallback. Through
- * a shim the version comes from proto's resolution in the job's working directory
- * (`TEMPAD_HOME`), that is proto's global default, not the checkout's `.prototools` pin.
- * Otherwise `execPath`, with a warning when its path carries a version.
+ * a shim the version is proto's resolution in the job's working directory (`TEMPAD_HOME`), which
+ * is proto's global default, so `resolveInvokedEntry` also reads the checkout's `.prototools` pin
+ * and the job carries it as `PROTO_BUN_VERSION`. Otherwise `execPath`, with a warning when its
+ * path carries a version.
  */
 export function resolveRuntime(
   environment: NodeJS.ProcessEnv,
@@ -151,6 +172,51 @@ export function resolveRuntime(
 }
 
 /**
+ * The `bun` a `.prototools` above `script` pins: the nearest file (proto walks up the same way)
+ * with a string `bun` key, which is what proto would resolve from a working directory in that
+ * checkout, searching no further than the project root (below). Null when there is none, so a global install without a pin keeps proto's default.
+ * The value is passed through as written (`1.4.2`, `1.4`, `latest`); proto reads all of them.
+ */
+export function readBunPin(script: string): BunPin | null {
+  let directory = dirname(script);
+  for (;;) {
+    const source = join(directory, ".prototools");
+    const text = readIfPresent(source);
+    if (text !== null) {
+      try {
+        const version = (Bun.TOML.parse(text) as { bun?: unknown }).bun;
+        if (typeof version === "string" && version.trim() !== "") {
+          return { version: version.trim(), source };
+        }
+      } catch {
+        // an unreadable .prototools pins nothing; proto itself would complain when it runs
+      }
+    }
+    // Stop where the project ends, so a `.prototools` in some ancestor of the checkout or of an
+    // installed copy (`~/.prototools`) is not mistaken for the project's pin: the repository root
+    // (a `.git` directory, or a file in a worktree), or the root of a package installed under
+    // `node_modules`. A checkout's own `packages/core/package.json` is not a stop: its pin is above.
+    if (existsSync(join(directory, ".git"))) return null;
+    if (
+      existsSync(join(directory, "package.json")) &&
+      directory.split(sep).includes("node_modules")
+    ) {
+      return null;
+    }
+    const parent = dirname(directory);
+    if (parent === directory) return null;
+    directory = parent;
+  }
+}
+
+/** Whether `runtime` is the proto shim, the only runtime `PROTO_BUN_VERSION` steers. */
+function isProtoShim(runtime: string, environment: NodeJS.ProcessEnv): boolean {
+  const home = environment.HOME ?? "";
+  const protoHome = environment.PROTO_HOME || join(home, ".proto");
+  return runtime.replace(/\/+$/, "") === join(protoHome, "shims", "bun");
+}
+
+/**
  * The tempad the user invoked: a stable Bun (`resolveRuntime`) and the real path of its entry
  * script (`argv[1]` with symlinks resolved, so `~/.local/bin/tempad -> .../src/cli.ts` and a
  * global install both land on the `cli.ts` that actually runs). Refuses a copy that sits where bun
@@ -179,7 +245,18 @@ export function resolveInvokedEntry(
     );
   }
   const { runtime, warning } = resolveRuntime(environment, execPath, isUnstable);
-  return { runtime, script, warnings: warning === null ? [] : [warning] };
+  const warnings = warning === null ? [] : [warning];
+  // The job runs outside the checkout, so a shim there resolves proto's global default, not the pin.
+  const bunPin = isProtoShim(runtime, environment) ? readBunPin(script) : null;
+  if (bunPin !== null && /^\d+\.\d+\.\d+$/.test(bunPin.version)) {
+    const protoHome = environment.PROTO_HOME || join(environment.HOME ?? "", ".proto");
+    if (!existsSync(join(protoHome, "tools", "bun", bunPin.version))) {
+      warnings.push(
+        `${bunPin.source} pins Bun ${bunPin.version}, which proto has not installed; the job fails until you run \`proto install bun ${bunPin.version}\``,
+      );
+    }
+  }
+  return { runtime, script, bunPin, warnings };
 }
 
 function homeOf(environment: NodeJS.ProcessEnv): string {
@@ -290,8 +367,12 @@ function shellOnlyVariables(environment: NodeJS.ProcessEnv, home: string): strin
     .filter((name) => (environment[name] ?? "") !== "" && fileValues[name] === undefined);
 }
 
-function buildJob(context: ScheduleContext): { job: ScheduleJob; warnings: string[] } {
-  const { runtime, script, warnings = [] } = context.resolveEntry();
+function buildJob(context: ScheduleContext): {
+  job: ScheduleJob;
+  warnings: string[];
+  bunPin: BunPin | null;
+} {
+  const { runtime, script, bunPin = null, warnings = [] } = context.resolveEntry();
   const home = tempadHomeOf(context.environment);
   const shellOnly = shellOnlyVariables(context.environment, home.path);
   const allWarnings = [...warnings];
@@ -306,15 +387,26 @@ function buildJob(context: ScheduleContext): { job: ScheduleJob; warnings: strin
       command: [runtime, "--no-env-file", script, "sync"],
       path: jobPath(runtime, context.environment),
       tempadHome: home.explicit ? home.path : null,
+      protoBunVersion: bunPin?.version ?? null,
       workingDirectory: home.path,
       logPath: syncLogPath(context.environment),
     },
     warnings: allWarnings,
+    bunPin,
   };
 }
 
 function describeFailure(result: CommandResult): string {
-  const text = (result.stderr.trim() || result.stdout.trim()).split("\n")[0] ?? "";
+  let text = (result.stderr.trim() || result.stdout.trim()).split("\n")[0] ?? "";
+  if (text.startsWith("{")) {
+    // proto reports its errors as one JSON line
+    try {
+      const message = (JSON.parse(text) as { message?: unknown }).message;
+      if (typeof message === "string") text = message;
+    } catch {
+      // not JSON after all: keep the line
+    }
+  }
   return `exit ${result.status ?? "signal"}${text === "" ? "" : `: ${text}`}`;
 }
 
@@ -341,8 +433,13 @@ function serviceTarget(context: ScheduleContext): string {
   return `gui/${context.uid}`;
 }
 
-function describeJob(job: ScheduleJob, lines: string[]): void {
+function describeJob(job: ScheduleJob, bunPin: BunPin | null, lines: string[]): void {
   lines.push(`runs: ${job.command.join(" ")}`);
+  if (bunPin !== null) {
+    lines.push(
+      `bun: ${bunPin.version}, pinned in ${bunPin.source} and carried as PROTO_BUN_VERSION (the job runs outside the checkout, where proto would pick its global default)`,
+    );
+  }
   lines.push(`log: ${job.logPath}`);
 }
 
@@ -352,6 +449,7 @@ function installLaunchd(
   context: ScheduleContext,
   paths: SchedulePaths,
   job: ScheduleJob,
+  bunPin: BunPin | null,
 ): string[] {
   const plist = paths.files[0] as string;
   const domain = serviceTarget(context);
@@ -372,7 +470,7 @@ function installLaunchd(
     );
   }
   const lines = [`installed ${plist}`, `loaded ${LAUNCHD_LABEL}: runs now, then every hour`];
-  describeJob(job, lines);
+  describeJob(job, bunPin, lines);
   return lines;
 }
 
@@ -380,6 +478,7 @@ function installSystemd(
   context: ScheduleContext,
   paths: SchedulePaths,
   job: ScheduleJob,
+  bunPin: BunPin | null,
 ): string[] {
   const [servicePath, timerPath] = paths.files as [string, string];
   const reinstall = existsSync(timerPath);
@@ -407,7 +506,7 @@ function installSystemd(
     `installed ${servicePath} and ${timerPath}`,
     `enabled ${timer}: first run started now, then every hour on the hour`,
   ];
-  describeJob(job, lines);
+  describeJob(job, bunPin, lines);
   lines.push(
     "note: a user timer only runs while you are logged in; `loginctl enable-linger` keeps it running after logout",
   );
@@ -458,6 +557,14 @@ export interface ScheduleStatus {
   intervalSeconds: number;
   definition: string[];
   command: string[] | null;
+  /** What the job's Bun reports for `--version`, run with the job's own environment; null when it could not be asked. */
+  bunVersion: string | null;
+  /** The `PROTO_BUN_VERSION` the definition carries; null when it carries none. */
+  bunPinned: string | null;
+  /** The pin the checkout holds now (`.prototools` above the job's entry script); null when none or the job is not on the proto shim. */
+  bunCheckoutPin: string | null;
+  /** Whether the job's runtime is the proto shim, the only one a pin steers. */
+  bunViaProtoShim: boolean;
   logPath: string;
   /** Things to fix: a missing runtime or entry, a failed last run, an unreachable manager. */
   problems: string[];
@@ -505,6 +612,55 @@ function commandProblems(command: string[] | null): string[] {
     .map((path) => `${path} is missing, so the job fails; run \`tempad schedule install\` again`);
 }
 
+/**
+ * Asks the job's own Bun for its version, with the environment the definition gives the job (plus
+ * `HOME`, which the manager supplies) and `PROTO_AUTO_INSTALL=false`, so a check never downloads
+ * a Bun. Through the proto shim that is exactly what the job resolves: the pin when the
+ * definition carries one, else proto's default for the job's working directory.
+ */
+function inspectJobBun(
+  context: ScheduleContext,
+  status: ScheduleStatus,
+  environment: Record<string, string>,
+): void {
+  status.bunPinned = environment.PROTO_BUN_VERSION ?? null;
+  const runtime = status.command?.[0];
+  if (runtime === undefined || !isAbsolute(runtime)) return;
+  status.bunViaProtoShim = isProtoShim(runtime, context.environment);
+  const script = status.command?.[2];
+  if (status.bunViaProtoShim && script !== undefined && isAbsolute(script)) {
+    // The pin is baked in at install time; a checkout that moved to another Bun since leaves the job on the old one.
+    const current = readBunPin(script);
+    status.bunCheckoutPin = current?.version ?? null;
+    if (current !== null && current.version !== status.bunPinned) {
+      status.problems.push(
+        `${current.source} now pins Bun ${current.version}, but the job ${
+          status.bunPinned === null ? "carries no pin" : `is pinned to ${status.bunPinned}`
+        }; run \`tempad schedule install\` to update it`,
+      );
+    }
+  }
+  if (!existsSync(runtime)) return;
+  const home = environment.TEMPAD_HOME ?? tempadHomeOf(context.environment).path;
+  const result = context.run(runtime, ["--version"], {
+    env: {
+      ...(context.environment.HOME === undefined ? {} : { HOME: context.environment.HOME }),
+      ...environment,
+      PROTO_AUTO_INSTALL: "false",
+    },
+    ...(existsSync(home) ? { cwd: home } : {}),
+  });
+  if (result.status !== 0) {
+    status.problems.push(
+      `the job's Bun (${runtime}) does not start (${describeFailure(result)})${
+        status.bunPinned === null ? "" : `; it is pinned to ${status.bunPinned}`
+      }`,
+    );
+    return;
+  }
+  status.bunVersion = result.stdout.trim().split("\n")[0] || null;
+}
+
 function statusLaunchd(context: ScheduleContext, paths: SchedulePaths): ScheduleStatus {
   const plist = paths.files[0] as string;
   const text = readIfPresent(plist);
@@ -522,9 +678,14 @@ function statusLaunchd(context: ScheduleContext, paths: SchedulePaths): Schedule
     intervalSeconds: SYNC_INTERVAL_SECONDS,
     definition: paths.files,
     command: text === null ? null : parseLaunchdCommand(text),
+    bunVersion: null,
+    bunPinned: null,
+    bunCheckoutPin: null,
+    bunViaProtoShim: false,
     logPath,
     problems: text === null ? [] : commandProblems(parseLaunchdCommand(text)),
   };
+  inspectJobBun(context, status, text === null ? {} : parseLaunchdEnvironment(text));
   const printed = context.run("launchctl", ["print", `${serviceTarget(context)}/${LAUNCHD_LABEL}`]);
   if (printed.status === 0) {
     status.loaded = true;
@@ -568,9 +729,14 @@ function statusSystemd(context: ScheduleContext, paths: SchedulePaths): Schedule
     intervalSeconds: SYNC_INTERVAL_SECONDS,
     definition: paths.files,
     command,
+    bunVersion: null,
+    bunPinned: null,
+    bunCheckoutPin: null,
+    bunViaProtoShim: false,
     logPath: syncLogPath(context.environment),
     problems: serviceText === null ? [] : commandProblems(command),
   };
+  inspectJobBun(context, status, serviceText === null ? {} : parseSystemdEnvironment(serviceText));
   const timer = context.run("systemctl", [
     "--user",
     "show",
@@ -625,6 +791,21 @@ function statusSystemd(context: ScheduleContext, paths: SchedulePaths): Schedule
   return status;
 }
 
+function formatBun(status: ScheduleStatus): string | null {
+  if (status.bunVersion === null) {
+    return status.bunPinned === null
+      ? null
+      : `bun: pinned to ${status.bunPinned} (PROTO_BUN_VERSION)`;
+  }
+  const how =
+    status.bunPinned !== null
+      ? ` (pinned by PROTO_BUN_VERSION=${status.bunPinned})`
+      : status.bunViaProtoShim
+        ? " (proto shim, no pin: proto's default decides)"
+        : "";
+  return `bun: ${status.bunVersion}${how}`;
+}
+
 function formatStatus(status: ScheduleStatus): string[] {
   const lines = [
     `schedule: ${status.installed ? "installed" : "not installed"}, ${
@@ -637,6 +818,8 @@ function formatStatus(status: ScheduleStatus): string[] {
   }
   lines.push(`definition: ${status.definition.join(" and ")}`);
   if (status.command !== null) lines.push(`runs: ${status.command.join(" ")} (every hour)`);
+  const bun = formatBun(status);
+  if (bun !== null) lines.push(bun);
   if (status.state !== null) lines.push(`state: ${status.state}`);
   lines.push(
     status.lastRunAt === null
@@ -710,13 +893,13 @@ export function runScheduleCommand(
           `tempad is not set up yet (${home}); run /tempad:setup in Claude Code, or \`tempad setup\` in a terminal, before scheduling a sync`,
         );
       }
-      const { job, warnings } = buildJob(context);
+      const { job, warnings, bunPin } = buildJob(context);
       for (const warning of warnings) context.stderr(`warning: ${warning}`);
       mkdirSync(dirname(job.logPath), { recursive: true, mode: 0o700 });
       const lines =
         paths.manager === "launchd"
-          ? installLaunchd(context, paths, job)
-          : installSystemd(context, paths, job);
+          ? installLaunchd(context, paths, job, bunPin)
+          : installSystemd(context, paths, job, bunPin);
       for (const line of lines) context.stdout(line);
       return 0;
     }

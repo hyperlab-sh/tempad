@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -60,7 +68,9 @@ describe("acquireSyncLock", () => {
     const lines: string[] = [];
     using lock = acquireSyncLock(home, (line) => lines.push(line));
     expect(lock.held).toBe(true);
-    expect(lines).toEqual([`sync.lock was left by a sync that is gone (pid ${pid}), removing`]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toStartWith("sync.lock is stale (");
+    expect(lines[0]).toContain(`its runner is not running (pid ${pid})`);
     expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
   });
 
@@ -143,23 +153,19 @@ describe("acquireSyncLock", () => {
     expect(readFileSync(join(home, SYNC_CLEARING_FILE), "utf8")).toBe(String(process.pid));
   });
 
-  test("a clearing lock left by a clearer that died is removed, that run skips, the next one proceeds", async () => {
+  test("a clearing lock left by a clearer that died is removed and the same run goes on to take the lock", async () => {
     const home = configuredHome();
     writeFileSync(join(home, "sync.lock"), String(await deadPid()));
     writeFileSync(join(home, SYNC_CLEARING_FILE), String(await deadPid()));
-    {
-      using first = acquireSyncLock(home);
-      expect(first.held).toBe(false);
-    }
+    using lock = acquireSyncLock(home);
+    expect(lock.held).toBe(true);
     expect(existsSync(join(home, SYNC_CLEARING_FILE))).toBe(false);
-    using second = acquireSyncLock(home);
-    expect(second.held).toBe(true);
+    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(String(process.pid));
   });
 
-  test("a pid-less clearing lock is left alone while fresh, then removed once older than the critical section", async () => {
+  test("a pid-less clearing lock is left alone while fresh, then removed once older than the critical section and the run goes on", async () => {
     const home = configuredHome();
-    const deadLock = String(await deadPid());
-    writeFileSync(join(home, "sync.lock"), deadLock);
+    writeFileSync(join(home, "sync.lock"), String(await deadPid()));
     const clearingPath = join(home, SYNC_CLEARING_FILE);
     writeFileSync(clearingPath, "");
     {
@@ -170,18 +176,12 @@ describe("acquireSyncLock", () => {
 
     const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
     utimesSync(clearingPath, old, old);
-    {
-      using stale = acquireSyncLock(home);
-      expect(stale.held).toBe(false);
-    }
-    expect(existsSync(clearingPath)).toBe(false);
-    // The dead lock was never touched by the run that only removed the clearing lock.
-    expect(readFileSync(join(home, "sync.lock"), "utf8")).toBe(deadLock);
     using next = acquireSyncLock(home);
     expect(next.held).toBe(true);
+    expect(existsSync(clearingPath)).toBe(false);
   });
 
-  test("an old clearing lock naming a live process (a reused pid) is removed too", async () => {
+  test("a clearing lock naming a live process is kept past 10 s (it may be a stopped clearer) and removed after 30 minutes (a reused pid)", async () => {
     const home = configuredHome();
     writeFileSync(join(home, "sync.lock"), String(await deadPid()));
     const clearingPath = join(home, SYNC_CLEARING_FILE);
@@ -192,16 +192,19 @@ describe("acquireSyncLock", () => {
         using fresh = acquireSyncLock(home);
         expect(fresh.held).toBe(false);
       }
-      expect(existsSync(clearingPath)).toBe(true);
       const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
       utimesSync(clearingPath, old, old);
       {
-        using stale = acquireSyncLock(home);
-        expect(stale.held).toBe(false);
+        using paused = acquireSyncLock(home);
+        expect(paused.held).toBe(false);
       }
-      expect(existsSync(clearingPath)).toBe(false);
+      expect(existsSync(clearingPath)).toBe(true);
+
+      const ancient = new Date(Date.now() - 31 * 60_000);
+      utimesSync(clearingPath, ancient, ancient);
       using next = acquireSyncLock(home);
       expect(next.held).toBe(true);
+      expect(existsSync(clearingPath)).toBe(false);
     } finally {
       sleeper.kill("SIGKILL");
     }
@@ -223,6 +226,44 @@ describe("acquireSyncLock", () => {
     utimesSync(lockPath, old, old);
     using lock = acquireSyncLock(home);
     expect(lock.held).toBe(false);
+  });
+
+  test("a held lock is touched while the sync runs, so one past the hold ceiling is not taken over", async () => {
+    const home = configuredHome();
+    const lockPath = join(home, "sync.lock");
+    const lock = acquireSyncLock(home, undefined, { touchIntervalMs: 10 });
+    try {
+      const ceilingAgo = new Date(Date.now() - 7 * 3_600_000);
+      utimesSync(lockPath, ceilingAgo, ceilingAgo);
+      await Bun.sleep(100);
+      expect(Date.now() - statSync(lockPath).mtimeMs).toBeLessThan(60_000);
+      {
+        using second = acquireSyncLock(home);
+        expect(second.held).toBe(false);
+      }
+    } finally {
+      lock[Symbol.dispose]();
+    }
+    // released: the timer is gone and does not recreate or refresh anything
+    expect(existsSync(lockPath)).toBe(false);
+    await Bun.sleep(50);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("the timer leaves a lock another run took over alone", async () => {
+    const home = configuredHome();
+    const lockPath = join(home, "sync.lock");
+    const lock = acquireSyncLock(home, undefined, { touchIntervalMs: 10 });
+    try {
+      rmSync(lockPath);
+      writeFileSync(lockPath, "4242");
+      const old = new Date(Date.now() - 60_000);
+      utimesSync(lockPath, old, old);
+      await Bun.sleep(80);
+      expect(Date.now() - statSync(lockPath).mtimeMs).toBeGreaterThan(30_000);
+    } finally {
+      lock[Symbol.dispose]();
+    }
   });
 
   test("an unconfigured or missing home creates nothing and reports held", () => {

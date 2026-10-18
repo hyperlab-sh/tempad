@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   parseLaunchdCommand,
+  parseLaunchdEnvironment,
   parseSystemdCommand,
+  parseSystemdEnvironment,
   renderLaunchdPlist,
   renderSystemdService,
   renderSystemdTimer,
@@ -145,5 +147,52 @@ WantedBy=timers.target
 
   test("a service with no ExecStart parses to null", () => {
     expect(parseSystemdCommand("[Service]\nType=oneshot\n")).toBeNull();
+  });
+});
+
+describe("the job's environment", () => {
+  const pinned: ScheduleJob = { ...job, protoBunVersion: "1.4.2" };
+
+  test("PROTO_BUN_VERSION follows PATH and TEMPAD_HOME in both definitions, and only when set", () => {
+    expect(renderLaunchdPlist(pinned)).toContain(
+      "    <key>TEMPAD_HOME</key>\n    <string>/Users/me/.tempad</string>\n    <key>PROTO_BUN_VERSION</key>\n    <string>1.4.2</string>\n  </dict>",
+    );
+    expect(renderSystemdService(pinned)).toContain(
+      'Environment="TEMPAD_HOME=/Users/me/.tempad"\nEnvironment="PROTO_BUN_VERSION=1.4.2"\nExecStart=',
+    );
+    for (const unpinned of [job, { ...job, protoBunVersion: null }]) {
+      expect(renderLaunchdPlist(unpinned)).not.toContain("PROTO_BUN_VERSION");
+      expect(renderSystemdService(unpinned)).not.toContain("PROTO_BUN_VERSION");
+    }
+  });
+
+  test("the environment reads back from both definitions", () => {
+    const expected = {
+      PATH: "/opt/bun:/usr/bin:/bin",
+      TEMPAD_HOME: "/Users/me/.tempad",
+      PROTO_BUN_VERSION: "1.4.2",
+    };
+    expect(parseLaunchdEnvironment(renderLaunchdPlist(pinned))).toEqual(expected);
+    expect(parseSystemdEnvironment(renderSystemdService(pinned))).toEqual(expected);
+  });
+
+  test("awkward values survive the round trip: spaces, quotes, XML metacharacters and %", () => {
+    const awkward: ScheduleJob = {
+      ...pinned,
+      path: "/Users/me/My Tools:/usr/bin",
+      tempadHome: '/Users/me/R&D <x> "100%"',
+    };
+    const expected = {
+      PATH: awkward.path,
+      TEMPAD_HOME: awkward.tempadHome as string,
+      PROTO_BUN_VERSION: "1.4.2",
+    };
+    expect(parseLaunchdEnvironment(renderLaunchdPlist(awkward))).toEqual(expected);
+    expect(parseSystemdEnvironment(renderSystemdService(awkward))).toEqual(expected);
+  });
+
+  test("a definition with no environment reads back empty", () => {
+    expect(parseLaunchdEnvironment("<plist><dict></dict></plist>")).toEqual({});
+    expect(parseSystemdEnvironment("[Service]\nExecStart=/bin/true\n")).toEqual({});
   });
 });

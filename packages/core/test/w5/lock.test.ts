@@ -1,10 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   acquireLock,
+  CLEARING_STALE_MS,
   checkLock,
+  clearingPathFor,
   clearStaleLock,
   LOCK_MAX_HOLD_HOURS,
   lockPid,
@@ -12,6 +23,7 @@ import {
   releaseLock,
   STALE_LOCK_MINUTES,
   touchLock,
+  tryClearStaleLock,
 } from "../../src/w5/lock";
 
 const NOW = Date.parse("2026-10-17T12:00:00.000Z");
@@ -268,5 +280,249 @@ describe("a lock that vanishes mid-check is no lock", () => {
 
   test("clearStaleLock on a missing lock does nothing", () => {
     expect(clearStaleLock("/nonexistent-tempad-dir/w5.lock", () => {}, { now: NOW })).toBe(false);
+  });
+});
+
+describe("tryClearStaleLock", () => {
+  test("a lock another run replaced after the first verdict is not removed", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        afterJudgedStale: () => {
+          rmSync(path);
+          writeFileSync(path, String(process.pid));
+          utimesSync(path, new Date(NOW), new Date(NOW));
+        },
+      });
+      expect(outcome).toBe("not-stale");
+      expect(lockPid(path)).toBe(process.pid);
+      expect(existsSync(clearingPathFor(path))).toBe(false);
+    });
+  });
+
+  test("skips while another run holds the clearing handoff, leaving both files alone", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      writeFileSync(clearingPathFor(path), String(process.pid));
+      const outcome = tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false });
+      expect(outcome).toBe("contended");
+      expect(existsSync(path)).toBe(true);
+      expect(existsSync(clearingPathFor(path))).toBe(true);
+    });
+  });
+
+  test("an abandoned handoff (its clearer is dead) is removed and the same call then clears", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: (pid) => pid === 0 })).toBe(
+        "cleared",
+      );
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a handoff with no pid is left for 10 s, then removed and the same call clears", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "");
+      const options = { now: NOW, isAlive: () => false };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(existsSync(clearing)).toBe(true);
+      const abandoned = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(clearing, abandoned, abandoned);
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
+      expect(existsSync(path)).toBe(false);
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a handoff whose clearer is alive is kept past 10 s (a stopped clearer) and removed only after the 30 minute rule", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "4343");
+      // 4242 (the lock's runner) is gone, 4343 (the clearer, or a reused pid) is alive
+      const options = { now: NOW, isAlive: (pid: number) => pid === 4343 };
+      const tenSecondsOld = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(clearing, tenSecondsOld, tenSecondsOld);
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(existsSync(clearing)).toBe(true);
+      expect(existsSync(path)).toBe(true);
+
+      const old = new Date(Date.now() - (STALE_LOCK_MINUTES + 1) * 60_000);
+      utimesSync(clearing, old, old);
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
+      expect(existsSync(clearing)).toBe(false);
+    });
+  });
+
+  test("a handoff replaced after it was judged abandoned is given back, not deleted, and the run skips", () => {
+    withLock("4242", STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, "4242");
+      const lines: string[] = [];
+      const outcome = tryClearStaleLock(path, (line) => lines.push(line), {
+        now: NOW,
+        // 4242 is gone; 4343 is the run that cleared the abandoned handoff first and took a fresh one
+        isAlive: (pid) => pid === 4343,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, "4343");
+        },
+      });
+      expect(outcome).toBe("contended");
+      expect(lines).toEqual([]);
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(existsSync(path)).toBe(true);
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+
+  test("a grace of 0 clears a dead runner's fresh lock but never a pid-less one", () => {
+    withLock("4242", 0, (path) => {
+      const options = { now: NOW, isAlive: () => false, deadRunnerGraceMinutes: 0 };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("cleared");
+    });
+    withLock("", 0, (path) => {
+      const options = { now: NOW, isAlive: () => false, deadRunnerGraceMinutes: 0 };
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("not-stale");
+      expect(existsSync(path)).toBe(true);
+    });
+  });
+});
+
+describe("racing processes over a stale lock: exactly one takes it", () => {
+  const RACERS = 8;
+  const LOCK_MODULE = JSON.stringify(join(import.meta.dir, "../../src/w5/lock"));
+  const SYNC_LOCK_MODULE = JSON.stringify(join(import.meta.dir, "../../src/sync/lock"));
+
+  /**
+   * Every racer waits for the same instant, judges the stale lock, and waits for fixed later
+   * instants (absolute, so a racer that started late still joins) before it takes the clearing
+   * handoff and again before it unlinks, each racer 40 ms after the one before it. The second
+   * wait is the window in
+   * which, without the handoff, every racer has judged the lock stale a second time: one
+   * unlinks it and takes a fresh lock, the next unlinks that live lock and takes its own.
+   * It prints `won` only when it holds the lock afterwards, then stays alive long enough that a
+   * winner's lock is not judged dead by a slower racer.
+   */
+  const w5Racer = `
+    import { acquireLock, clearStaleLock } from ${LOCK_MODULE};
+    const startAt = Number(process.argv[2]);
+    const waitUntil = (time) => Bun.sleepSync(Math.max(0, time - Date.now()));
+    waitUntil(startAt);
+    clearStaleLock(process.argv[1], () => {}, {
+      afterJudgedStale: () => waitUntil(startAt + 300),
+      beforeRemoveAbandoned: () => waitUntil(startAt + 450 + 40 * Number(process.argv[3])),
+      beforeUnlink: () => waitUntil(startAt + 600 + 40 * Number(process.argv[3])),
+    });
+    console.log(acquireLock(process.argv[1]) ? "won" : "lost");
+    await Bun.sleep(300);
+  `;
+  const syncRacer = `
+    import { acquireSyncLock } from ${SYNC_LOCK_MODULE};
+    const startAt = Number(process.argv[1]);
+    const waitUntil = (time) => Bun.sleepSync(Math.max(0, time - Date.now()));
+    waitUntil(startAt);
+    const lock = acquireSyncLock(process.argv[2], () => {}, {
+      afterJudgedDead: () => waitUntil(startAt + 300),
+      beforeUnlink: () => waitUntil(startAt + 600 + 40 * Number(process.argv[3])),
+    });
+    console.log(lock.held ? "won" : "lost");
+    await Bun.sleep(300);
+  `;
+
+  async function race(script: string, args: (startAt: string) => string[]): Promise<string[]> {
+    const startAt = String(Date.now() + 800);
+    const racers = Array.from({ length: RACERS }, (_, index) =>
+      Bun.spawn(["bun", "--no-env-file", "-e", script, ...args(startAt), String(index)], {
+        stdout: "pipe",
+        stderr: "pipe",
+      }),
+    );
+    return Promise.all(
+      racers.map(async (racer) => {
+        const [out, err] = await Promise.all([
+          new Response(racer.stdout).text(),
+          new Response(racer.stderr).text(),
+        ]);
+        if (err.trim()) throw new Error(`racer failed: ${err}`);
+        return out.trim();
+      }),
+    );
+  }
+
+  function expectOneWinner(results: string[]): void {
+    expect(results.filter((result) => result === "won")).toHaveLength(1);
+    expect(results.filter((result) => result === "lost")).toHaveLength(RACERS - 1);
+  }
+
+  async function withDirectory(run: (directory: string) => Promise<void>): Promise<void> {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-lock-stale-race-"));
+    try {
+      await run(directory);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  const old = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+
+  const w5Cases: {
+    name: string;
+    content: () => string;
+    ageMinutes: number;
+    /** A handoff its clearer died holding: every racer finds it and judges it abandoned. */
+    abandonedHandoff?: boolean;
+  }[] = [
+    {
+      name: "its runner is gone",
+      content: () => String(deadPid()),
+      ageMinutes: STALE_LOCK_MINUTES + 1,
+    },
+    { name: "it holds no pid", content: () => "", ageMinutes: STALE_LOCK_MINUTES + 1 },
+    {
+      name: "its runner is gone and the clearing handoff was abandoned",
+      content: () => String(deadPid()),
+      ageMinutes: STALE_LOCK_MINUTES + 1,
+      abandonedHandoff: true,
+    },
+    {
+      name: "it is past the hold ceiling with a live pid",
+      content: () => String(process.pid),
+      ageMinutes: LOCK_MAX_HOLD_HOURS * 60 + 1,
+    },
+  ];
+
+  for (const { name, content, ageMinutes, abandonedHandoff } of w5Cases) {
+    test(`w5.lock, ${name}`, async () => {
+      await withDirectory(async (directory) => {
+        const lockPath = join(directory, "w5.lock");
+        writeFileSync(lockPath, content());
+        utimesSync(lockPath, old(ageMinutes), old(ageMinutes));
+        if (abandonedHandoff) writeFileSync(`${lockPath}.clearing`, String(deadPid()));
+        expectOneWinner(await race(w5Racer, (startAt) => [lockPath, startAt]));
+        expect(readdirSync(directory).sort()).toEqual(["w5.lock"]);
+      });
+    });
+  }
+
+  test("sync.lock, its runner is gone (no grace)", async () => {
+    await withDirectory(async (directory) => {
+      writeFileSync(join(directory, ".env"), "");
+      writeFileSync(join(directory, "sync.lock"), String(deadPid()));
+      expectOneWinner(await race(syncRacer, (startAt) => [startAt, directory]));
+      expect(readdirSync(directory).sort()).toEqual([".env", "sync.lock"]);
+    });
+  });
+
+  test("sync.lock, it holds no pid and is older than the grace", async () => {
+    await withDirectory(async (directory) => {
+      writeFileSync(join(directory, ".env"), "");
+      const lockPath = join(directory, "sync.lock");
+      writeFileSync(lockPath, "");
+      utimesSync(lockPath, old(STALE_LOCK_MINUTES + 1), old(STALE_LOCK_MINUTES + 1));
+      expectOneWinner(await race(syncRacer, (startAt) => [startAt, directory]));
+    });
   });
 });

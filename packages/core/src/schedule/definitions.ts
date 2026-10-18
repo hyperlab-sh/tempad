@@ -19,6 +19,12 @@ export interface ScheduleJob {
   path: string;
   /** Carried as `TEMPAD_HOME` only when it was set when the job was installed; null otherwise. */
   tempadHome: string | null;
+  /**
+   * Carried as `PROTO_BUN_VERSION` when the runtime is a proto shim: the job runs outside the
+   * checkout, where proto would otherwise resolve its global default instead of the pin; null
+   * otherwise.
+   */
+  protoBunVersion?: string | null;
   workingDirectory: string;
   /** stdout and stderr of every run, appended. */
   logPath: string;
@@ -42,16 +48,24 @@ function unescapeXml(text: string): string {
     .replace(/&amp;/g, "&");
 }
 
+/** The environment the job gets, in the order it is written. */
+function jobEnvironment(job: ScheduleJob): [string, string][] {
+  return [
+    ["PATH", job.path],
+    ...(job.tempadHome === null ? [] : [["TEMPAD_HOME", job.tempadHome] as [string, string]]),
+    ...(job.protoBunVersion
+      ? [["PROTO_BUN_VERSION", job.protoBunVersion] as [string, string]]
+      : []),
+  ];
+}
+
 export function renderLaunchdPlist(job: ScheduleJob): string {
   const argumentLines = job.command.map(
     (argument) => `    <string>${escapeXml(argument)}</string>`,
   );
-  const environment = [
-    ["PATH", job.path],
-    ...(job.tempadHome === null ? [] : [["TEMPAD_HOME", job.tempadHome]]),
-  ].map(
+  const environment = jobEnvironment(job).map(
     ([name, value]) =>
-      `    <key>${escapeXml(name as string)}</key>\n    <string>${escapeXml(value as string)}</string>`,
+      `    <key>${escapeXml(name)}</key>\n    <string>${escapeXml(value)}</string>`,
   );
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -94,6 +108,17 @@ export function parseLaunchdCommand(plist: string): string[] | null {
   return argumentsFound.length > 0 ? argumentsFound : null;
 }
 
+/** The `EnvironmentVariables` of a plist `renderLaunchdPlist` wrote; empty when there are none. */
+export function parseLaunchdEnvironment(plist: string): Record<string, string> {
+  const block = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(plist)?.[1];
+  const values: Record<string, string> = {};
+  if (block === undefined) return values;
+  for (const match of block.matchAll(/<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g)) {
+    values[unescapeXml(match[1] ?? "")] = unescapeXml(match[2] ?? "");
+  }
+  return values;
+}
+
 /** A path in a value systemd runs through specifier expansion: `%` is the escape character. */
 function systemdSpecifiers(text: string): string {
   return text.replace(/%/g, "%%");
@@ -113,10 +138,7 @@ function systemdAssignment(name: string, value: string): string {
 }
 
 export function renderSystemdService(job: ScheduleJob): string {
-  const environment = [
-    systemdAssignment("PATH", job.path),
-    ...(job.tempadHome === null ? [] : [systemdAssignment("TEMPAD_HOME", job.tempadHome)]),
-  ];
+  const environment = jobEnvironment(job).map(([name, value]) => systemdAssignment(name, value));
   return `[Unit]
 Description=tempad sync (collect Monday, GitHub and Claude Code history)
 
@@ -185,4 +207,16 @@ export function parseSystemdCommand(service: string): string[] | null {
     word.replace(/\$\$/g, "$").replace(/%%/g, "%"),
   );
   return words.length > 0 ? words : null;
+}
+
+/** The `Environment=` assignments of a service `renderSystemdService` wrote; empty when there are none. */
+export function parseSystemdEnvironment(service: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const line of service.matchAll(/^Environment=(.*)$/gm)) {
+    for (const word of splitSystemdWords(line[1] ?? "")) {
+      const index = word.indexOf("=");
+      if (index > 0) values[word.slice(0, index)] = word.slice(index + 1).replace(/%%/g, "%");
+    }
+  }
+  return values;
 }
