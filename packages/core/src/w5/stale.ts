@@ -50,94 +50,102 @@ export interface StaleCandidate {
   covered: boolean;
 }
 
+/** What the planner decided for one window. */
+export interface StaleDecision {
+  /** The window is replaced: its `traceIds` are retracted and it runs again. */
+  stale: boolean;
+  /** Why the window's group was declined, else null. A declined window never runs again. */
+  declined: string | null;
+  traceIds: string[];
+}
+
 /**
- * Which candidate windows of one session can be replaced, and which live traces
- * the replacement retracts.
+ * Which windows of one session a declaration replaces, decided once over the
+ * union of every stale window of the session in this run.
  *
- * A trace the live runner wrote can span several backfill chunks, so clearing
- * one window by its fully nested traces would leave the crossing trace alive next
- * to the rerun's new ones: the same stretch counted twice. Windows linked by a
- * crossing trace therefore form one group, replaced together or not at all. A
- * group is replaced only when:
- * - every window in it is stale or not yet classified (a covered window the
- *   declaration does not reach would be left holding half of a retracted trace);
- * - none of its traces, nested or crossing, carries a protected quest (a rerun
- *   would classify the whole window again on top of work somebody chose);
- * - each trace's first and last instants fall inside a window of the group (the
- *   rerun can only re-cover time that has messages in it).
- * A group that fails any of these keeps its windows exactly as they were
- * (`stale: false`; a covered window stays covered). The traces retracted are
- * those overlapping a window of the group, so scope never grows past the
- * session's stale windows.
+ * The rule: the replacement proceeds only when every live trace that overlaps
+ * the union lies entirely inside it and none of them is protected (carries a
+ * declared or confirmed quest). Otherwise the whole group is declined: nothing
+ * is retracted, no window of the group runs again, and every member is marked
+ * declined, which neither `backfill` nor `tempad scry` counts as pending. The
+ * reason names the first offending trace (`protected trace <id>`,
+ * `crossing trace <id>`, `out of bounds trace <id>`).
+ *
+ * Why inside the union and not merely at its endpoints: a rerun can only
+ * re-cover the time that has messages in a window, so a trace that crosses two
+ * chunks, or runs past one, would either survive next to its replacement (the
+ * stretch counted twice) or be retracted with the part between the chunks lost.
+ * The check reads trace bounds only, never `w5_windows` or a classification
+ * time, so a live run's trace (which leaves neither) is caught the same way.
+ *
+ * Members of a declined group: the stale windows, plus every uncovered window
+ * that overlaps a trace overlapping the union (a rerun of it would add a second
+ * copy of what that trace already holds).
  */
 export function resolveStaleWindows(
   windows: readonly StaleCandidate[],
   traces: readonly PlanTrace[],
-): { stale: boolean; traceIds: string[] }[] {
-  const result = windows.map(() => ({ stale: false, traceIds: [] as string[] }));
-  if (!windows.some((window) => window.stale)) return result;
+): StaleDecision[] {
+  const decisions = windows.map(() => ({
+    stale: false,
+    declined: null as string | null,
+    traceIds: [] as string[],
+  }));
+  const members = windows.flatMap((window, index) => (window.stale ? [index] : []));
+  if (members.length === 0) return decisions;
 
-  const parent = windows.map((_, index) => index);
-  const find = (index: number): number => {
-    let root = index;
-    while (parent[root] !== root) root = parent[root] as number;
-    let node = index;
-    while (parent[node] !== root) {
-      const next = parent[node] as number;
-      parent[node] = root;
-      node = next;
-    }
-    return root;
-  };
-  const union = (left: number, right: number) => {
-    parent[find(left)] = find(right);
-  };
-
-  const overlapping = traces.map((trace) =>
-    windows.flatMap((window, index) =>
-      trace.started_at <= window.endedAt && trace.ended_at >= window.startedAt ? [index] : [],
-    ),
-  );
-  const endpointsCovered = traces.map(
-    (trace) =>
-      windows.some((w) => trace.started_at >= w.startedAt && trace.started_at <= w.endedAt) &&
-      windows.some((w) => trace.ended_at >= w.startedAt && trace.ended_at <= w.endedAt),
-  );
-  for (const indexes of overlapping) {
-    for (const index of indexes.slice(1)) union(indexes[0] as number, index);
+  const touches = (trace: PlanTrace, window: StaleCandidate) =>
+    trace.started_at <= window.endedAt && trace.ended_at >= window.startedAt;
+  const union: { from: string; through: string }[] = [];
+  for (const index of [...members].sort((a, b) =>
+    (windows[a] as StaleCandidate).startedAt < (windows[b] as StaleCandidate).startedAt ? -1 : 1,
+  )) {
+    const window = windows[index] as StaleCandidate;
+    const last = union.at(-1);
+    if (last && window.startedAt <= last.through) {
+      if (window.endedAt > last.through) last.through = window.endedAt;
+    } else union.push({ from: window.startedAt, through: window.endedAt });
   }
 
-  const groups = new Map<number, number[]>();
-  for (const [index] of windows.entries()) {
-    const root = find(index);
-    const list = groups.get(root);
-    if (list) list.push(index);
-    else groups.set(root, [index]);
-  }
-  for (const [root, members] of groups) {
-    if (!members.some((index) => windows[index]?.stale)) continue;
-    const groupTraces = traces.flatMap((_trace, traceIndex) =>
-      overlapping[traceIndex]?.some((index) => find(index) === root) ? [traceIndex] : [],
+  const overlapping = traces
+    .filter((trace) =>
+      union.some((span) => trace.started_at <= span.through && trace.ended_at >= span.from),
+    )
+    .sort((a, b) =>
+      a.started_at === b.started_at
+        ? a.id.localeCompare(b.id)
+        : a.started_at < b.started_at
+          ? -1
+          : 1,
     );
-    const blocked =
-      members.some((index) => {
-        const window = windows[index] as StaleCandidate;
-        return window.covered && !window.stale;
-      }) ||
-      groupTraces.some(
-        (traceIndex) =>
-          (traces[traceIndex] as PlanTrace).protected || !endpointsCovered[traceIndex],
-      );
-    if (blocked) continue;
-    for (const index of members) {
-      const entry = result[index] as { stale: boolean; traceIds: string[] };
-      entry.stale = windows[index]?.stale === true;
-      entry.traceIds = groupTraces
-        .filter((traceIndex) => overlapping[traceIndex]?.includes(index))
-        .map((traceIndex) => (traces[traceIndex] as PlanTrace).id);
-    }
+  const protectedTrace = overlapping.find((trace) => trace.protected);
+  const escaping = overlapping.find(
+    (trace) =>
+      !union.some((span) => trace.started_at >= span.from && trace.ended_at <= span.through),
+  );
+  let reason: string | null = null;
+  if (protectedTrace) reason = `protected trace ${protectedTrace.id}`;
+  else if (escaping) {
+    const crossed = members.filter((index) => touches(escaping, windows[index] as StaleCandidate));
+    reason = `${crossed.length > 1 ? "crossing" : "out of bounds"} trace ${escaping.id}`;
   }
-  return result;
+
+  if (reason === null) {
+    for (const index of members) {
+      const entry = decisions[index] as StaleDecision;
+      entry.stale = true;
+      entry.traceIds = overlapping
+        .filter((trace) => touches(trace, windows[index] as StaleCandidate))
+        .map((trace) => trace.id);
+    }
+    return decisions;
+  }
+  for (const [index, window] of windows.entries()) {
+    const overlapsGroupTrace = overlapping.some((trace) => touches(trace, window));
+    if (window.stale || (!window.covered && overlapsGroupTrace))
+      (decisions[index] as StaleDecision).declined = reason;
+  }
+  return decisions;
 }
 
 export interface StaleWindowReplacement {

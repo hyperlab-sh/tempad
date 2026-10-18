@@ -11,7 +11,12 @@ import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
 import { scry } from "../../src/scry/collect";
-import { backfill, planBackfillWindows, selectBackfillSessions } from "../../src/w5/backfill";
+import {
+  backfill,
+  isPendingWindow,
+  planBackfillWindows,
+  selectBackfillSessions,
+} from "../../src/w5/backfill";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
 import { replaceStaleWindow } from "../../src/w5/stale";
 
@@ -648,30 +653,34 @@ describe("a stale window is never replaced on top of, or over, chosen work", () 
     }
   });
 
-  test("a live trace crossing two windows is replaced with both, leaving no duplicate time", async () => {
+  test("a live trace crossing two stale windows declines both: nothing retracted, nothing rerun", async () => {
     const fixture = seed();
     createQuest(fixture, "Q1");
     await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
-    liveTrace(
+    const crossing = liveTrace(
       fixture,
       "crossing",
       undefined,
       "2026-09-04T14:00:00.000Z",
       "2026-09-04T15:00:00.000Z",
     );
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    expect(classifier.windows).toHaveLength(0);
     expect(liveTraceBounds(fixture.database)).toEqual([
       "14:00-14:10",
       "14:00-15:00",
       "15:00-15:00",
     ]);
-    declareLate(fixture);
-    const classifier = new RecordingClassifier();
-
-    await run(fixture.database, classifier, afterDeclaration());
-
-    expect(classifiedStarts(classifier)).toEqual(["14:00", "15:00"]);
-    // The first pass's two traces and the crossing one are gone; each window has one.
-    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "15:00-15:00"]);
+    expect(logs.filter((line) => line.startsWith("backfill: declined stale replacement"))).toEqual([
+      expect.stringContaining(
+        `s1 windows 0-1 (2026-09-04T14:00:00.000Z to 2026-09-04T15:00:00.000Z): crossing trace ${crossing.trace}`,
+      ),
+    ]);
   });
 
   test("a crossing trace that reaches a window the declaration does not cover blocks the whole group", async () => {
@@ -702,6 +711,7 @@ describe("a stale window is never replaced on top of, or over, chosen work", () 
 
     expect(classifier.windows).toHaveLength(0);
     expect(logs.some((line) => line.includes("replaced"))).toBe(false);
+    expect(logs.some((line) => line.includes(`out of bounds trace ${crossing.trace}`))).toBe(true);
     expect(liveTraceBounds(fixture.database)).toEqual([
       "14:00-14:10",
       "14:00-15:00",
@@ -738,6 +748,174 @@ describe("a stale window is never replaced on top of, or over, chosen work", () 
       "14:00-15:30",
       "15:00-15:00",
     ]);
+  });
+});
+
+// ---- one rule: the union of a session's stale windows, replaced whole or declined whole ----
+
+/** `seed()` with a message at 15:10, so the second window runs 15:00 to 15:10. */
+function seedWithLongSecondWindow() {
+  const fixture = seed();
+  fixture.database
+    .query(
+      "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES ('m3', 's1', '2026-09-04T15:10:00.000Z', 'user', 0, 'work')",
+    )
+    .run();
+  fixture.database
+    .query("UPDATE claude_sessions SET ended_at = '2026-09-04T15:10:00.000Z' WHERE id = 's1'")
+    .run();
+  return fixture;
+}
+
+const liveMinutes = (database: ReturnType<typeof openDatabase>) =>
+  (
+    database
+      .query(
+        "SELECT started_at AS startedAt, ended_at AS endedAt FROM traces WHERE retracted_at IS NULL",
+      )
+      .all() as { startedAt: string; endedAt: string }[]
+  ).reduce((sum, row) => sum + (Date.parse(row.endedAt) - Date.parse(row.startedAt)) / 60_000, 0);
+
+describe("a stale replacement is computed over the union of the session's stale windows", () => {
+  test("a live run's crossing trace (no w5_windows row, nothing nested) is not duplicated", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    // What the live runner leaves: one trace over both chunks, no window.classified.
+    const crossing = liveTrace(
+      fixture,
+      "live",
+      undefined,
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T15:00:00.000Z",
+    );
+    expect(
+      (
+        fixture.database.query("SELECT COUNT(*) AS count FROM w5_windows").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(0);
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    const result = await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(result.windowsClassified).toBe(0);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-15:00"]);
+    expect(logs.some((line) => line.includes(`crossing trace ${crossing.trace}`))).toBe(true);
+  });
+
+  test("a declined group holds every member: a protected crossing trace plus a nested first-chunk trace never reruns the second chunk", async () => {
+    const fixture = seedWithLongSecondWindow();
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "nested", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z");
+    const crossing = liveTrace(
+      fixture,
+      "chosen",
+      "Q1",
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T15:10:00.000Z",
+    );
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    const result = await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(result.windowsClassified).toBe(0);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "14:00-15:10"]);
+    expect(
+      logs.some(
+        (line) =>
+          line.startsWith("backfill: declined stale replacement for s1") &&
+          line.includes(`protected trace ${crossing.trace}`),
+      ),
+    ).toBe(true);
+    expect(plan(fixture.database).map((window) => window.declined !== null)).toEqual([true, true]);
+  });
+
+  test("a 14:00-15:10 trace against chunks 14:00-14:10 and 15:00-15:10 keeps its 70 minutes live", async () => {
+    const fixture = seedWithLongSecondWindow();
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "whole", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T15:10:00.000Z");
+    expect(liveMinutes(fixture.database)).toBe(70);
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(liveMinutes(fixture.database)).toBe(70);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-15:10"]);
+    expect(logs.some((line) => line.includes("crossing trace"))).toBe(true);
+  });
+
+  test("an uncovered window the declaration does not reach is held when a crossing trace overlaps it", async () => {
+    const fixture = seedWithLongSecondWindow();
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "live", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T15:10:00.000Z");
+    // Reaches back over the 14:00 window only: 15:00 is not covered and has no marker of its own.
+    declareQuest(fixture.store, fixture.database, {
+      sessionId: "s1",
+      questId: "Q1",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T14:30:00.000Z",
+      heroId: "H1",
+    });
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-15:10"]);
+  });
+
+  test("traces wholly inside the union are replaced together, and what is outside it is untouched", async () => {
+    const fixture = seedWithLongSecondWindow();
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "first", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z");
+    liveTrace(fixture, "second", undefined, "2026-09-04T15:00:00.000Z", "2026-09-04T15:10:00.000Z");
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifiedStarts(classifier)).toEqual(["14:00", "15:00"]);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "15:00-15:10"]);
+  });
+
+  test("scry's pending count equals backfill's when a group is declined", async () => {
+    const fixture = seedWithLongSecondWindow();
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "nested", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z");
+    liveTrace(fixture, "chosen", "Q1", "2026-09-04T14:00:00.000Z", "2026-09-04T15:10:00.000Z");
+    declareLate(fixture);
+    const home = mkdtempSync(join(tmpdir(), "tempad-stale-scry-"));
+    const report = scry({
+      database: fixture.database,
+      home,
+      databasePath: join(home, "tempad.db"),
+      now: new Date(Date.now() + 86_400_000),
+      w5: config,
+      windowDays: 3650,
+      syncEnabled: false,
+      fast: true,
+      schedule: null,
+      priorChecks: [],
+      sizeBytes: 0,
+    });
+    const pending = plan(fixture.database).filter((window) => isPendingWindow(window));
+    const result = await run(fixture.database, new RecordingClassifier(), afterDeclaration());
+
+    expect(pending).toHaveLength(0);
+    expect(report.stats?.w5?.windowsPending).toBe(0);
+    expect(result.windowsClassified).toBe(0);
   });
 });
 

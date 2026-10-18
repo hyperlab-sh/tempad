@@ -17,6 +17,7 @@ import { MIRROR_SYNC_ENABLED } from "../sync/triggers";
 import {
   backfillSessionMode,
   backfillWindowMinutes,
+  isPendingWindow,
   planBackfillWindows,
   selectBackfillSessions,
 } from "../w5/backfill";
@@ -585,8 +586,8 @@ function coverageCheck(input: ScryInput): CoverageResult {
     staleEligible: (sessionId) => backfillSessionMode(database, w5, sessionId) === "declared",
   });
   const inFlightAfter = new Date(now.getTime() - IN_FLIGHT_MS).toISOString();
-  const covered = planned.filter((window) => window.covered);
-  const pending = planned.filter((window) => !window.covered);
+  const covered = planned.filter((window) => !isPendingWindow(window));
+  const pending = planned.filter(isPendingWindow);
   const inFlight = pending.filter((window) => window.endedAt >= inFlightAfter);
   const stale = pending.filter((window) => window.endedAt < inFlightAfter);
 
