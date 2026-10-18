@@ -982,6 +982,45 @@ describe("applyResult", () => {
     expect(trace.stint_id).not.toBe("A-does-not-exist");
   });
 
+  test("matchedStint naming a stint that closed after the segment began reuses it: no overlapping continues stint", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+    // A later window already closed it, at 15:10; the segment below starts at 15:00,
+    // when the stint was still open (which is how buildWindow offered it).
+    database
+      .query(
+        `INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision)
+         VALUES ('A-later-closed', 'Q1', 'still going at 15:00', '2026-09-04T14:30:00.000Z', '2026-09-04T15:10:00.000Z', 'idle', 1)`,
+      )
+      .run();
+    const summary = applyResult(
+      store,
+      database,
+      window,
+      {
+        segments: [{ ...baseMatched, matchedStint: "A-later-closed", matchedQuest: "Q1" }],
+        sessionNote: null,
+      },
+      {
+        actor: "hook",
+        askingEnabled: false,
+        now: "2026-09-04T15:21:00.000Z",
+        log: () => {},
+        stintMinMinutes: 5,
+        mode: "inferred" as const,
+      },
+    );
+
+    expect(summary.stintsOpened).toBe(0);
+    expect(summary.unknownStintIds).toBe(0);
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM stints WHERE continues IS NOT NULL").get(),
+    ).toEqual({ n: 0 });
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM traces WHERE stint_id = 'A-later-closed'").get(),
+    ).toEqual({ n: 1 });
+  });
+
   test("matchedStint naming a stint that is retracted is not reused, one that is closed is continued", () => {
     const database = openDatabase(":memory:");
     const { store } = seed(database);

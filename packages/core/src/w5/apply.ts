@@ -160,15 +160,24 @@ interface StintState {
  * can return an id that never existed, belongs to another session, or was
  * retracted since the slice was built, so every id it hands back is looked up
  * before it is trusted.
+ *
+ * With `at` (the instant the segment starts) a stint that closed at or after it
+ * counts as open: it was open when the work began, which is how `buildWindow`
+ * offered it when later windows were already classified (a `--force` or
+ * `--reclassify` re-run). Opening a `continues` stint there would overlap the
+ * stint it continues.
  */
-function readStint(database: Database, stintId: string): StintState | null {
+function readStint(database: Database, stintId: string, at?: string): StintState | null {
   const row = database
     .query(
       "SELECT quest_id as questId, closed_at as closedAt FROM stints WHERE id = ? AND retracted_at IS NULL AND dismissed_at IS NULL",
     )
     .get(stintId) as { questId: string | null; closedAt: string | null } | null;
   if (!row) return null;
-  return { questId: row.questId, isOpen: row.closedAt === null };
+  return {
+    questId: row.questId,
+    isOpen: row.closedAt === null || (at !== undefined && row.closedAt >= at),
+  };
 }
 
 function resolveQuest(
@@ -417,7 +426,7 @@ function resolveStintForSegment(
   // resolves to no live stint at all is unknown.
   let continues: string | null = null;
   if (typeof segment.matchedStint === "string") {
-    const matched = readStint(database, segment.matchedStint);
+    const matched = readStint(database, segment.matchedStint, openedAt);
     if (matched?.isOpen) {
       return reuseStint(
         store,
@@ -441,7 +450,7 @@ function resolveStintForSegment(
   // still-open stint says the attention never stopped: that is a plain reuse,
   // and opening a second row would leave two open stints for one outcome.
   if (continues === null && typeof segment.continuesStint === "string") {
-    const referenced = readStint(database, segment.continuesStint);
+    const referenced = readStint(database, segment.continuesStint, openedAt);
     if (referenced === null) {
       unknownStintId = true;
     } else if (referenced.isOpen) {
