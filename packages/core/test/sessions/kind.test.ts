@@ -91,6 +91,22 @@ function facts(overrides: Partial<SessionFacts> = {}): SessionFacts {
   };
 }
 
+function makeContext(database: ReturnType<typeof openDatabase>, intentConfig?: IntentConfig) {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  return {
+    context: {
+      database,
+      home: mkdtempSync(join(tmpdir(), "tempad-kind-cli-")),
+      intentConfig: intentConfig ?? defaultIntentConfig(),
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+    },
+    stdout,
+    stderr,
+  };
+}
+
 describe("session kind rules", () => {
   test("every rule fires on facts that satisfy it", () => {
     expect(ruleKind(facts({ entrypoint: "sdk-ts", hasHumanOrigin: false }))).toEqual({
@@ -533,22 +549,6 @@ describe("manual session kind", () => {
 });
 
 describe("sessions cli", () => {
-  function makeContext(database: ReturnType<typeof openDatabase>, intentConfig?: IntentConfig) {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
-    return {
-      context: {
-        database,
-        home: mkdtempSync(join(tmpdir(), "tempad-kind-cli-")),
-        intentConfig: intentConfig ?? defaultIntentConfig(),
-        stdout: (line: string) => stdout.push(line),
-        stderr: (line: string) => stderr.push(line),
-      },
-      stdout,
-      stderr,
-    };
-  }
-
   test("list shows manual and inferred kinds and --kind filters them", async () => {
     const { runSessionsCommand } = await import("../../src/sessions/cli");
     const database = openDatabase(":memory:");
@@ -616,6 +616,36 @@ describe("sessions cli", () => {
     expect(refreshOut.at(-1)).toMatch(/^sessions: kinds ruled=/);
     // --refresh with a session id is a usage error.
     expect(await runSessionsCommand(["kind", "s1", "--refresh"], context)).toBe(2);
+  });
+});
+
+describe("runSessionKindPass", () => {
+  test("prints the summary and swallows a failure without throwing", async () => {
+    const { runSessionKindPass } = await import("../../src/sessions/cli");
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      messages: [
+        { uuid: "m", ts: "2026-10-02T10:00:00.000Z", text: "You are the dev", originKind: "human" },
+      ],
+    });
+    const ok = makeContext(database);
+    await runSessionKindPass({ ...ok.context, classifier: null });
+    expect(ok.stdout.at(-1)).toMatch(/^sessions: kinds ruled=1/);
+
+    // Anything the pass itself throws never fails `tempad sync`: the summary
+    // writer blowing up is caught and reported on stderr.
+    const errors: string[] = [];
+    await runSessionKindPass({
+      ...makeContext(database).context,
+      classifier: null,
+      stdout: () => {
+        throw new Error("stdout broke");
+      },
+      stderr: (line: string) => errors.push(line),
+    });
+    expect(errors.some((line) => line.includes("kind pass failed: stdout broke"))).toBe(true);
   });
 });
 
