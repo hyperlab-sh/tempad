@@ -55,7 +55,7 @@ function seed() {
 function declareFor(
   { database, store }: ReturnType<typeof seed>,
   at: string,
-  extra: { done?: boolean } = {},
+  extra: { done?: boolean; since?: string } = {},
 ) {
   declareQuest(store, database, {
     sessionId: "s1",
@@ -148,9 +148,11 @@ describe("a window with no active quest and a model that says belongs: true", ()
     expectRecordedWithoutQuestAndOneDeclareQuestion(fixture);
   });
 
-  test("cause B: the quest was declared only after the window", () => {
+  test("cause B: the quest was declared only after the window, with a --since that starts after it", () => {
     const fixture = seed();
-    declareFor(fixture, "2026-09-04T16:00:00.000Z");
+    // Without `since` the first declaration would cover the window (see
+    // test/intent/declaration-coverage.test.ts); `since` pins its start after it.
+    declareFor(fixture, "2026-09-04T16:00:00.000Z", { since: "2026-09-04T15:50:00.000Z" });
 
     const { result, summary } = classifyAndApply(fixture, "Q1");
 

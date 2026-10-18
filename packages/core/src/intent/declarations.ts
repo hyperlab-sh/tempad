@@ -36,6 +36,11 @@ export interface DeclareQuestInput {
    * side effect of declaring something else.
    */
   done?: boolean;
+  /**
+   * ISO timestamp the declaration covers the session from, overriding the
+   * computed start (see `activeDeclaredQuests`). Never after `at`.
+   */
+  since?: string;
 }
 
 export interface DeclareQuestResult {
@@ -50,6 +55,16 @@ export function declareQuest(
 ): DeclareQuestResult {
   let questId = input.questId ?? null;
   let created = false;
+
+  if (input.since !== undefined) {
+    if (input.done === true) throw new Error("declareQuest: --since does not apply to --done");
+    const since = Date.parse(input.since);
+    if (Number.isNaN(since))
+      throw new Error(`declareQuest: since is not a timestamp: ${input.since}`);
+    if (since > Date.parse(input.at)) {
+      throw new Error(`declareQuest: since ${input.since} is after the declaration at ${input.at}`);
+    }
+  }
 
   // `--done` always names a quest that already exists: there is nothing to
   // create, and no `new` payload to write.
@@ -117,6 +132,7 @@ export function declareQuest(
         session_id: input.sessionId,
         quest_id: questId,
         done: input.done === true ? true : undefined,
+        since: input.since,
         new:
           input.done === true || input.newQuest === undefined
             ? undefined
@@ -152,6 +168,165 @@ export interface DeclaredQuest {
   parentSessionId: string | null;
 }
 
+/** A `quest.declared` row as the coverage fold reads it. */
+export interface DeclarationRow {
+  at: string;
+  /** Local row id: identifies an event within one database, never across hosts. */
+  id?: number;
+  uid: string | null;
+  payload: {
+    quest_id?: string;
+    plan?: string[];
+    done?: boolean;
+    since?: string;
+    parent_session_id?: string;
+  };
+}
+
+/**
+ * One stretch during which a quest is declared for a session. `start` is `null`
+ * for "the session's own start", which only the database can answer
+ * (`claude_sessions.started_at`); everything else is a timestamp.
+ */
+export interface CoverageInterval {
+  questId: string;
+  start: string | null;
+  /** The `--done` that ended it, or null while it is still active. */
+  end: string | null;
+  /** The declaration that opened it. */
+  declaredAt: string;
+  declaredId: number | undefined;
+  /** Every declaration of the quest within the interval, oldest first (plan amendments). */
+  versions: { at: string; plan: string[] }[];
+}
+
+/**
+ * Folds declarations (already ordered `at, uid, id`) into coverage intervals.
+ * This is the one place the coverage rule lives; see `activeDeclaredQuests`.
+ */
+export function foldCoverage(rows: DeclarationRow[]): CoverageInterval[] {
+  const intervals: CoverageInterval[] = [];
+  const open = new Map<string, CoverageInterval>();
+  let declaredBefore = false;
+  let lastDoneAt: string | null = null;
+  for (const row of rows) {
+    const questId = row.payload.quest_id;
+    if (!questId) continue;
+    if (row.payload.done === true) {
+      const interval = open.get(questId);
+      if (!interval) continue;
+      interval.end = row.at;
+      open.delete(questId);
+      lastDoneAt = row.at;
+      continue;
+    }
+    const existing = open.get(questId);
+    if (existing) {
+      existing.versions.push({ at: row.at, plan: row.payload.plan ?? [] });
+      continue;
+    }
+    let start: string | null;
+    if (row.payload.since !== undefined) start = row.payload.since;
+    else if (!declaredBefore) start = null;
+    else if (open.size === 0 && lastDoneAt !== null) start = lastDoneAt;
+    else start = row.at;
+    const interval: CoverageInterval = {
+      questId,
+      start,
+      end: null,
+      declaredAt: row.at,
+      declaredId: row.id,
+      versions: [{ at: row.at, plan: row.payload.plan ?? [] }],
+    };
+    intervals.push(interval);
+    open.set(questId, interval);
+    declaredBefore = true;
+  }
+  return intervals;
+}
+
+function sessionStartedAt(database: Database, sessionId: string): string | null {
+  const table = database
+    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claude_sessions'")
+    .get();
+  if (table === null) return null;
+  const row = database
+    .query("SELECT started_at FROM claude_sessions WHERE id = ?")
+    .get(sessionId) as {
+    started_at: string;
+  } | null;
+  return row?.started_at ?? null;
+}
+
+/**
+ * The instant an interval starts covering, never after the declaration itself.
+ * A session with no stored row has no start to reach back to, so its first
+ * declaration covers from its own event.
+ */
+export function resolveCoverageStart(
+  interval: Pick<CoverageInterval, "start" | "declaredAt">,
+  sessionStart: string | null,
+): string {
+  const start = interval.start ?? sessionStart ?? interval.declaredAt;
+  return start < interval.declaredAt ? start : interval.declaredAt;
+}
+
+function readDeclarations(
+  database: Database,
+  sessionId: string,
+  scope: "session" | "subagent",
+  parentSessionId?: string,
+): DeclarationRow[] {
+  const rows = database
+    .query(
+      `SELECT payload, at, uid, id FROM events
+        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ?
+          AND json_extract(payload, '$.scope') = ?
+        ORDER BY at ASC, uid ASC, id ASC`,
+    )
+    .all(sessionId, scope) as { payload: string; at: string; uid: string | null; id: number }[];
+  return rows
+    .map((row) => ({ at: row.at, uid: row.uid, id: row.id, payload: JSON.parse(row.payload) }))
+    .filter(
+      (row: DeclarationRow) =>
+        scope !== "subagent" || row.payload.parent_session_id === parentSessionId,
+    );
+}
+
+function coveredIntervals(
+  database: Database,
+  input: {
+    sessionId: string;
+    at: string;
+    scope: "session" | "subagent";
+    parentSessionId?: string;
+  },
+): CoverageInterval[] {
+  const intervals = foldCoverage(
+    readDeclarations(database, input.sessionId, input.scope, input.parentSessionId),
+  );
+  const sessionStart = sessionStartedAt(database, input.sessionId);
+  return intervals.filter(
+    (interval) =>
+      resolveCoverageStart(interval, sessionStart) <= input.at &&
+      (interval.end === null || input.at < interval.end),
+  );
+}
+
+/** The plan in force at `at`: the latest amendment by then, else the first declaration's. */
+function planAt(interval: CoverageInterval, at: string): string[] {
+  let plan = interval.versions[0]?.plan ?? [];
+  for (const version of interval.versions) if (version.at <= at) plan = version.plan;
+  return plan;
+}
+
+/** The latest declaration time at or before `at`, else the first one (a back-covered stretch). */
+function declaredKey(interval: CoverageInterval, at: string): string {
+  let key = interval.versions[0]?.at ?? interval.declaredAt;
+  for (const version of interval.versions) if (version.at <= at) key = version.at;
+  return key;
+}
+
 function resolveDeclaration(
   database: Database,
   sessionId: string,
@@ -166,6 +341,35 @@ function resolveDeclaration(
         ORDER BY at DESC, uid DESC, id DESC`,
     )
     .all(sessionId, at) as { payload: string }[];
+
+  const live = (questId: string) =>
+    database
+      .query("SELECT title, outcome FROM quests WHERE id = ? AND retracted_at IS NULL")
+      .get(questId) as { title: string; outcome: string | null } | null;
+
+  // Coverage first: the quest declared at `at`, even when its declaration is
+  // later than `at` (a declaration covers the session from its start) or an
+  // earlier one has been ended. The legacy "latest event" lookup below answers
+  // only when nothing covers `at`.
+  const covering = coveredIntervals(database, { sessionId, at, scope, parentSessionId })
+    .map((interval, index) => ({ interval, index }))
+    .sort(
+      (left, right) =>
+        declaredKey(right.interval, at).localeCompare(declaredKey(left.interval, at)) ||
+        right.index - left.index,
+    );
+  for (const { interval } of covering) {
+    const quest = live(interval.questId);
+    if (!quest) continue;
+    return {
+      questId: interval.questId,
+      title: quest.title,
+      outcome: quest.outcome,
+      plan: planAt(interval, at),
+      scope,
+      parentSessionId: scope === "subagent" ? (parentSessionId ?? null) : null,
+    };
+  }
 
   for (const row of rows) {
     const payload = JSON.parse(row.payload) as {
@@ -186,9 +390,7 @@ function resolveDeclaration(
 
     const questId = payload.quest_id;
     if (!questId) continue;
-    const quest = database
-      .query("SELECT title, outcome FROM quests WHERE id = ? AND retracted_at IS NULL")
-      .get(questId) as { title: string; outcome: string | null } | null;
+    const quest = live(questId);
     if (!quest) continue;
     return {
       questId,
@@ -213,11 +415,32 @@ export interface ActiveDeclaredQuest extends DeclaredQuest {
 }
 
 /**
- * Every quest still active for a session at `at`. A `quest.declared` event marks
- * its quest active from `at` onward; one carrying `done: true` ends it. A session
- * legitimately pursues several quests at once, so "latest wins"
- * (`currentDeclaredQuest`) cannot express what is actually declared -- declaring
- * a second quest would silently retire the first.
+ * Every quest declared for a session at `at`.
+ *
+ * Coverage rule -- a declaration covers the session from its start, unless told
+ * otherwise:
+ *
+ * - The FIRST declaration of a session (per scope) is active from the session's
+ *   start (`claude_sessions.started_at`), not from its own event: models declare
+ *   late, often at the end, and the work before that was still done for it.
+ * - A later declaration starts at its own event, EXCEPT when every previously
+ *   declared quest has been ended with `--done` by then: it then starts where
+ *   the last `--done` happened, so there is no gap.
+ * - `--since <iso>` (payload `since`, never after the event) overrides the
+ *   computed start of the declaration that carries it.
+ * - A quest is active until its own `--done`. Re-declaring an active quest only
+ *   amends its plan (the plan at `at` is the latest amendment by then, or the
+ *   first declaration's for a stretch before any), and a declaration made again
+ *   after its `--done` opens a new stretch by the same rules.
+ * - A session with no stored row has no start to reach back to, so its first
+ *   declaration covers from its own event.
+ * - Subagent-scope declarations follow the same rules within the subagent's own
+ *   session, keyed by the pair (session, parent).
+ *
+ * `sessionHasActiveDeclaration`, `currentDeclaredQuest*` and
+ * `latestDeclaredParentSessionId` answer from this same coverage, so they agree
+ * with it. A session legitimately pursues several quests at once, so "latest
+ * wins" (`currentDeclaredQuest`) cannot express what is actually declared.
  */
 export function activeDeclaredQuests(
   database: Database,
@@ -235,54 +458,19 @@ export function activeDeclaredQuests(
   },
 ): ActiveDeclaredQuest[] {
   const scope = input.scope ?? "session";
-  const rows = database
-    .query(
-      `SELECT payload, at FROM events
-        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ?
-          AND json_extract(payload, '$.scope') = ? AND at <= ?
-        ORDER BY at ASC, uid ASC, id ASC`,
-    )
-    .all(input.sessionId, scope, input.at) as { payload: string; at: string }[];
-
-  // Insertion order is declaration order, so a quest re-declared later to amend
-  // its plan keeps its position and its alias does not jump around.
-  const active = new Map<string, { plan: string[]; at: string }>();
-  for (const row of rows) {
-    const payload = JSON.parse(row.payload) as {
-      quest_id?: string;
-      plan?: string[];
-      done?: boolean;
-      parent_session_id?: string;
-    };
-    if (scope === "subagent" && payload.parent_session_id !== input.parentSessionId) continue;
-    const questId = payload.quest_id;
-    if (!questId) continue;
-    if (payload.done === true) {
-      active.delete(questId);
-      continue;
-    }
-    const existing = active.get(questId);
-    if (existing) {
-      existing.plan = payload.plan ?? [];
-      existing.at = row.at;
-      continue;
-    }
-    active.set(questId, { plan: payload.plan ?? [], at: row.at });
-  }
-
   const result: ActiveDeclaredQuest[] = [];
   let aliasNumber = 0;
-  for (const [questId, entry] of active) {
+  for (const interval of coveredIntervals(database, { ...input, scope })) {
     const quest = database
       .query("SELECT title, outcome FROM quests WHERE id = ? AND retracted_at IS NULL")
-      .get(questId) as { title: string; outcome: string | null } | null;
+      .get(interval.questId) as { title: string; outcome: string | null } | null;
     if (!quest) continue;
     aliasNumber += 1;
     result.push({
-      questId,
+      questId: interval.questId,
       title: quest.title,
       outcome: quest.outcome,
-      plan: entry.plan,
+      plan: planAt(interval, input.at),
       scope,
       parentSessionId: scope === "subagent" ? (input.parentSessionId ?? null) : null,
       alias: `Q${aliasNumber}`,
@@ -322,6 +510,9 @@ export function hasAnyDeclaration(database: Database, sessionId: string): boolea
  * lives entirely on the `quest.declared` payload -- no schema or collector
  * column -- and `activeDeclaredQuests`/`currentDeclaredQuest` only resolve
  * session-scope declarations, so a subagent's parent has to be read from here.
+ * When no declaration is at or before `at`, the session's first declaration
+ * answers if its coverage reaches back over `at` (a subagent that declared late
+ * is still the parent's child for the stretch before).
  */
 export function latestDeclaredParentSessionId(
   database: Database,
@@ -335,10 +526,28 @@ export function latestDeclaredParentSessionId(
         ORDER BY at DESC, uid DESC, id DESC LIMIT 1`,
     )
     .get(sessionId, at) as { payload: string } | null;
-  if (row === null) return null;
-  const payload = JSON.parse(row.payload) as { scope?: string; parent_session_id?: string };
-  if (payload.scope !== "subagent") return null;
-  return payload.parent_session_id ?? null;
+  if (row !== null) {
+    const payload = JSON.parse(row.payload) as { scope?: string; parent_session_id?: string };
+    if (payload.scope !== "subagent") return null;
+    return payload.parent_session_id ?? null;
+  }
+  const first = database
+    .query(
+      `SELECT payload FROM events
+        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ?
+        ORDER BY at ASC, uid ASC, id ASC LIMIT 1`,
+    )
+    .get(sessionId) as { payload: string } | null;
+  if (first === null) return null;
+  const payload = JSON.parse(first.payload) as { scope?: string; parent_session_id?: string };
+  if (payload.scope !== "subagent" || !payload.parent_session_id) return null;
+  const covered = coveredIntervals(database, {
+    sessionId,
+    at,
+    scope: "subagent",
+    parentSessionId: payload.parent_session_id,
+  });
+  return covered.length > 0 ? payload.parent_session_id : null;
 }
 
 /**

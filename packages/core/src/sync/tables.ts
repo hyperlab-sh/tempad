@@ -67,6 +67,7 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "questions",
   "impacts",
   "w5_windows",
+  "w5_stale_windows",
   "projection_state",
   // Cross-host identity aliases (src/intent/identity.ts), rebuilt with the rest.
   "identity_aliases",

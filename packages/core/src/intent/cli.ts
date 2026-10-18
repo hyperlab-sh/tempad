@@ -590,6 +590,7 @@ export const QUEST_DECLARE_OPTIONS = {
   done: { type: "string" },
   by: { type: "string", default: "agent" },
   at: { type: "string" },
+  since: { type: "string" },
   serves: { type: "string" },
   advances: { type: "string" },
   "deviates-from": { type: "string" },
@@ -1111,6 +1112,17 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       return 2;
     }
     values.at = at;
+    // `--since` moves where the declaration starts covering the session; it can
+    // only reach backwards, so a start after the declaration itself is a mistake.
+    const since = normalizeAt(values.since);
+    if (since === null) {
+      console.error(`--since must be an ISO date or timestamp, got ${values.since}`);
+      return 2;
+    }
+    if (since !== undefined && since > (values.at ?? new Date().toISOString())) {
+      console.error(`--since ${since} is after the declaration (${values.at ?? "now"})`);
+      return 2;
+    }
     // `--done` retires a declaration; it names an existing quest and nothing
     // else, so every flag that describes what is being declared is excluded.
     if (values.done) {
@@ -1121,7 +1133,8 @@ function runQuestCommand(args: string[], context: IntentContext): number {
         values.origin ||
         values.serves ||
         values.advances ||
-        values["deviates-from"]
+        values["deviates-from"] ||
+        values.since
       ) {
         console.error(usage);
         return 2;
@@ -1267,6 +1280,7 @@ function runQuestCommand(args: string[], context: IntentContext): number {
       scope: values.parent ? "subagent" : "session",
       declaredBy: values.by === "hero" ? "hero" : "agent",
       at: values.at ?? new Date().toISOString(),
+      since,
       heroId: heroRow.id,
     });
     context.stdout(`declared ${result.questId}${result.created ? " (new)" : ""}`);
