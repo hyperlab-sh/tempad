@@ -232,15 +232,18 @@ function runContext(args: string[], context: W5Context): number {
   // the epoch keeps an unread session unthrottled until `w5 run` writes its own.
   const vagueLines: string[] = [];
   if (active.length > 0) {
-    const flagged = active
-      .map(
-        (quest) =>
-          context.database
-            .query("SELECT title FROM quests WHERE id = ? AND title_vague = 1")
-            .get(quest.questId) as { title: string } | null,
-      )
-      .filter((row): row is { title: string } => row !== null);
-    if (flagged.length > 0) {
+    const flagged = new Set(
+      active
+        .map(
+          (quest) =>
+            context.database
+              .query("SELECT id FROM quests WHERE id = ? AND title_vague = 1")
+              .get(quest.questId) as { id: string } | null,
+        )
+        .filter((row): row is { id: string } => row !== null)
+        .map((row) => row.id),
+    );
+    if (flagged.size > 0) {
       const previous = context.database
         .query("SELECT vague_nudged FROM w5_runs WHERE session_id = ?")
         .get(values.session) as { vague_nudged: string | null } | null;
@@ -253,7 +256,7 @@ function runContext(args: string[], context: W5Context): number {
       const seen = new Set(nudged);
       for (const quest of active) {
         if (seen.has(quest.questId)) continue;
-        if (!flagged.some((row) => row.title === quest.title)) continue;
+        if (!flagged.has(quest.questId)) continue;
         vagueLines.push(
           buildVagueTitleLine({ id: quest.questId, title: quest.title, alias: quest.alias }),
         );

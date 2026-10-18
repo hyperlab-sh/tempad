@@ -20,9 +20,17 @@ const ROWS: { title: string; verdict: TitleVerdictKind; note?: string }[] = [
   { title: "cleanup", verdict: "vague" },
   { title: "follow up", verdict: "vague" },
   { title: "fix the bug", verdict: "vague" }, // only generic words + stop word
-  // No word longer than 3 letters.
+  // Short title with nothing specific in it (shortness alone is not a verdict).
   { title: "fix the api", verdict: "vague" },
   { title: "run db fix", verdict: "vague" },
+  // Review r1 counterexamples: short titles that name a concrete object or a
+  // technical identifier are ok.
+  { title: "Fix deadlocks", verdict: "ok" },
+  { title: "Rotate credentials", verdict: "ok" },
+  { title: "Upgrade PostgreSQL", verdict: "ok" },
+  { title: "Add SSH key", verdict: "ok" }, // uppercase acronym makes it concrete
+  { title: "Fix JWT TTL", verdict: "ok" }, // uppercase acronyms make it concrete
+  { title: "Back up S3 buckets", verdict: "ok" }, // letter-digit identifier
   // Only generic words (longer than 3 words, long words present).
   { title: "fix stuff and things", verdict: "vague" },
   { title: "misc cleanup and leftovers", verdict: "vague" },
@@ -90,6 +98,17 @@ describe("judgeTitleQuality", () => {
         reason: "duplicate:q2",
         duplicateOf: "q2",
       });
+    });
+
+    test("C# and C++ normalize to the same token (known, documented collision)", () => {
+      // Punctuation is stripped for the duplicate comparison, so the tokenizer
+      // cannot tell the two languages apart. Accepted for now: an exact-title
+      // duplicate only suggests a reword, never blocks the declaration.
+      expect(
+        judgeTitleQuality("Install the C# compiler", [
+          { id: "q3", title: "Install the C++ compiler" },
+        ]).verdict,
+      ).toBe("duplicate");
     });
   });
 });

@@ -371,10 +371,14 @@ function reprojectQuests(database: Database): void {
 
 /**
  * TypeScript half of migration 0028: adds `quests.title_vague`/
- * `title_vague_reason` and `w5_runs.vague_nudged`. The ALTERs live here, not
- * in the SQL file, because `reprojectQuests` (step 24) may already have added
- * the quests columns on a chain that crossed 24 before this version, and each
- * add is conditional so both orders converge on the same schema.
+ * `title_vague_reason` and `w5_runs.vague_nudged`, then populates the new
+ * derived columns by replaying the quest events in order inside this
+ * transaction (`reprojectQuests`), so a database upgraded from version 26/27
+ * carries exactly the flags a `tempad rebuild` would produce instead of the
+ * ALTER defaults (0/null) for quests already declared. The ALTERs live here,
+ * not in the SQL file, because `reprojectQuests` (step 24) may already have
+ * added the quests columns on a chain that crossed 24 before this version,
+ * and each add is conditional so both orders converge on the same schema.
  */
 function addTitleQualityColumns(database: Database): void {
   const quests = database
@@ -384,6 +388,7 @@ function addTitleQualityColumns(database: Database): void {
   const runs = database
     .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'w5_runs'")
     .get();
+  reprojectQuests(database);
   if (!runs) return;
   const columns = database.query("SELECT name FROM pragma_table_info('w5_runs')").all() as Array<{
     name: string;

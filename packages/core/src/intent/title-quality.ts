@@ -30,6 +30,10 @@ const GENERIC_WORDS = [
   "fix",
   "fixes",
   "fixing",
+  "bug",
+  "bugs",
+  "ship",
+  "release",
   "stuff",
   "things",
   "work",
@@ -49,7 +53,20 @@ const GENERIC_WORDS = [
 ];
 
 /** Words ignored both when matching a duplicate and when judging vagueness. */
-const STOP_WORDS = new Set(["the", "a", "an", "for", "of", "and", "to", "in", "on", "with", "up"]);
+const STOP_WORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "for",
+  "of",
+  "and",
+  "to",
+  "in",
+  "on",
+  "with",
+  "up",
+  "it",
+]);
 
 /** The words the duplicate comparison strips, exactly the brief's list. */
 const DUPLICATE_STRIP_WORDS = new Set(["the", "a", "an", "for", "of"]);
@@ -76,6 +93,24 @@ function normalizeForDuplicate(title: string): string {
 }
 
 /**
+ * A technical identifier in the title as written: an uppercase acronym
+ * (`JWT`, `SSH`, `TTL`) or a letter-digit mix (`S3`, `marko2`). These make a
+ * short title concrete ("Fix JWT TTL") even though every token is 3 letters
+ * or less, so shortness alone must not flag them.
+ */
+function isTechnicalIdentifier(raw: string): boolean {
+  return /^[A-Z]{2,}[0-9]*$/.test(raw) || /^[A-Za-z]+[0-9]+[A-Za-z0-9]*$/.test(raw);
+}
+
+/** Raw whitespace-separated words of the title as written (case kept). */
+function rawWords(title: string): string[] {
+  return title
+    .trim()
+    .split(/\s+/)
+    .filter((word) => word.length > 0);
+}
+
+/**
  * Judge a proposed quest title against the existing quests the caller chose to
  * compare with (the declare path and the projection pass the open quests).
  *
@@ -85,9 +120,15 @@ function normalizeForDuplicate(title: string): string {
  *     one of the existing titles, or equality after additionally stripping the
  *     words "the/a/an/for/of". The existing quest's id is suggested, never
  *     enforced: the caller creates the quest anyway.
- * (b) vague -- the title matches a code (`S1`, `42`), or has fewer than 3
- *     words, or no word longer than 3 letters, or is made only of generic
- *     words ("fix stuff and things") and stop words.
+ * (b) vague -- the title matches a code (`S1`, `42`), or is made only of
+ *     generic words ("fix stuff and things") and stop words, or is short
+ *     without anything concrete in it. Shortness is a supporting signal,
+ *     never a verdict on its own: a short title that names a specific object
+ *     ("Fix deadlocks", "Rotate credentials") or carries a technical
+ *     identifier ("Fix JWT TTL", "Add SSH key") is ok. Concretely, the third
+ *     rule fires only when the title has at most 3 words, none longer than 3
+ *     letters, and none is a technical identifier (an uppercase acronym like
+ *     `JWT`/`SSH` or a letter-digit mix like `S3`).
  * (c) otherwise ok.
  */
 export function judgeTitleQuality(
@@ -117,16 +158,14 @@ export function judgeTitleQuality(
     return { verdict: "vague", reason: "looks like a code" };
   }
   const tokens = tokenize(trimmed);
-  if (tokens.length < 3) {
-    return { verdict: "vague", reason: "fewer than 3 words" };
-  }
-  const longest = tokens.reduce((max, token) => Math.max(max, token.length), 0);
-  if (longest <= 3) {
-    return { verdict: "vague", reason: "no word longer than 3 letters" };
-  }
   const contentTokens = tokens.filter((token) => !STOP_WORDS.has(token));
   if (contentTokens.length > 0 && contentTokens.every((token) => GENERIC_TOKENS.has(token))) {
     return { verdict: "vague", reason: "only generic words" };
+  }
+  const longest = tokens.reduce((max, token) => Math.max(max, token.length), 0);
+  const hasTechnical = rawWords(trimmed).some((word) => isTechnicalIdentifier(word));
+  if (tokens.length <= 3 && longest <= 3 && !hasTechnical) {
+    return { verdict: "vague", reason: "short title with nothing specific in it" };
   }
 
   return { verdict: "ok", reason: "" };
@@ -140,7 +179,7 @@ export function judgeTitleQuality(
 export function openQuestTitles(database: Database): { id: string; title: string }[] {
   return database
     .query(
-      "SELECT id, title FROM quests WHERE ended_at IS NULL AND merged_into IS NULL AND retracted_at IS NULL",
+      "SELECT id, title FROM quests WHERE ended_at IS NULL AND merged_into IS NULL AND retracted_at IS NULL AND state NOT IN ('done', 'abandoned')",
     )
     .all() as { id: string; title: string }[];
 }
