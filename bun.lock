@@ -10,7 +10,7 @@
     },
     "packages/core": {
       "name": "@hyperlab.sh/tempad",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "bin": {
         "tempad": "./src/cli.ts",
       },
