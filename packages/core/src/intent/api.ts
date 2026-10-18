@@ -77,6 +77,8 @@ export interface TraceInput {
    */
   belongs?: boolean;
   guess?: string | null;
+  /** The transcript text behind a doubt; carried on the event only (`tempad review` reads it). */
+  trigger?: string | null;
 }
 
 export function recordTrace(store: EventStore, database: Database, input: TraceInput): string {
@@ -105,6 +107,7 @@ export function recordTrace(store: EventStore, database: Database, input: TraceI
         classified_by: input.classifiedBy,
         belongs: input.belongs,
         guess: input.guess,
+        trigger: input.trigger ?? undefined,
       },
     }),
   );

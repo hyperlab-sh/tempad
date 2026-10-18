@@ -377,7 +377,7 @@ describe("classifier", () => {
     expect(result.selectorDefaulted).toBe(1);
   });
 
-  test("validateResult repairs a quest sent alongside belongs: false back to null", () => {
+  test("validateResult keeps a recognized quest sent alongside belongs: false and nulls an unknown one", () => {
     const result = validateResult(
       {
         segments: [{ ...good.segments[0], belongs: false, guess: "something else", quest: "Q1" }],
@@ -386,7 +386,15 @@ describe("classifier", () => {
     );
 
     expect(result.segments[0]?.belongs).toBe(false);
-    expect(result.segments[0]?.quest).toBeNull();
+    expect(result.segments[0]?.quest).toBe("Q1");
+
+    const unknown = validateResult(
+      {
+        segments: [{ ...good.segments[0], belongs: false, guess: "something else", quest: "Q9" }],
+      },
+      window,
+    );
+    expect(unknown.segments[0]?.quest).toBeNull();
   });
 
   test("an unrecognized quest alias with two or more active quests keeps a guess the model did supply", () => {

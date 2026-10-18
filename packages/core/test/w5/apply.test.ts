@@ -2520,6 +2520,7 @@ describe("applyResult in declared mode", () => {
             belongs: false,
             quest: null,
             guess: "a competitor comparison",
+            trigger: "let's compare with the competitor",
           }),
         ],
         sessionNote: null,
@@ -2950,9 +2951,13 @@ describe("applyResult in declared mode", () => {
       },
       {
         segments: [
-          // A doubted segment names no quest, so its stint carries none; the
-          // belonging one is what shows the subagent's own quest is used.
-          segment({ belongs: false, quest: null, guess: "unrelated refactor" }),
+          // A doubted segment names no quest and keeps the subagent's current one.
+          segment({
+            belongs: false,
+            quest: null,
+            guess: "unrelated refactor",
+            trigger: "while here, tidy the loader",
+          }),
           segment({
             startedAt: "2026-09-04T15:20:00.000Z",
             endedAt: "2026-09-04T15:20:00.000Z",

@@ -12,6 +12,8 @@ import {
   type ClassifierWindow,
   DEFAULT_NEW_STINT_REASON,
   parseSegmentReference,
+  QUEST_NOT_NAMED_GUESS,
+  UNRECOGNIZED_QUEST_ALIAS_GUESS,
 } from "./classifier";
 import { openStintContinuing } from "./lifecycle";
 
@@ -882,6 +884,13 @@ function resolveStintForSegmentDeclared(
   return open(segment.what);
 }
 
+const UNASKABLE_GUESSES = new Set([UNRECOGNIZED_QUEST_ALIAS_GUESS, QUEST_NOT_NAMED_GUESS]);
+
+function isAskableDoubt(segment: ClassifierSegment): boolean {
+  if (typeof segment.trigger !== "string" || segment.trigger.trim() === "") return false;
+  return !UNASKABLE_GUESSES.has(segment.guess ?? "");
+}
+
 export function applyResult(
   store: EventStore,
   database: Database,
@@ -919,6 +928,24 @@ export function applyResult(
     questionSessionId =
       latestDeclaredParentSessionId(database, window.sessionId, at) ?? window.sessionId;
   }
+
+  // A doubted segment (`belongs: false`) stays on the quest it was judged against:
+  // the one the model named, else the session's current one (the newest active
+  // quest, the parent's for a subagent). The doubt is flagged on the trace and
+  // asked about, but the work is never left without a quest because the model
+  // was unsure; only a session with nothing active has no quest to keep.
+  const currentQuestAlias = (
+    window.activeQuests.length > 0 ? window.activeQuests : window.parentActiveQuests
+  ).at(-1)?.alias;
+  const segmentQuestId = (segment: ClassifierSegment): string | null => {
+    if (segment.quest !== null && segment.quest !== undefined) {
+      return questAliases[segment.quest] ?? null;
+    }
+    if (segment.belongs === false && currentQuestAlias !== undefined) {
+      return questAliases[currentQuestAlias] ?? null;
+    }
+    return null;
+  };
 
   // One stint per (quest, plan item) for the life of this window; across windows
   // the same reuse comes from the open-stint lookup in the resolver.
@@ -1012,9 +1039,7 @@ export function applyResult(
           database,
           segment,
           segment.startedAt,
-          segment.quest === null || segment.quest === undefined
-            ? null
-            : (questAliases[segment.quest] ?? null),
+          segmentQuestId(segment),
           window.sessionId,
           window.openStintAliases ?? {},
           window.planAliases ?? {},
@@ -1100,6 +1125,7 @@ export function applyResult(
       sessionId: window.sessionId,
       belongs: declaredMode ? segment.belongs : undefined,
       guess: declaredMode ? (segment.guess ?? null) : undefined,
+      trigger: declaredMode && segment.belongs === false ? (segment.trigger ?? null) : undefined,
     });
     summary.traces += 1;
 
@@ -1111,7 +1137,11 @@ export function applyResult(
         options.log(
           `w5 doubt: session ${window.sessionId} stint ${stintId} guess "${segment.guess ?? ""}"`,
         );
-        if (options.askingEnabled) {
+        // A doubt the model did not back with a quoted trigger, or one the
+        // validator fabricated (the quest alias was unrecognized or never named),
+        // is recorded and logged but never asked: the human would be answering a
+        // question nobody could explain.
+        if (options.askingEnabled && isAskableDoubt(segment)) {
           askQuestion(store, database, {
             trace: traceId,
             sessionId: questionSessionId,

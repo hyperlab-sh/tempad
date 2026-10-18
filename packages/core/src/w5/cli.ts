@@ -317,19 +317,70 @@ function runReview(args: string[], context: W5Context): number {
   }
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
+  // Doubted work stays on its quest (the verifier's `belongs: false` flags the
+  // stint, it does not orphan it), so this section is where a human confirms or
+  // moves it. One line per stint; the trigger is read from the trace's own event
+  // since only `tempad review` ever shows it.
   const doubtedTraces = context.database
     .query(
-      `SELECT traces.id as id, traces.what as what, traces.doubt as doubt FROM traces
-        JOIN stints ON stints.id = traces.stint_id
+      `SELECT traces.id as id, traces.stint_id as stintId, traces.doubt as doubt,
+              stints.outcome as outcome, quests.title as questTitle,
+              (SELECT json_extract(events.payload, '$.trigger') FROM events
+                WHERE events.subject = traces.id AND events.kind = 'trace.recorded'
+                ORDER BY events.uid DESC LIMIT 1) as trigger
+         FROM traces
+         JOIN stints ON stints.id = traces.stint_id
+         LEFT JOIN quests ON quests.id = stints.quest_id
         WHERE traces.doubt IS NOT NULL AND traces.retracted_at IS NULL AND traces.started_at >= ?
           AND stints.dismissed_at IS NULL AND stints.retracted_at IS NULL
         ORDER BY traces.started_at ASC`,
     )
-    .all(since) as { id: string; what: string; doubt: string }[];
+    .all(since) as {
+    id: string;
+    stintId: string;
+    doubt: string;
+    outcome: string;
+    questTitle: string | null;
+    trigger: string | null;
+  }[];
+  const doubtedStints = new Map<
+    string,
+    {
+      outcome: string;
+      questTitle: string | null;
+      traces: string[];
+      guesses: Set<string>;
+      triggers: Set<string>;
+    }
+  >();
   for (const trace of doubtedTraces) {
-    context.stdout(
-      `trace ${trace.id} doubt (${trace.doubt}) — ${trace.what} — ${usageText("trace list")}`,
-    );
+    const stint = doubtedStints.get(trace.stintId) ?? {
+      outcome: trace.outcome,
+      questTitle: trace.questTitle,
+      traces: [],
+      guesses: new Set<string>(),
+      triggers: new Set<string>(),
+    };
+    stint.traces.push(trace.id);
+    stint.guesses.add(trace.doubt);
+    if (typeof trace.trigger === "string" && trace.trigger.trim() !== "") {
+      stint.triggers.add(trace.trigger);
+    }
+    doubtedStints.set(trace.stintId, stint);
+  }
+  if (doubtedStints.size > 0) context.stdout("doubted stints:");
+  for (const [stintId, stint] of doubtedStints) {
+    const parts = [
+      `stint ${stintId} doubted`,
+      stint.questTitle === null ? "no quest" : `quest "${stint.questTitle}"`,
+      stint.outcome,
+      `guess ${[...stint.guesses].map((guess) => `"${guess}"`).join(", ")}`,
+    ];
+    if (stint.triggers.size > 0) {
+      parts.push(`trigger ${[...stint.triggers].map((trigger) => `"${trigger}"`).join(", ")}`);
+    }
+    parts.push(`traces ${stint.traces.join(", ")}`, usageText("trace list"));
+    context.stdout(parts.join(" — "));
   }
 
   const expiredQuestions = context.database

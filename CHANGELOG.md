@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- A doubt (`belongs: false`) no longer strips the quest from the work it flags. The stint stays on the quest the segment was judged against (the one the model named, else the session's current one, a subagent's own before its parent's), the trace is marked doubted (`traces.doubt`), and the `belongs` question is asked as before; before, the stint was opened with no quest and stayed that way when the question expired (351 expired so far, 453 of 598 quest-less declared-session traces in the real database were doubts, and 120 of 178 answered questions were answered `--belongs`). `tempad answer --belongs` and `--quest` clear the doubt on the trace (`--quest` also moves the stint, as before), an expiry leaves both the quest and the doubt, and `tempad rebuild` reproduces the flag from events (no migration). A doubt the model gave no quoted `trigger` for, or one the validator made up (`unrecognized quest alias`, `quest not named`), is recorded, logged as `w5 doubt:` and counted in `doubts` but no longer asks a question. `tempad review` lists doubted stints in their own section with the quest title, guess and trigger when there is one; a `belongs: false` segment that names an active quest alias now keeps it through validation instead of having it nulled.
+
 ## [0.3.1] - 2026-10-18
 
 ### Removed
