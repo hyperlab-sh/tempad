@@ -29,7 +29,10 @@ describe("tempad schedule (process)", () => {
       for (const args of [["schedule"], ["schedule", "bogus"], ["schedule", "install", "--json"]]) {
         const result = await tempad(args, home);
         expect(result.code).toBe(2);
-        expect(result.stderr).toContain("usage: tempad schedule install");
+        // An unknown subcommand is answered by the command tree (`Usage:`), the rest by the command itself (`usage:`).
+        expect(result.stderr).toMatch(/[Uu]sage:/);
+        expect(result.stderr).toContain("tempad schedule install");
+        expect(result.stderr).toContain("tempad schedule status [--json]");
       }
       // bun itself may create ~/.bun (its cache) in the fake HOME; tempad must add nothing else.
       expect(readdirSync(home).filter((name) => name !== ".bun")).toEqual([]);
