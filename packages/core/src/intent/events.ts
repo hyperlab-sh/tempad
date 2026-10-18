@@ -40,6 +40,7 @@ export const EVENT_KINDS = [
   "retracted",
   "window.classified",
   "impact.stated",
+  "session.kind_set",
 ] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 

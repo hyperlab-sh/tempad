@@ -57,15 +57,28 @@ export async function classifyWithRetry(
   userPrompt: string,
   request: (prompt: string) => Promise<string>,
 ): Promise<ClassifierResult> {
+  return requestWithRetry(userPrompt, request, (value) => validateResult(value, window));
+}
+
+/**
+ * Sends `userPrompt`, parses the answer as JSON and hands it to `validate`; on a
+ * parse or validation failure asks once more with the reason appended. The w5
+ * classifier and the session kind classifier (`src/sessions/classifier.ts`) share it.
+ */
+export async function requestWithRetry<T>(
+  userPrompt: string,
+  request: (prompt: string) => Promise<string>,
+  validate: (value: unknown) => T,
+): Promise<T> {
   const first = await request(userPrompt);
   try {
-    return validateResult(JSON.parse(extractJsonText(first)), window);
+    return validate(JSON.parse(extractJsonText(first)));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const retryPrompt = `${userPrompt}\n\nYour previous response was invalid: ${message}\nRespond with valid JSON only.`;
     const second = await request(retryPrompt);
     try {
-      return validateResult(JSON.parse(extractJsonText(second)), window);
+      return validate(JSON.parse(extractJsonText(second)));
     } catch (retryError) {
       throw new ClassifierResponseError(
         retryError instanceof Error ? retryError.message : String(retryError),

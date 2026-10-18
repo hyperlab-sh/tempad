@@ -19,6 +19,8 @@ import {
   sessionEverDeclared,
   sessionHasActiveDeclaration,
 } from "../intent/declarations";
+import { ensureSessionKindTables, sessionKindSql } from "../sessions/kind";
+import { isSessionKind } from "../sessions/kinds";
 import { isSyncEnabled } from "../sync/config";
 import { usageText } from "../usage";
 import { backfill } from "./backfill";
@@ -320,13 +322,15 @@ const REVIEW_USAGE = `usage: ${usageText("review")}`;
 
 function runReview(args: string[], context: W5Context): number {
   let daysValue: string | undefined;
+  let kindValue: string | undefined;
   try {
     const { values } = parseArgs({
       args,
-      options: { days: { type: "string" } },
+      options: { days: { type: "string" }, kind: { type: "string" } },
       strict: true,
     });
     daysValue = values.days;
+    kindValue = values.kind;
   } catch {
     // node:util's parseArgs itself throws on a value that looks like another
     // flag (e.g. `--days -5` un-joined) before any of our own validation
@@ -348,7 +352,17 @@ function runReview(args: string[], context: W5Context): number {
     }
     days = Number.parseInt(daysValue, 10);
   }
+  if (kindValue !== undefined && !isSessionKind(kindValue)) {
+    context.stdout(REVIEW_USAGE);
+    return 2;
+  }
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  // `--kind` keeps only items from sessions of that kind (a manual kind first, then the
+  // inferred one); a session no pass has classified yet matches no kind.
+  if (kindValue !== undefined) ensureSessionKindTables(context.database);
+  const kindFilter = (sessionId: string): string =>
+    kindValue === undefined ? "" : `AND ${sessionKindSql(sessionId)} = ?`;
+  const kindParameters: string[] = kindValue === undefined ? [] : [kindValue];
 
   // Doubted work stays on its quest (the verifier's `belongs: false` flags the
   // stint, it does not orphan it), so this section is where a human confirms or
@@ -366,6 +380,7 @@ function runReview(args: string[], context: W5Context): number {
          LEFT JOIN quests ON quests.id = stints.quest_id
         WHERE traces.doubt IS NOT NULL AND traces.retracted_at IS NULL AND traces.started_at >= ?
           AND stints.dismissed_at IS NULL AND stints.retracted_at IS NULL
+          ${kindFilter("traces.session_id")}
         ORDER BY traces.started_at ASC`,
     )
     .all(since) as {
@@ -419,9 +434,10 @@ function runReview(args: string[], context: W5Context): number {
   const expiredQuestions = context.database
     .query(
       `SELECT id, text, kind, guess, session_id as sessionId FROM questions
-        WHERE state = 'expired' AND ${TRACE_NOT_RETRACTED} ORDER BY rowid ASC`,
+        WHERE state = 'expired' AND ${TRACE_NOT_RETRACTED} ${kindFilter("questions.session_id")}
+        ORDER BY rowid ASC`,
     )
-    .all() as {
+    .all(...kindParameters) as {
     id: string;
     text: string;
     kind: string;
@@ -468,11 +484,20 @@ function runReview(args: string[], context: W5Context): number {
     );
   }
 
+  // A quest has no session of its own: it matches a kind when a live trace of one of its
+  // stints was recorded in a session of that kind.
+  const questKindFilter =
+    kindValue === undefined
+      ? ""
+      : `AND EXISTS (SELECT 1 FROM stints JOIN traces ON traces.stint_id = stints.id
+           WHERE stints.quest_id = quests.id AND traces.retracted_at IS NULL
+             ${kindFilter("traces.session_id")})`;
   const unconfirmedQuests = context.database
     .query(
-      "SELECT id, title FROM quests WHERE confirmed = 0 AND retracted_at IS NULL ORDER BY created_at ASC",
+      `SELECT id, title FROM quests WHERE confirmed = 0 AND retracted_at IS NULL ${questKindFilter}
+        ORDER BY created_at ASC`,
     )
-    .all() as { id: string; title: string }[];
+    .all(...kindParameters) as { id: string; title: string }[];
   for (const quest of unconfirmedQuests) {
     context.stdout(
       `quest ${quest.id} unconfirmed (${quest.title}) — tempad quest confirm ${quest.id}`,
@@ -481,9 +506,10 @@ function runReview(args: string[], context: W5Context): number {
 
   const lowConfidenceTraces = context.database
     .query(
-      "SELECT id, what FROM traces WHERE confidence < 0.5 AND retracted_at IS NULL ORDER BY started_at ASC",
+      `SELECT id, what FROM traces WHERE confidence < 0.5 AND retracted_at IS NULL
+        ${kindFilter("traces.session_id")} ORDER BY started_at ASC`,
     )
-    .all() as { id: string; what: string }[];
+    .all(...kindParameters) as { id: string; what: string }[];
   for (const trace of lowConfidenceTraces) {
     context.stdout(`trace ${trace.id} low confidence (${trace.what}) — ${usageText("trace list")}`);
   }

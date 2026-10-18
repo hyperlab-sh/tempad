@@ -28,6 +28,8 @@ export function renderTomlFile(): string {
 # memory_quests = ${w5.memoryQuests}
 # overlap_messages = ${w5.overlapMessages}
 # backfill_days = ${w5.backfillDays}
+# session_kind_model = "${w5.sessionKindModel}"
+# session_kind_batch = ${w5.sessionKindBatch}
 
 # Project rules map a working directory to an org/project and a display name.
 # A \`path\` rule matches one exact folder and everything under it; list path rules

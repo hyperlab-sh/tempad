@@ -49,6 +49,7 @@ export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
   ],
   quiet: [],
   review: [],
+  sessions: ["kind"],
   scry: [],
   schedule: ["install", "remove", "status"],
   skill: ["install"],
@@ -167,7 +168,18 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
     text: "tempad w5 eval --from <date> --to <date> [--db <path>] [--declare <file>]",
   },
   { paths: ["quiet"], text: "tempad quiet <2h|30m>" },
-  { paths: ["review"], text: "tempad review [--days <n>]" },
+  {
+    paths: ["review"],
+    text: "tempad review [--days <n>] [--kind <human|lead|subagent|automated>]",
+  },
+  {
+    paths: ["sessions"],
+    text: "tempad sessions [--days <n>] [--kind <human|lead|subagent|automated>]   (list Claude sessions with their kind: who started them)",
+  },
+  {
+    paths: ["sessions kind"],
+    text: "tempad sessions kind <session-id> [--set <human|lead|subagent|automated> | --clear] | --refresh [--limit <n>]   (show or set a session's kind by hand; --refresh runs the rules and the model now)",
+  },
   {
     paths: ["scry"],
     text: "tempad scry [--json] [--days <n>] [--fast]   (read-only health check of the data: Health, Stats, Recommendations; exit 1 when a check fails; --fast skips quick_check and the projection replay)",
@@ -442,6 +454,8 @@ export const POSITIONAL_LIMITS: Readonly<Record<string, number>> = {
   "w5 eval": 0,
   quiet: 1,
   review: 0,
+  sessions: 0,
+  "sessions kind": 1,
   scry: 0,
   "schedule install": 0,
   "schedule remove": 0,
@@ -456,6 +470,7 @@ export const POSITIONAL_LIMITS: Readonly<Record<string, number>> = {
 export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "--all",
   "--belongs",
+  "--clear",
   "--detached",
   "--dry-run",
   "--fast",
@@ -469,6 +484,7 @@ export const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   "--open",
   "--pull",
   "--push",
+  "--refresh",
   "--side",
   "--unconfirmed",
 ]);

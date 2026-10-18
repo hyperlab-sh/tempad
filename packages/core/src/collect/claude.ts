@@ -82,7 +82,7 @@ interface SessionAccumulator {
   userType: string | undefined;
 }
 
-async function* readLines(path: string): AsyncGenerator<string> {
+export async function* readLines(path: string): AsyncGenerator<string> {
   const stream = Bun.file(path).stream();
   const reader = stream.getReader();
   const decoder = new TextDecoder();

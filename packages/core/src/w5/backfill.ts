@@ -5,6 +5,7 @@ import { hasAnyDeclaration } from "../intent/declarations";
 import { applyIncremental, ensureTables } from "../intent/projections";
 import { registerAllProjections } from "../intent/projections/register";
 import { EventStore } from "../intent/store";
+import { effectiveSessionKind } from "../sessions/kind";
 import { applyResult } from "./apply";
 import type { Classifier } from "./classifier";
 import { writeSessionNote } from "./jobs";
@@ -546,10 +547,12 @@ export async function backfill(
     // tail is the messages before this chunk, never this chunk's own; `messages`
     // is overridden because the chunk's bounds, not `sinceTs`, decide what it
     // classifies.
+    const sessionKind = effectiveSessionKind(database, session.id)?.kind;
     const chunkWindow = {
       ...buildWindow(database, {
         sessionId: session.id,
         mode: modeFor(session.id),
+        ...(sessionKind === undefined ? {} : { sessionKind }),
         sinceTs: previousChunkEnd,
         maxMessages: 5000,
         memoryHours: intentConfig.memoryHours,

@@ -4,6 +4,7 @@ import type { LoadedConfig } from "../config/env";
 import type { W5Config } from "../intent/config";
 import { registerAllProjections } from "../intent/projections/register";
 import { EventStore } from "../intent/store";
+import { effectiveSessionKind } from "../sessions/kind";
 import { type AppliedSummary, applyResult } from "./apply";
 import type { Classifier } from "./classifier";
 import { describeJobFailure } from "./classifier-shared";
@@ -168,9 +169,11 @@ export async function runOnce(
     // sessions no agent will ever resume.
     const mode = intentConfig.mode;
 
+    const sessionKind = effectiveSessionKind(database, job.sessionId)?.kind;
     const window = buildWindow(database, {
       sessionId: job.sessionId,
       mode,
+      ...(sessionKind === undefined ? {} : { sessionKind }),
       sinceTs,
       maxMessages: 200,
       memoryHours: intentConfig.memoryHours,

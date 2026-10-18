@@ -77,6 +77,8 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "w5_jobs",
   "w5_runs",
   "w5_quiet",
+  // Inferred session kinds (src/sessions/kind.ts): a cache every host refills itself.
+  "session_kind",
   // Owned by sync itself.
   "sync_local",
   "sync_cursors",

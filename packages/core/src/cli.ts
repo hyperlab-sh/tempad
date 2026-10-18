@@ -30,6 +30,7 @@ import { reports } from "./report/index.ts";
 import type { Report, ReportOptions } from "./report/types.ts";
 import { runScheduleCommand } from "./schedule/index.ts";
 import { runScryCommand } from "./scry/cli.ts";
+import { runSessionKindPass, runSessionsCommand } from "./sessions/cli.ts";
 import { runSetup } from "./setup/index.ts";
 import { isSyncEnabled, SyncConfigError } from "./sync/config.ts";
 import { forgetSync, formatForgetSummary, rejoinServer } from "./sync/forget.ts";
@@ -316,6 +317,19 @@ async function runSyncCommand(args: string[]): Promise<number> {
         `${summary.source}: inserted=${summary.inserted} updated=${summary.updated} deleted=${summary.deleted}${warnings}`,
       );
     }
+
+    // Session kinds follow the Claude sessions; this is the hourly pass the schedule runs.
+    // It never changes the exit code, and runs before push sync so a push failure cannot skip it.
+    if (selected.some((collector) => collector.name === "claude")) {
+      await runSessionKindPass({
+        database,
+        home: config.home,
+        intentConfig: loadIntentConfig(join(config.home, "tempad.toml")),
+        hostSlug: syncEnabled ? config.hostSlug : undefined,
+        stdout: (line) => console.log(line),
+        stderr: (line) => console.error(line),
+      });
+    }
   }
 
   // Push sync, when [sync] is enabled: after the collectors (which keep
@@ -557,6 +571,25 @@ async function runIntentDispatch(command: string, rest: string[]): Promise<numbe
   });
 }
 
+async function runSessionsDispatch(rest: string[]): Promise<number> {
+  // Only a refresh sends sessions to the model, and with push sync on only this host's.
+  const refresh = rest[0] === "kind" && rest.includes("--refresh");
+  const syncEnabled = refresh && isSyncEnabled(tempadHome());
+  const { config, database } = prepareCommand(
+    rest[0] === "kind" ? "tempad sessions kind" : "tempad sessions",
+    syncEnabled ? (["hostSlug"] as const) : [],
+  );
+  ensureTables(database);
+  return runSessionsCommand(rest, {
+    database,
+    home: config.home,
+    intentConfig: loadIntentConfig(join(config.home, "tempad.toml")),
+    hostSlug: (config as Partial<Pick<Config, "hostSlug">>).hostSlug,
+    stdout: (line) => console.log(line),
+    stderr: (line) => console.error(line),
+  });
+}
+
 async function runW5Dispatch(command: "w5" | "quiet" | "review", rest: string[]): Promise<number> {
   const plan = planW5Command(command, rest, { syncEnabled: () => isSyncEnabled(tempadHome()) });
   if (plan === null) {
@@ -651,6 +684,9 @@ async function dispatch(command: string | undefined, rest: string[]): Promise<nu
   }
   if (command === "w5" || command === "quiet" || command === "review") {
     return runW5Dispatch(command, rest);
+  }
+  if (command === "sessions") {
+    return runSessionsDispatch(rest);
   }
   if (command === "scry") {
     // Read-only: opens the database itself instead of through `prepareCommand`, which migrates and writes.
