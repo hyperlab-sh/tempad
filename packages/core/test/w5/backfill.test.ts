@@ -941,6 +941,138 @@ describe("backfill and declared quests", () => {
   });
 });
 
+describe("backfill with a classifier that mixes up the ids it is offered", () => {
+  // The 2026-10-18 run: in inference mode the prompt lists quests and stints by
+  // 26-character id, and the model put a quest id in `matchedStint`, a stint id
+  // in `matchedQuest`, or named a stint that had since closed as `matchedStint`.
+  // Each such segment used to open a fresh, unlinked stint, so one stretch of
+  // work fragmented into one stint per window.
+  class ConfusedClassifier implements Classifier {
+    public chunk = 0;
+
+    constructor(
+      private readonly confuse: (
+        window: ClassifierWindow,
+        chunk: number,
+      ) => Partial<ClassifierResult["segments"][number]>,
+    ) {}
+
+    async classify(window: ClassifierWindow): Promise<ClassifierResult> {
+      this.chunk += 1;
+      const first = window.messages[0]?.ts ?? "2026-09-04T15:00:00.000Z";
+      const last = window.messages.at(-1)?.ts ?? first;
+      return {
+        segments: [
+          {
+            startedAt: first,
+            endedAt: last,
+            what: "work",
+            why: "ship",
+            belongs: true,
+            guess: null,
+            matchedQuest: null,
+            proposedQuest: null,
+            matchedStint: null,
+            continuesStint: null,
+            newStintReason: "first work of the window",
+            isSwitch: false,
+            trigger: null,
+            confidence: 0.9,
+            questions: [],
+            ...this.confuse(window, this.chunk),
+          },
+        ],
+        sessionNote: null,
+      };
+    }
+  }
+
+  const proposal = {
+    title: "Inferred quest",
+    outcome: "guessed from the transcript",
+    commitment: "exploratory" as const,
+  };
+
+  test("a quest id in matchedStint and a stint id in matchedQuest continue the open stint", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    // 40 minutes apart: two chunks, and the first stint is still open (under the 45 minute idle limit).
+    seedSession(database, {
+      id: "s1",
+      endedAt: "2026-09-04T15:40:00.000Z",
+      messageTimestamps: ["2026-09-04T15:00:00.000Z", "2026-09-04T15:40:00.000Z"],
+    });
+
+    const classifier = new ConfusedClassifier((window, chunk) => {
+      if (chunk === 1) return { proposedQuest: proposal };
+      const quest = window.openQuests?.[0];
+      const stint = window.sessionOpenStints[0];
+      return {
+        matchedStint: quest?.id ?? null,
+        matchedQuest: stint?.stintId ?? null,
+        newStintReason: null,
+      };
+    });
+    const logs: string[] = [];
+    const result = await backfill(database, makeConfig(), config, classifier, {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: (line) => logs.push(line),
+    });
+
+    expect(result.windowsClassified).toBe(2);
+    expect(result.unknownStintIds).toBe(0);
+    expect(result.doubts).toBe(0);
+    expect(logs.filter((line) => line.includes("unknown stint id"))).toEqual([]);
+    const stints = database.query("SELECT id FROM stints").all() as { id: string }[];
+    expect(stints).toHaveLength(1);
+    const traces = database
+      .query("SELECT COUNT(*) as count FROM traces WHERE stint_id = ?")
+      .get(stints[0]?.id ?? "") as { count: number };
+    expect(traces.count).toBe(2);
+  });
+
+  test("a stint that closed in the gap and is named as matchedStint is continued, not orphaned", async () => {
+    const database = openDatabase(":memory:");
+    seedHero(database);
+    // Chunk 1 spans 6 minutes (over stint_min_minutes, so closing its stint does
+    // not dismiss it); 74 minutes of silence then close it before chunk 2.
+    seedSession(database, {
+      id: "s1",
+      endedAt: "2026-09-04T16:20:00.000Z",
+      messageTimestamps: [
+        "2026-09-04T15:00:00.000Z",
+        "2026-09-04T15:06:00.000Z",
+        "2026-09-04T16:20:00.000Z",
+      ],
+    });
+
+    const classifier = new ConfusedClassifier((window, chunk) => {
+      if (chunk === 1) return { proposedQuest: proposal };
+      const closed = window.recentStints[0];
+      return {
+        matchedStint: closed?.stintId ?? null,
+        newStintReason: null,
+      };
+    });
+    const result = await backfill(database, makeConfig(), config, classifier, {
+      days: 15,
+      now: "2026-09-04T17:00:00.000Z",
+      log: () => {},
+    });
+
+    expect(result.windowsClassified).toBe(2);
+    expect(result.unknownStintIds).toBe(0);
+    const stints = database
+      .query("SELECT id, continues, quest_id as questId FROM stints ORDER BY opened_at")
+      .all() as { id: string; continues: string | null; questId: string | null }[];
+    expect(stints).toHaveLength(2);
+    expect(stints[0]?.questId).not.toBeNull();
+    expect(stints[1]?.continues).toBe(stints[0]?.id);
+    expect(stints[1]?.questId).toBe(stints[0]?.questId);
+  });
+});
+
 describe("backfill hands the classifier the prompt its mode needs", () => {
   test("a never-declaring session's window is classified with the inference prompt", async () => {
     const database = openDatabase(":memory:");
