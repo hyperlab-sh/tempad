@@ -21,6 +21,7 @@ import { resolveQuest } from "./projections/quest";
 import { registerAllProjections } from "./projections/register";
 import { EventStore } from "./store";
 import { stateAsOf } from "./time-travel";
+import { judgeQuestTitle } from "./title-quality";
 
 registerAllProjections();
 
@@ -367,9 +368,12 @@ function runSagaCommand(args: string[], context: IntentContext): number {
     const source = values["as-of"]
       ? stateAsOf(context.database, values["as-of"])
       : context.database;
-    const where = values.all ? "" : "WHERE ended_at IS NULL";
     const rows = source
-      .query(`SELECT id, title, owner_kind, end_reason FROM sagas ${where} ORDER BY created_at`)
+      .query(
+        values.all
+          ? "SELECT id, title, owner_kind, end_reason FROM sagas ORDER BY created_at"
+          : "SELECT id, title, owner_kind, end_reason FROM sagas WHERE ended_at IS NULL ORDER BY created_at",
+      )
       .all() as {
       id: string;
       title: string;
@@ -1057,24 +1061,14 @@ function runQuestCommand(args: string[], context: IntentContext): number {
     const source = values["as-of"]
       ? stateAsOf(context.database, values["as-of"])
       : context.database;
-    const clauses: string[] = [];
-    if (!values.all) {
-      clauses.push("ended_at IS NULL");
-      clauses.push("merged_into IS NULL");
-      clauses.push("retracted_at IS NULL");
-    }
-    if (values.unconfirmed) clauses.push("confirmed = 0");
-    if (values.side) clauses.push("quests.branched_at IS NOT NULL");
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    // Flag filters go in as binds: one static SQL statement, no interpolated
+    // fragments. `--all` skips the live filter, `--unconfirmed` keeps only
+    // unconfirmed quests, `--side` only branched ones.
     const rows = source
       .query(
-        `SELECT id, title, state, confirmed, retracted_at, branched_at,
-                COALESCE(deviates_from_quest_id,
-                         (SELECT quest_id FROM stints WHERE stints.id = quests.deviates_from_stint_id))
-                  AS deviates_from
-           FROM quests ${where} ORDER BY created_at`,
+        "SELECT id, title, state, confirmed, retracted_at, branched_at, COALESCE(deviates_from_quest_id, (SELECT quest_id FROM stints WHERE stints.id = quests.deviates_from_stint_id)) AS deviates_from FROM quests WHERE (? = 1 OR (ended_at IS NULL AND merged_into IS NULL AND retracted_at IS NULL)) AND (? = 0 OR confirmed = 0) AND (? = 0 OR quests.branched_at IS NOT NULL) ORDER BY created_at",
       )
-      .all() as {
+      .all(values.all ? 1 : 0, values.unconfirmed ? 1 : 0, values.side ? 1 : 0) as {
       id: string;
       title: string;
       state: string;
@@ -1259,6 +1253,22 @@ function runQuestCommand(args: string[], context: IntentContext): number {
           .filter((part) => part.length > 0)
       : [];
 
+    // tempad-7b2: a new quest's title is judged against the open quests of the
+    // database -- the same query and the same pure detector the projection
+    // replays, so the recorded flag always agrees with this check. A duplicate
+    // never rejects the declaration; it only says the existing quest exists.
+    if (values.new) {
+      const verdict = judgeQuestTitle(context.database, values.new);
+      if (verdict.verdict === "duplicate" && verdict.duplicateOf) {
+        const duplicate = context.database
+          .query("SELECT title FROM quests WHERE id = ?")
+          .get(verdict.duplicateOf) as { title: string } | null;
+        context.stdout(
+          `tempad: a quest with this title exists: ${verdict.duplicateOf} "${duplicate?.title ?? values.new}"; declare it with --quest ${verdict.duplicateOf} or keep this one`,
+        );
+      }
+    }
+
     const result = declareQuest(store, context.database, {
       sessionId: values.session,
       parentSessionId: values.parent,
@@ -1299,17 +1309,11 @@ function runStintCommand(args: string[], context: IntentContext): number {
       options: { open: { type: "boolean", default: false }, quest: { type: "string" } },
       strict: true,
     });
-    const clauses: string[] = ["retracted_at IS NULL"];
-    const parameters: string[] = [];
-    if (values.open) clauses.push("closed_at IS NULL");
-    if (values.quest) {
-      clauses.push("quest_id = ?");
-      parameters.push(values.quest);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = context.database
-      .query(`SELECT id, outcome, quest_id, closed_at FROM stints ${where} ORDER BY opened_at`)
-      .all(...parameters) as {
+      .query(
+        "SELECT id, outcome, quest_id, closed_at FROM stints WHERE retracted_at IS NULL AND (? = 0 OR closed_at IS NULL) AND (? IS NULL OR quest_id = ?) ORDER BY opened_at",
+      )
+      .all(values.open ? 1 : 0, values.quest ?? null, values.quest ?? null) as {
       id: string;
       outcome: string;
       quest_id: string | null;
@@ -1335,20 +1339,16 @@ function runTraceCommand(args: string[], context: IntentContext): number {
       options: { since: { type: "string" }, stint: { type: "string" } },
       strict: true,
     });
-    const clauses: string[] = [];
-    const parameters: string[] = [];
-    if (values.since) {
-      clauses.push("started_at >= ?");
-      parameters.push(values.since);
-    }
-    if (values.stint) {
-      clauses.push("stint_id = ?");
-      parameters.push(values.stint);
-    }
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = context.database
-      .query(`SELECT id, stint_id, what, why, confidence FROM traces ${where} ORDER BY started_at`)
-      .all(...parameters) as {
+      .query(
+        "SELECT id, stint_id, what, why, confidence FROM traces WHERE (? IS NULL OR started_at >= ?) AND (? IS NULL OR stint_id = ?) ORDER BY started_at",
+      )
+      .all(
+        values.since ?? null,
+        values.since ?? null,
+        values.stint ?? null,
+        values.stint ?? null,
+      ) as {
       id: string;
       stint_id: string;
       what: string;

@@ -1,0 +1,12 @@
+-- Title-quality verdict for quests, and the hook's per-session nudge memory.
+-- tempad-7b2: quest declare --new flags a vague title or a duplicate of an
+-- open quest (src/intent/title-quality.ts). The verdict is derivable from
+-- events, so it lives in projection columns on quests, never in an event.
+-- A rebuild recomputes it. w5_runs.vague_nudged is the hook's per-session
+-- memory: the JSON array of quest ids the UserPromptSubmit line has already
+-- nudged this session, so the nudge appears once per session per quest.
+-- The columns are added by MIGRATION_STEPS[28] (src/db/database.ts), not here:
+-- reprojectQuests (step 24) replays quest events through a reducer that writes
+-- title_vague before a chain crossing 24 reaches this version, and that step
+-- already adds the quests columns when missing, so this step must tolerate
+-- finding them present.

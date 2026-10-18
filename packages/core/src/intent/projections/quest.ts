@@ -1,6 +1,13 @@
 import type { Database } from "bun:sqlite";
 import { resolveOwnerIdentity } from "../identity";
+import { judgeTitleQuality, openQuestTitles, type TitleVerdict } from "../title-quality";
 import type { Projection } from "./index";
+
+/** Columns the title-quality verdict lives in (see `title-quality.ts`). */
+function titleVerdictColumns(verdict: TitleVerdict): { flag: 0 | 1; reason: string | null } {
+  if (verdict.verdict === "ok") return { flag: 0, reason: null };
+  return { flag: 1, reason: verdict.reason };
+}
 
 export const questProjection: Projection = {
   name: "quests",
@@ -33,18 +40,26 @@ export const questProjection: Projection = {
       ended_at TEXT,
       end_reason TEXT,
       replaced_by TEXT,
-      retracted_at TEXT
+      retracted_at TEXT,
+      title_vague INTEGER NOT NULL DEFAULT 0,
+      title_vague_reason TEXT
     );`,
   apply(database, event) {
     const payload = event.payload;
     switch (event.kind) {
       case "quest.created": {
         const owner = resolveOwnerIdentity(database, payload.owner as { kind: string; id: string });
+        // Judged against the open quests as of this event -- a rebuild replays
+        // events in order, so a duplicate target created earlier is in the table
+        // and one ended later is not yet ended, reproducing the original
+        // verdict without storing it on the event.
+        const verdict = judgeTitleQuality(String(payload.title), openQuestTitles(database));
+        const vague = titleVerdictColumns(verdict);
         database
           .query(
             `INSERT OR REPLACE INTO quests
-              (id, owner_kind, owner_id, serves, title, outcome, done_condition, due, budget_minutes, commitment, confirmed, origin_kind, revision, state, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'started', ?)`,
+              (id, owner_kind, owner_id, serves, title, outcome, done_condition, due, budget_minutes, commitment, confirmed, origin_kind, revision, state, created_at, title_vague, title_vague_reason)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'started', ?, ?, ?)`,
           )
           .run(
             event.subject,
@@ -60,20 +75,43 @@ export const questProjection: Projection = {
             payload.confirmed === false ? 0 : 1,
             payload.origin_kind ? String(payload.origin_kind) : "inferred",
             event.at,
+            vague.flag,
+            vague.reason,
           );
         return;
       }
-      case "quest.reworded":
+      case "quest.reworded": {
+        // A reword is re-judged: an ok title clears the vague flag (the point
+        // of the nudge), and a reword into another vague or duplicate title
+        // records that instead. The quest itself is excluded from the
+        // duplicate comparison -- it is about to carry the new title.
+        if (payload.title !== undefined) {
+          const vague = titleVerdictColumns(
+            judgeTitleQuality(
+              String(payload.title),
+              openQuestTitles(database).filter((quest) => quest.id !== event.subject),
+            ),
+          );
+          database
+            .query(
+              "UPDATE quests SET title = ?, outcome = COALESCE(?, outcome), revision = revision + 1, title_vague = ?, title_vague_reason = ? WHERE id = ?",
+            )
+            .run(
+              String(payload.title),
+              payload.outcome !== undefined ? String(payload.outcome) : null,
+              vague.flag,
+              vague.reason,
+              event.subject,
+            );
+          return;
+        }
         database
           .query(
-            "UPDATE quests SET title = COALESCE(?, title), outcome = COALESCE(?, outcome), revision = revision + 1 WHERE id = ?",
+            "UPDATE quests SET outcome = COALESCE(?, outcome), revision = revision + 1 WHERE id = ?",
           )
-          .run(
-            payload.title !== undefined ? String(payload.title) : null,
-            payload.outcome !== undefined ? String(payload.outcome) : null,
-            event.subject,
-          );
+          .run(payload.outcome !== undefined ? String(payload.outcome) : null, event.subject);
         return;
+      }
       case "quest.ended":
         database
           .query("UPDATE quests SET ended_at = ?, end_reason = ?, replaced_by = ? WHERE id = ?")
