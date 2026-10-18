@@ -9,7 +9,13 @@ import { applyResult } from "./apply";
 import type { Classifier } from "./classifier";
 import { writeSessionNote } from "./jobs";
 import { closeIdleStints } from "./lifecycle";
-import { replaceStaleWindow } from "./stale";
+import {
+  declaredQuestIds,
+  isProtectedQuest,
+  type PlanTrace,
+  replaceStaleWindow,
+  resolveStaleWindows,
+} from "./stale";
 import { buildWindow } from "./window";
 
 registerAllProjections();
@@ -64,6 +70,23 @@ export interface BackfillResult {
   sessionsDeclared: number;
   /** Sessions classified this run whose `modeFor` was `"inferred"`. */
   sessionsInferred: number;
+}
+
+/**
+ * The mode `backfill` classifies a session in. Shared with `tempad scry`, whose
+ * pending count has to match what the command will actually run: a session in
+ * inferred mode has no declared rerun to make, so its stale windows are not
+ * pending in either.
+ */
+export function backfillSessionMode(
+  database: Database,
+  intentConfig: Pick<W5Config, "mode" | "inferenceFallback">,
+  sessionId: string,
+): "declared" | "inferred" {
+  return intentConfig.mode === "inferred" ||
+    (intentConfig.inferenceFallback && !hasAnyDeclaration(database, sessionId))
+    ? "inferred"
+    : "declared";
 }
 
 export interface SessionRow {
@@ -149,9 +172,14 @@ export interface PlannedWindow {
    * A declaration whose coverage reaches back over this window was recorded
    * after the window was last classified (`w5_stale_windows`, derived from
    * `quest.declared`): it ran without that quest and has to run again. Never set
-   * under `force`, whose caller resets what it reruns itself.
+   * under `force`, whose caller resets what it reruns itself. A window the
+   * declaration reaches but that cannot be replaced cleanly (work on a chosen
+   * quest, or a live trace crossing into a window that is not stale) is not
+   * stale: it keeps its coverage (`resolveStaleWindows`).
    */
   stale: boolean;
+  /** For a stale window, the live traces its replacement retracts. */
+  replaceTraceIds: string[];
 }
 
 /**
@@ -186,7 +214,7 @@ export function planBackfillWindows(
   const wanted = new Set(sessions.map((session) => session.id));
   const classified = new Map<string, string>();
   const stale = new Map<string, { from: string | null; through: string; markedAt: string }[]>();
-  const traces = new Map<string, { started_at: string; ended_at: string; recorded_at: string }[]>();
+  const traces = new Map<string, PlanTrace[]>();
   if (!options.force) {
     for (const row of (hasTable("w5_windows")
       ? database
@@ -221,22 +249,40 @@ export function planBackfillWindows(
       if (list) list.push(entry);
       else stale.set(row.session_id, [entry]);
     }
+    const declared = declaredQuestIds(database);
     for (const row of (hasTable("traces")
       ? database
           .query(
-            "SELECT session_id, started_at, ended_at, recorded_at FROM traces WHERE retracted_at IS NULL AND session_id IS NOT NULL",
+            `SELECT traces.id, traces.session_id, traces.started_at, traces.ended_at, traces.recorded_at,
+                    stints.quest_id AS quest_id, quests.confirmed AS confirmed,
+                    quests.origin_kind AS origin_kind
+               FROM traces
+               LEFT JOIN stints ON stints.id = traces.stint_id
+               LEFT JOIN quests ON quests.id = stints.quest_id AND quests.retracted_at IS NULL
+              WHERE traces.retracted_at IS NULL AND traces.session_id IS NOT NULL`,
           )
           .all()
       : []) as {
+      id: string;
       session_id: string;
       started_at: string;
       ended_at: string;
       recorded_at: string;
+      quest_id: string | null;
+      confirmed: number | null;
+      origin_kind: string | null;
     }[]) {
       if (!wanted.has(row.session_id)) continue;
+      const trace: PlanTrace = {
+        id: row.id,
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+        recorded_at: row.recorded_at,
+        protected: isProtectedQuest(row, declared),
+      };
       const list = traces.get(row.session_id);
-      if (list) list.push(row);
-      else traces.set(row.session_id, [row]);
+      if (list) list.push(trace);
+      else traces.set(row.session_id, [trace]);
     }
   }
 
@@ -252,6 +298,9 @@ export function planBackfillWindows(
       .filter((message) => options.to === undefined || message.ts < options.to);
     const sessionTraces = traces.get(session.id) ?? [];
     const chunks = chunkByWindow(rows, options.windowMinutes);
+    const sessionWindows: PlannedWindow[] = [];
+    const candidates: { stale: boolean; covered: boolean; startedAt: string; endedAt: string }[] =
+      [];
     for (const [index, chunk] of chunks.entries()) {
       const startedAt = chunk[0]?.ts ?? session.ended_at;
       const endedAt = chunk.at(-1)?.ts ?? session.ended_at;
@@ -268,26 +317,43 @@ export function planBackfillWindows(
             latest === undefined || latest < trace.recorded_at ? trace.recorded_at : latest,
           undefined,
         );
-      // A window is stale when a declaration recorded after it was classified
-      // covers it. The nested-trace rule does not keep it covered: those traces
-      // are what ran without the quest.
+      // A window is stale when it was classified and a declaration recorded after
+      // that covers it (one never classified is simply pending). The nested-trace
+      // rule does not keep it covered: those traces are what ran without the quest.
       const isStale = (stale.get(session.id) ?? []).some(
         (entry) =>
           startedAt < entry.through &&
           (entry.from === null || endedAt >= entry.from) &&
-          (classifiedAt === undefined || classifiedAt <= entry.markedAt),
+          classifiedAt !== undefined &&
+          classifiedAt <= entry.markedAt,
       );
-      planned.push({
+      candidates.push({
+        stale: isStale,
+        covered: classifiedAt !== undefined,
+        startedAt,
+        endedAt,
+      });
+      sessionWindows.push({
         sessionId: session.id,
         index,
         startedAt,
         endedAt,
         messages: chunk,
         previousWindowEnd: index > 0 ? (chunks[index - 1]?.at(-1)?.ts ?? null) : null,
-        stale: isStale,
-        covered: !isStale && classifiedAt !== undefined,
+        stale: false,
+        replaceTraceIds: [],
+        covered: false,
       });
     }
+    const decided = resolveStaleWindows(candidates, sessionTraces);
+    for (const [position, window] of sessionWindows.entries()) {
+      const decision = decided[position] as { stale: boolean; traceIds: string[] };
+      const candidate = candidates[position] as { covered: boolean };
+      window.stale = decision.stale;
+      window.replaceTraceIds = decision.traceIds;
+      window.covered = !decision.stale && candidate.covered;
+    }
+    planned.push(...sessionWindows);
   }
   return planned;
 }
@@ -344,11 +410,7 @@ export async function backfill(
   const modeFor = (sessionId: string): "declared" | "inferred" => {
     const cached = sessionModes.get(sessionId);
     if (cached !== undefined) return cached;
-    const mode: "declared" | "inferred" =
-      intentConfig.mode === "inferred" ||
-      (intentConfig.inferenceFallback && !hasAnyDeclaration(database, sessionId))
-        ? "inferred"
-        : "declared";
+    const mode = backfillSessionMode(database, intentConfig, sessionId);
     sessionModes.set(sessionId, mode);
     return mode;
   };
@@ -412,9 +474,9 @@ export async function backfill(
   // work that is about to be replaced.
   for (const window of pending) {
     if (!window.stale) continue;
-    const replaced = replaceStaleWindow(database, window);
+    const replaced = replaceStaleWindow(database, { traceIds: window.replaceTraceIds });
     options.log(
-      `backfill: replaced ${window.sessionId} window ${window.index} (${window.startedAt} to ${window.endedAt}): a declaration now covers it; retracted traces=${replaced.traces} stints=${replaced.stints} quests=${replaced.quests}, kept ${replaced.kept} on declared or confirmed quests`,
+      `backfill: replaced ${window.sessionId} window ${window.index} (${window.startedAt} to ${window.endedAt}): a declaration now covers it; retracted traces=${replaced.traces} stints=${replaced.stints} quests=${replaced.quests}, kept ${replaced.kept} on chosen quests`,
     );
   }
 

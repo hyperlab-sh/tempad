@@ -334,23 +334,11 @@ function resolveDeclaration(
   at: string,
   parentSessionId?: string,
 ): DeclaredQuest | null {
-  const rows = database
-    .query(
-      `SELECT payload FROM events
-        WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = ? AND at <= ?
-        ORDER BY at DESC, uid DESC, id DESC`,
-    )
-    .all(sessionId, at) as { payload: string }[];
-
-  const live = (questId: string) =>
-    database
-      .query("SELECT title, outcome FROM quests WHERE id = ? AND retracted_at IS NULL")
-      .get(questId) as { title: string; outcome: string | null } | null;
-
-  // Coverage first: the quest declared at `at`, even when its declaration is
-  // later than `at` (a declaration covers the session from its start) or an
-  // earlier one has been ended. The legacy "latest event" lookup below answers
-  // only when nothing covers `at`.
+  // The quest declared at `at`, resolved from coverage alone: a quest that was
+  // ended with `--done` is not the current one, a stretch before the first
+  // declaration is (a declaration covers the session from its start), and a
+  // stretch a `--since` left uncovered has none. Of several covering quests the
+  // one whose latest declaration is newest wins.
   const covering = coveredIntervals(database, { sessionId, at, scope, parentSessionId })
     .map((interval, index) => ({ interval, index }))
     .sort(
@@ -359,7 +347,9 @@ function resolveDeclaration(
         right.index - left.index,
     );
   for (const { interval } of covering) {
-    const quest = live(interval.questId);
+    const quest = database
+      .query("SELECT title, outcome FROM quests WHERE id = ? AND retracted_at IS NULL")
+      .get(interval.questId) as { title: string; outcome: string | null } | null;
     if (!quest) continue;
     return {
       questId: interval.questId,
@@ -368,37 +358,6 @@ function resolveDeclaration(
       plan: planAt(interval, at),
       scope,
       parentSessionId: scope === "subagent" ? (parentSessionId ?? null) : null,
-    };
-  }
-
-  for (const row of rows) {
-    const payload = JSON.parse(row.payload) as {
-      session_id: string;
-      quest_id?: string;
-      scope: string;
-      parent_session_id?: string;
-      plan: string[];
-    };
-    if (payload.scope !== scope) continue;
-    if (scope === "session" && payload.session_id !== sessionId) continue;
-    if (
-      scope === "subagent" &&
-      (payload.session_id !== sessionId || payload.parent_session_id !== parentSessionId)
-    ) {
-      continue;
-    }
-
-    const questId = payload.quest_id;
-    if (!questId) continue;
-    const quest = live(questId);
-    if (!quest) continue;
-    return {
-      questId,
-      title: quest.title,
-      outcome: quest.outcome,
-      plan: payload.plan,
-      scope: payload.scope as "session" | "subagent",
-      parentSessionId: payload.parent_session_id ?? null,
     };
   }
   return null;

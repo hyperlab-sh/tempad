@@ -1,6 +1,15 @@
 import { type DeclarationRow, foldCoverage } from "../declarations";
 import type { Projection } from "./index";
 
+export const STALE_WINDOWS_SQL = `
+    CREATE TABLE IF NOT EXISTS w5_stale_windows (
+      session_id TEXT NOT NULL,
+      from_ts TEXT,
+      through_ts TEXT NOT NULL,
+      marked_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS w5_stale_windows_session ON w5_stale_windows(session_id);`;
+
 /**
  * A `window.classified` event records that a backfill window (a chunk of a
  * Claude session's messages, see `chunkByWindow` in `src/w5/backfill.ts`)
@@ -30,13 +39,7 @@ export const windowProjection: Projection = {
       classified_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS w5_windows_session ON w5_windows(session_id, started_at, ended_at);
-    CREATE TABLE IF NOT EXISTS w5_stale_windows (
-      session_id TEXT NOT NULL,
-      from_ts TEXT,
-      through_ts TEXT NOT NULL,
-      marked_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS w5_stale_windows_session ON w5_stale_windows(session_id);`,
+    ${STALE_WINDOWS_SQL}`,
   apply(database, event) {
     if (event.kind === "quest.declared") {
       markStaleWindows(database, event);
@@ -52,7 +55,7 @@ export const windowProjection: Projection = {
   },
 };
 
-function markStaleWindows(
+export function markStaleWindows(
   database: Parameters<Projection["apply"]>[0],
   event: Parameters<Projection["apply"]>[1],
 ): void {

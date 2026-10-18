@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Config } from "../../src/config/env";
 import { openDatabase } from "../../src/db/database";
 import { openStint, recordTrace } from "../../src/intent/api";
@@ -7,6 +10,7 @@ import { declareQuest } from "../../src/intent/declarations";
 import { applyIncremental, ensureTables } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
+import { scry } from "../../src/scry/collect";
 import { backfill, planBackfillWindows, selectBackfillSessions } from "../../src/w5/backfill";
 import type { Classifier, ClassifierResult, ClassifierWindow } from "../../src/w5/classifier";
 import { replaceStaleWindow } from "../../src/w5/stale";
@@ -413,9 +417,7 @@ describe("replaceStaleWindow protects stints that already carry a quest", () => 
     const confirmed = stintWithTrace(fixture, "confirmed", "QC");
 
     const replaced = replaceStaleWindow(fixture.database, {
-      sessionId: "s1",
-      startedAt: "2026-09-04T14:00:00.000Z",
-      endedAt: "2026-09-04T14:10:00.000Z",
+      traceIds: [loose.trace, inferred.trace, declared.trace, confirmed.trace],
     });
 
     expect(replaced).toEqual({ traces: 2, stints: 2, quests: 1, kept: 2 });
@@ -436,7 +438,30 @@ describe("replaceStaleWindow protects stints that already carry a quest", () => 
     expect(retracted("quests", "QC")).toBe(false);
   });
 
-  test("touches only the one session's traces nested in the window, and leaves the session's other windows alone", async () => {
+  test("a quest a declaration names stays, whatever its provenance (--quest on an inferred quest)", () => {
+    const fixture = seed();
+    createQuest(fixture, "QI", { confirmed: false, originKind: "inferred" });
+    const named = stintWithTrace(fixture, "named", "QI");
+    declareQuest(fixture.store, fixture.database, {
+      sessionId: "s1",
+      questId: "QI",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T16:00:00.000Z",
+      heroId: "H1",
+    });
+
+    const replaced = replaceStaleWindow(fixture.database, { traceIds: [named.trace] });
+
+    expect(replaced).toEqual({ traces: 0, stints: 0, quests: 0, kept: 1 });
+    const row = fixture.database.query("SELECT retracted_at FROM quests WHERE id = 'QI'").get() as {
+      retracted_at: string | null;
+    };
+    expect(row.retracted_at).toBeNull();
+  });
+
+  test("retracts only the traces it is given and leaves the session's coverage rows", async () => {
     const fixture = seed();
     createQuest(fixture, "Q1");
     await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
@@ -450,12 +475,11 @@ describe("replaceStaleWindow protects stints that already carry a quest", () => 
       "2026-09-04T16:00:00.000Z",
       "2026-09-04T16:10:00.000Z",
     );
+    const target = fixture.database
+      .query("SELECT id FROM traces WHERE started_at = '2026-09-04T14:00:00.000Z'")
+      .get() as { id: string };
 
-    const replaced = replaceStaleWindow(fixture.database, {
-      sessionId: "s1",
-      startedAt: "2026-09-04T14:00:00.000Z",
-      endedAt: "2026-09-04T14:10:00.000Z",
-    });
+    const replaced = replaceStaleWindow(fixture.database, { traceIds: [target.id] });
 
     expect(replaced.traces).toBe(1);
     expect(
@@ -473,12 +497,413 @@ describe("replaceStaleWindow protects stints that already carry a quest", () => 
         }
       ).count,
     ).toBe(windowsBefore.count);
+    expect(replaceStaleWindow(fixture.database, { traceIds: [] })).toEqual({
+      traces: 0,
+      stints: 0,
+      quests: 0,
+      kept: 0,
+    });
+  });
+});
+
+// ---- what a rerun must never do: duplicate live work or retract a chosen quest ----
+
+/** A live trace on a stint, as the live runner or an earlier pass leaves one. */
+function liveTrace(
+  fixture: ReturnType<typeof seed>,
+  outcome: string,
+  quest: string | undefined,
+  startedAt: string,
+  endedAt: string,
+) {
+  const stint = openStint(fixture.store, fixture.database, {
+    quest,
+    outcome,
+    actor: "hook",
+    at: startedAt,
+  });
+  const trace = recordTrace(fixture.store, fixture.database, {
+    stint,
+    tool: "claude",
+    place: "p",
+    source: "claude",
+    startedAt,
+    endedAt,
+    who: "s",
+    what: outcome,
+    why: "ship",
+    where: "p",
+    how: "claude",
+    confidence: 0.9,
+    classifiedBy: "assistant",
+    actor: "hook",
+    sessionId: "s1",
+  });
+  return { stint, trace };
+}
+
+const liveTraceBounds = (database: ReturnType<typeof openDatabase>) =>
+  (
+    database
+      .query(
+        "SELECT started_at AS startedAt, ended_at AS endedAt FROM traces WHERE retracted_at IS NULL ORDER BY started_at, ended_at",
+      )
+      .all() as { startedAt: string; endedAt: string }[]
+  ).map((row) => `${row.startedAt.slice(11, 16)}-${row.endedAt.slice(11, 16)}`);
+
+const classifiedStarts = (classifier: RecordingClassifier) =>
+  classifier.windows.map((window) => window.messages[0]?.ts.slice(11, 16));
+
+describe("a stale window is never replaced on top of, or over, chosen work", () => {
+  test("a --quest declaration of an existing inferred, unconfirmed quest keeps the quest and its stint", async () => {
+    const fixture = seed();
+    createQuest(fixture, "QI", { confirmed: false, originKind: "inferred" });
+    const named = liveTrace(
+      fixture,
+      "named",
+      "QI",
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T14:10:00.000Z",
+    );
+    declareQuest(fixture.store, fixture.database, {
+      sessionId: "s1",
+      questId: "QI",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T16:00:00.000Z",
+      heroId: "H1",
+    });
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    const quest = fixture.database
+      .query("SELECT retracted_at AS retractedAt FROM quests WHERE id = 'QI'")
+      .get() as { retractedAt: string | null };
+    expect(quest.retractedAt).toBeNull();
+    const stint = fixture.database
+      .query("SELECT retracted_at AS retractedAt FROM stints WHERE id = ?")
+      .get(named.stint) as { retractedAt: string | null };
+    expect(stint.retractedAt).toBeNull();
+    // The window holding it is left as it is; only the unclassified 15:00 one runs.
+    expect(classifiedStarts(classifier)).toEqual(["15:00"]);
+    expect(logs.some((line) => line.includes("replaced"))).toBe(false);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "15:00-15:00"]);
+  });
+
+  test("a window holding only chosen work is not run again: no second trace with the same bounds", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    createQuest(fixture, "QD", { confirmed: false, originKind: "declared" });
+    liveTrace(fixture, "chosen", "QD", "2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z");
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifiedStarts(classifier)).toEqual(["15:00"]);
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "15:00-15:00"]);
+    expect(plan(fixture.database).map((window) => [window.covered, window.stale])).toEqual([
+      [true, false],
+      [true, false],
+    ]);
+  });
+
+  test("a window mixing chosen and replaceable work is left alone whole", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    createQuest(fixture, "QD", { confirmed: false, originKind: "declared" });
+    const chosen = liveTrace(
+      fixture,
+      "chosen",
+      "QD",
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T14:05:00.000Z",
+    );
+    const loose = liveTrace(
+      fixture,
+      "loose",
+      undefined,
+      "2026-09-04T14:05:00.000Z",
+      "2026-09-04T14:10:00.000Z",
+    );
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifiedStarts(classifier)).toEqual(["15:00"]);
+    expect(liveTraceBounds(fixture.database)).toEqual([
+      "14:00-14:05",
+      "14:05-14:10",
+      "15:00-15:00",
+    ]);
+    for (const id of [chosen.trace, loose.trace]) {
+      const row = fixture.database
+        .query("SELECT retracted_at AS retractedAt FROM traces WHERE id = ?")
+        .get(id) as { retractedAt: string | null };
+      expect(row.retractedAt).toBeNull();
+    }
+  });
+
+  test("a live trace crossing two windows is replaced with both, leaving no duplicate time", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
+    liveTrace(
+      fixture,
+      "crossing",
+      undefined,
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T15:00:00.000Z",
+    );
+    expect(liveTraceBounds(fixture.database)).toEqual([
+      "14:00-14:10",
+      "14:00-15:00",
+      "15:00-15:00",
+    ]);
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifiedStarts(classifier)).toEqual(["14:00", "15:00"]);
+    // The first pass's two traces and the crossing one are gone; each window has one.
+    expect(liveTraceBounds(fixture.database)).toEqual(["14:00-14:10", "15:00-15:00"]);
+  });
+
+  test("a crossing trace that reaches a window the declaration does not cover blocks the whole group", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
+    const crossing = liveTrace(
+      fixture,
+      "crossing",
+      undefined,
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T15:00:00.000Z",
+    );
+    // Covers the session only up to 14:30: the 15:00 window keeps its classification.
+    declareQuest(fixture.store, fixture.database, {
+      sessionId: "s1",
+      questId: "Q1",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-04T14:30:00.000Z",
+      heroId: "H1",
+    });
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+
+    await run(fixture.database, classifier, afterDeclaration(), logs);
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(logs.some((line) => line.includes("replaced"))).toBe(false);
+    expect(liveTraceBounds(fixture.database)).toEqual([
+      "14:00-14:10",
+      "14:00-15:00",
+      "15:00-15:00",
+    ]);
     expect(
-      replaceStaleWindow(fixture.database, {
-        sessionId: "other",
-        startedAt: "2026-09-04T14:00:00.000Z",
-        endedAt: "2026-09-04T14:10:00.000Z",
-      }),
-    ).toEqual({ traces: 0, stints: 0, quests: 0, kept: 0 });
+      (
+        fixture.database
+          .query("SELECT retracted_at AS retractedAt FROM traces WHERE id = ?")
+          .get(crossing.trace) as { retractedAt: string | null }
+      ).retractedAt,
+    ).toBeNull();
+  });
+
+  test("a trace whose end has no message to re-cover is not replaced", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
+    liveTrace(
+      fixture,
+      "past the end",
+      undefined,
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T15:30:00.000Z",
+    );
+    declareLate(fixture);
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    expect(classifier.windows).toHaveLength(0);
+    expect(liveTraceBounds(fixture.database)).toEqual([
+      "14:00-14:10",
+      "14:00-15:30",
+      "15:00-15:00",
+    ]);
+  });
+});
+
+describe("after --done a window is offered nothing", () => {
+  function addSession(database: ReturnType<typeof openDatabase>, id: string, times: string[]) {
+    database
+      .query(
+        `INSERT INTO claude_sessions
+          (id, claude_dir, project_dir, file_path, cwd, org, project, title, git_branch,
+           started_at, ended_at, message_count, tool_call_count, models, host_slug, file_mtime)
+         VALUES (?, '/c', 'p', ?, '/w/p', 'personal', 'p', 't', 'main', ?, ?, 3, 0, '[]', 'host', ?)`,
+      )
+      .run(
+        id,
+        `/c/p/${id}.jsonl`,
+        times[0] as string,
+        times.at(-1) as string,
+        times.at(-1) as string,
+      );
+    for (const [index, ts] of times.entries()) {
+      database
+        .query(
+          "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES (?, ?, ?, 'user', 0, 'work')",
+        )
+        .run(`${id}-${index}`, id, ts);
+    }
+  }
+
+  test("a session's later window carries no ended quest, and a subagent's neither (nor its parent's)", async () => {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    addSession(fixture.database, "sub", [
+      "2026-09-04T14:00:00.000Z",
+      "2026-09-04T14:10:00.000Z",
+      "2026-09-04T17:00:00.000Z",
+    ]);
+    fixture.database
+      .query(
+        "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES ('s1-late', 's1', '2026-09-04T17:00:00.000Z', 'user', 0, 'work')",
+      )
+      .run();
+    const declareAt = (
+      at: string,
+      extra: { done?: boolean; sessionId?: string; parentSessionId?: string },
+    ) =>
+      declareQuest(fixture.store, fixture.database, {
+        sessionId: extra.sessionId ?? "s1",
+        parentSessionId: extra.parentSessionId,
+        questId: "Q1",
+        plan: [],
+        scope: extra.parentSessionId ? "subagent" : "session",
+        declaredBy: "agent",
+        at,
+        heroId: "H1",
+        done: extra.done,
+      });
+    declareAt("2026-09-04T14:30:00.000Z", {});
+    declareAt("2026-09-04T16:00:00.000Z", { done: true });
+    const sub = { sessionId: "sub", parentSessionId: "s1" };
+    declareAt("2026-09-04T14:30:00.000Z", sub);
+    declareAt("2026-09-04T16:00:00.000Z", { ...sub, done: true });
+    const classifier = new RecordingClassifier();
+
+    await run(fixture.database, classifier, afterDeclaration());
+
+    const offered = (sessionId: string, firstTs: string) =>
+      classifier.windows.find(
+        (window) => window.sessionId === sessionId && window.messages[0]?.ts === firstTs,
+      );
+    // Inside the coverage the quest is offered; after the --done nothing is.
+    expect(offered("s1", "2026-09-04T14:00:00.000Z")?.activeQuests).toHaveLength(1);
+    expect(offered("s1", "2026-09-04T17:00:00.000Z")?.activeQuests).toEqual([]);
+    expect(offered("sub", "2026-09-04T14:00:00.000Z")?.activeQuests).toHaveLength(1);
+    expect(offered("sub", "2026-09-04T17:00:00.000Z")?.activeQuests).toEqual([]);
+    expect(offered("sub", "2026-09-04T17:00:00.000Z")?.parentActiveQuests).toEqual([]);
+  });
+});
+
+describe("scry and backfill agree on what is pending", () => {
+  async function pendingBoth(mode: "declared" | "inferred") {
+    const fixture = seed();
+    createQuest(fixture, "Q1");
+    await run(fixture.database, new RecordingClassifier(), FIRST_RUN);
+    declareLate(fixture);
+    const w5: W5Config = { ...config, mode };
+    const home = mkdtempSync(join(tmpdir(), "tempad-stale-scry-"));
+    const report = scry({
+      database: fixture.database,
+      home,
+      databasePath: join(home, "tempad.db"),
+      now: new Date(),
+      w5,
+      windowDays: 3650,
+      syncEnabled: false,
+      fast: true,
+      schedule: null,
+      priorChecks: [],
+      sizeBytes: 0,
+    });
+    const result = await backfill(fixture.database, homeConfig, w5, new RecordingClassifier(), {
+      days: 3650,
+      now: afterDeclaration(),
+      log: () => {},
+    });
+    return { scryPending: report.stats?.w5?.windowsPending, classified: result.windowsClassified };
+  }
+
+  test("a stale window counts as pending for both in declared mode", async () => {
+    expect(await pendingBoth("declared")).toEqual({ scryPending: 2, classified: 2 });
+  });
+
+  test("a stale window counts for neither in inferred mode", async () => {
+    expect(await pendingBoth("inferred")).toEqual({ scryPending: 0, classified: 0 });
+  });
+});
+
+describe("a database upgraded with declarations already in it", () => {
+  test("migration 26 derives the stale windows, so backfill repairs history without a rebuild", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-stale-upgrade-"));
+    const path = join(directory, "tempad.db");
+    const old = openDatabase(path, { upToVersion: 25 });
+    ensureTables(old);
+    const store = new EventStore(old);
+    applyIncremental(
+      old,
+      store.append({ actor: "hero", kind: "hero.created", subject: "H1", payload: { name: "S" } }),
+    );
+    old
+      .query(
+        `INSERT INTO claude_sessions
+          (id, claude_dir, project_dir, file_path, cwd, org, project, title, git_branch,
+           started_at, ended_at, message_count, tool_call_count, models, host_slug, file_mtime)
+         VALUES ('s1', '/c', 'p', '/c/p/s1.jsonl', '/w/p', 'personal', 'p', 't', 'main',
+                 '2026-09-04T14:00:00.000Z', '2026-09-04T15:00:00.000Z', 2, 0, '[]', 'host', '2026-09-04T15:00:00.000Z')`,
+      )
+      .run();
+    for (const [index, ts] of ["2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z"].entries()) {
+      old
+        .query(
+          "INSERT INTO claude_messages (uuid, session_id, ts, role, is_sidechain, text_preview) VALUES (?, 's1', ?, 'user', 0, 'work')",
+        )
+        .run(`m${index}`, ts);
+    }
+    const fixture = { database: old, store };
+    createQuest(fixture, "Q1");
+    liveTrace(fixture, "before", undefined, "2026-09-04T14:00:00.000Z", "2026-09-04T14:10:00.000Z");
+    declareLate(fixture);
+    // What a database from before this change holds: the events, no stale table.
+    old.exec("DROP TABLE w5_stale_windows");
+    old.close();
+
+    const upgraded = openDatabase(path);
+
+    expect(
+      (upgraded.query("PRAGMA user_version").get() as { user_version: number }).user_version,
+    ).toBe(26);
+    expect(
+      upgraded.query("SELECT session_id, from_ts, through_ts FROM w5_stale_windows").all(),
+    ).toEqual([{ session_id: "s1", from_ts: null, through_ts: "2026-09-04T16:00:00.000Z" }]);
+    const classifier = new RecordingClassifier();
+    const logs: string[] = [];
+    const result = await run(upgraded, classifier, afterDeclaration(), logs);
+    expect(result.windowsClassified).toBe(1);
+    expect(logs.some((line) => line.includes("replaced s1 window 0"))).toBe(true);
+    expect(classifier.windows[0]?.activeQuests).toHaveLength(1);
+    expect(liveTraceBounds(upgraded)).toEqual(["14:00-14:10"]);
+    upgraded.close();
   });
 });

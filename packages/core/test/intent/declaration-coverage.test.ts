@@ -296,6 +296,81 @@ describe("the other readers agree with the coverage rule", () => {
   });
 });
 
+describe("after the last --done, nothing is current", () => {
+  const AFTER = "2026-09-04T17:00:00.000Z";
+
+  test("a session's readers return nothing once its only quest was ended", () => {
+    const fixture = seed();
+    declare(fixture, "2026-09-04T15:00:00.000Z", "Q1");
+    declare(fixture, "2026-09-04T16:00:00.000Z", "Q1", { done: true });
+
+    expect(activeIds(fixture, AFTER)).toEqual([]);
+    expect(currentDeclaredQuest(fixture.database, { sessionId: "s1", at: AFTER })).toBeNull();
+    expect(sessionHasActiveDeclaration(fixture.database, { sessionId: "s1", at: AFTER })).toBe(
+      false,
+    );
+    // Inside the coverage it is still current.
+    expect(
+      currentDeclaredQuest(fixture.database, { sessionId: "s1", at: "2026-09-04T15:30:00.000Z" })
+        ?.questId,
+    ).toBe("Q1");
+  });
+
+  test("a subagent's readers return nothing once its quest was ended", () => {
+    const fixture = seed();
+    const sub = { sessionId: "sub", parentSessionId: "s1" };
+    declare(fixture, "2026-09-04T15:00:00.000Z", "Q2", sub);
+    declare(fixture, "2026-09-04T16:00:00.000Z", "Q2", { ...sub, done: true });
+
+    expect(
+      currentDeclaredQuestForSubagent(fixture.database, {
+        sessionId: "sub",
+        parentSessionId: "s1",
+        at: AFTER,
+      }),
+    ).toBeNull();
+    expect(sessionHasActiveDeclaration(fixture.database, { sessionId: "sub", at: AFTER })).toBe(
+      false,
+    );
+    expect(
+      activeDeclaredQuests(fixture.database, {
+        sessionId: "sub",
+        at: AFTER,
+        scope: "subagent",
+        parentSessionId: "s1",
+      }),
+    ).toEqual([]);
+  });
+
+  test("a stretch a --since left uncovered has no current quest, for a session and a subagent", () => {
+    const fixture = seed();
+    declare(fixture, "2026-09-04T16:00:00.000Z", "Q1", { since: "2026-09-04T15:30:00.000Z" });
+    const sub = { sessionId: "sub", parentSessionId: "s1" };
+    declare(fixture, "2026-09-04T16:00:00.000Z", "Q2", {
+      ...sub,
+      since: "2026-09-04T15:30:00.000Z",
+    });
+    const gap = "2026-09-04T15:00:00.000Z";
+
+    expect(currentDeclaredQuest(fixture.database, { sessionId: "s1", at: gap })).toBeNull();
+    expect(sessionHasActiveDeclaration(fixture.database, { sessionId: "s1", at: gap })).toBe(false);
+    expect(
+      currentDeclaredQuestForSubagent(fixture.database, {
+        sessionId: "sub",
+        parentSessionId: "s1",
+        at: gap,
+      }),
+    ).toBeNull();
+    expect(sessionHasActiveDeclaration(fixture.database, { sessionId: "sub", at: gap })).toBe(
+      false,
+    );
+    expect(
+      currentDeclaredQuest(fixture.database, { sessionId: "s1", at: "2026-09-04T15:45:00.000Z" })
+        ?.questId,
+    ).toBe("Q1");
+  });
+});
+
 describe("quest declare --since", () => {
   function harness() {
     const fixture = seed();
