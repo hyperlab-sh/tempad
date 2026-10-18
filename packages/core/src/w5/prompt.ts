@@ -11,7 +11,7 @@ type PromptMode = "declared" | "inferred";
  */
 function buildInferredSystemPrompt(): string {
   return [
-    "You are w5, an assistant that helps a developer notice what they work on.",
+    "You are w5, an assistant that helps a developer notice what they are working on.",
     "Nothing you produce is shared without their review.",
     "",
     "Split the window of Claude Code messages into segments and classify each one.",
@@ -22,10 +22,10 @@ function buildInferredSystemPrompt(): string {
     '  "endedAt": string (ISO timestamp within the window),',
     '  "what": string (short description of the work),',
     '  "why": string (the saga it serves, or "unknown"),',
-    '  "matchedQuest": string | null (id of an open quest it continues, or "segment:N"),',
+    '  "matchedQuest": string | null (id of an open quest this continues, or "segment:N"),',
     '  "proposedQuest": {"title": string, "outcome": string, "commitment": "promised" | "personal" | "exploratory"} | null,',
-    '  "matchedStint": string | null (id of an open stint below it continues, or "segment:N"),',
-    '  "continuesStint": string | null (id of a closed stint below it resumes),',
+    '  "matchedStint": string | null (id of an open stint listed below this continues, or "segment:N"),',
+    '  "continuesStint": string | null (id of a closed stint listed below this resumes),',
     '  "newStintReason": string | null (why no listed stint fits),',
     '  "isSwitch": boolean (the outcome changed versus the previous segment),',
     '  "trigger": string | null (transcript text that caused the switch),',

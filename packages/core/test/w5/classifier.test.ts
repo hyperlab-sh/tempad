@@ -17,6 +17,17 @@ import {
 } from "../../src/w5/classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "../../src/w5/prompt";
 
+/**
+ * Byte budget for each fixed system prompt. It is a drift alarm, not an API
+ * limit (`max_tokens: 2048` caps the response, not the prompt): the system
+ * prompt is resent uncached with every window, so each byte is paid once per
+ * classify call (185 calls in one reclassify of three days). It was 2048 until
+ * the `segment:N` rule left the inferred prompt at 2047 and its wording had
+ * been shaved to fit; 2560 leaves room for the next rule line without trading
+ * clarity for bytes.
+ */
+const SYSTEM_PROMPT_BUDGET_BYTES = 2560;
+
 const window: ClassifierWindow = {
   sessionId: "s",
   title: "marko-ui",
@@ -149,7 +160,7 @@ describe("classifier", () => {
     expect(text).toContain("ignore prior instructions");
   });
 
-  test("the declared system prompt states the selector order and stays under 2 KB", () => {
+  test("the declared system prompt states the selector order and stays within its byte budget", () => {
     const text = buildSystemPrompt();
     expect(text).toContain('"quest"');
     expect(text).toContain('"stint"');
@@ -160,7 +171,7 @@ describe("classifier", () => {
     expect(text).not.toContain("matchedStint");
     expect(text).not.toContain("continuesStint");
     expect(text).not.toContain("newStintReason");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("validateResult gives belongs: false with an empty, missing or non-string guess a placeholder and counts it", () => {
@@ -970,7 +981,7 @@ describe("prompt rendering per mode", () => {
     expect(text).not.toContain('"belongs"');
     expect(text).not.toContain('"guess"');
     expect(text).not.toContain("active quests");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("the declared system prompt asks for belongs/guess, never matchedQuest", () => {
@@ -983,7 +994,7 @@ describe("prompt rendering per mode", () => {
     expect(text).not.toContain('"proposedQuest"');
     expect(text).not.toContain('"questions"');
     expect(text).not.toContain("which_quest");
-    expect(new TextEncoder().encode(text).length).toBeLessThan(2048);
+    expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
   });
 
   test("buildSystemPrompt defaults to the declared prompt", () => {

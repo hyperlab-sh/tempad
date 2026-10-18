@@ -254,22 +254,20 @@ describe("applyResult", () => {
     // With the bug (comparing against the static window.previousTrace = A1/Q1),
     // only one branch would be recorded because segment 3's questId (Check email)
     // differs from A1's quest (Q1) too, but the branch's deviates_from would
-    // wrongly point at A1 instead of the stint segment 2 landed on.
+    // wrongly point at A1 instead of the stint opened for segment 1/2.
     expect(summary.branches).toBe(2);
 
-    // Segment 2 did not switch, so it stays on the stint segment 1 opened.
-    const astryxStint = database
-      .query("SELECT id FROM stints WHERE outcome = 'compare Astryx'")
+    // Segment 2 explains why it is a stint of its own and names no quest, so
+    // the same-outcome rule leaves it alone (an explicit reason is overridden
+    // only when the quest really matches).
+    const secondStint = database
+      .query("SELECT id FROM stints WHERE outcome = 'read Astryx docs'")
       .get() as { id: string };
-    const docsTrace = database
-      .query("SELECT stint_id FROM traces WHERE what = 'read Astryx docs'")
-      .get() as { stint_id: string };
-    expect(docsTrace.stint_id).toBe(astryxStint.id);
     const emailQuest = database
       .query("SELECT id, deviates_from_stint_id FROM quests WHERE title = 'Check email'")
       .get() as { id: string; deviates_from_stint_id: string };
 
-    expect(emailQuest.deviates_from_stint_id).toBe(astryxStint.id);
+    expect(emailQuest.deviates_from_stint_id).toBe(secondStint.id);
   });
 
   test("askingEnabled false records no question row", () => {
@@ -1796,11 +1794,14 @@ describe("segments of one inference window reach what earlier segments opened", 
     const database = openDatabase(":memory:");
     const { store } = seed(database);
 
+    // Segments 2 to 4 gave no reason of their own (validateResult defaulted
+    // it): the model had no id to name, so they continue segment 1's work.
+    const defaulted = { newStintReason: DEFAULT_NEW_STINT_REASON };
     const { summary } = run(database, store, [
       segmentAt(1, { proposedQuest: proposal }),
-      segmentAt(2),
-      segmentAt(3),
-      segmentAt(4),
+      segmentAt(2, defaulted),
+      segmentAt(3, defaulted),
+      segmentAt(4, defaulted),
     ]);
 
     const stints = sessionStints(database);
@@ -2065,6 +2066,300 @@ describe("segments of one inference window reach what earlier segments opened", 
       .query("SELECT COUNT(*) as count FROM traces WHERE stint_id = 'A1'")
       .get() as { count: number };
     expect(onA1.count).toBe(3);
+  });
+
+  /** Adds an open quest Q2 next to the seed's Q1 and offers both. */
+  function offerTwoQuests(database: ReturnType<typeof openDatabase>): ClassifierWindow {
+    database
+      .query(
+        "INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at) SELECT 'Q2', 'hero', owner_id, 'Other', 'o', 1, 1, 'started', created_at FROM quests WHERE id = 'Q1'",
+      )
+      .run();
+    return {
+      ...freshWindow,
+      openQuests: [
+        ...(freshWindow.openQuests ?? []),
+        { id: "Q2", title: "Other", outcome: "o", lastStintAt: null },
+      ],
+    };
+  }
+
+  test("a quest id in matchedStint lands on the stint an earlier segment opened for that quest", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    // Review r1: the dominant #75 shape (236 of 345 unknown ids). Segment 1
+    // opened a stint of Q1 that no window list holds, so #75's repair could
+    // not find it and segment 2 opened a second stint of Q1.
+    const { summary, logs } = run(
+      database,
+      store,
+      [
+        segmentAt(1, { matchedQuest: "Q1" }),
+        segmentAt(2, { matchedStint: "Q1", newStintReason: null }),
+      ],
+      offerTwoQuests(database),
+    );
+
+    expect(sessionStints(database)).toEqual([
+      { id: expect.any(String), questId: "Q1", continues: null, traces: 2 },
+    ]);
+    expect(summary.stintsOpened).toBe(1);
+    expect(summary.selectorRepaired).toBe(1);
+    expect(summary.sameWindowReuse).toBe(1);
+    expect(summary.unknownStintIds).toBe(0);
+    expect(
+      logs.some((line) => line.includes("stint selector named quest Q1, on segment 1's stint")),
+    ).toBe(true);
+    const confidence = database
+      .query("SELECT confidence FROM traces WHERE what = 'round 2'")
+      .get() as { confidence: number };
+    expect(confidence.confidence).toBeLessThanOrEqual(0.5);
+  });
+
+  test("a quest id in a stint slot prefers this window's stint over a closed one of the quest in recentStints", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+    database
+      .query(
+        "INSERT INTO stints (id, quest_id, outcome, opened_at, closed_at, close_reason, revision) VALUES ('OLD', 'Q1', 'earlier contracts', '2026-10-03T00:00:00.000Z', '2026-10-03T01:00:00.000Z', 'idle', 1)",
+      )
+      .run();
+    const candidates: ClassifierWindow = {
+      ...offerTwoQuests(database),
+      recentStints: [
+        {
+          stintId: "OLD",
+          what: "earlier contracts",
+          why: "x",
+          questId: "Q1",
+          questTitle: "Ship marko-ui",
+          openedAt: "2026-10-03T00:00:00.000Z",
+          lastTraceEndedAt: "2026-10-03T01:00:00.000Z",
+          closedAt: "2026-10-03T01:00:00.000Z",
+          closeReason: "idle",
+        },
+      ],
+    };
+
+    // Before: segment 2 continued OLD (a link to another session's closed
+    // stint) while segment 1's stint of Q1 was still open in this window.
+    run(
+      database,
+      store,
+      [
+        segmentAt(1, { matchedQuest: "Q1" }),
+        segmentAt(2, { matchedStint: "Q1", newStintReason: null }),
+      ],
+      candidates,
+    );
+
+    expect(sessionStints(database)).toEqual([
+      { id: expect.any(String), questId: "Q1", continues: null, traces: 2 },
+    ]);
+  });
+
+  test("a quest id in continuesStint lands on the same window's stint too", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    const { summary } = run(
+      database,
+      store,
+      [
+        segmentAt(1, { matchedQuest: "Q1" }),
+        segmentAt(2, { matchedQuest: "Q2" }),
+        segmentAt(3, { continuesStint: "Q1", newStintReason: null, isSwitch: true }),
+      ],
+      offerTwoQuests(database),
+    );
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      ["Q1", 2],
+      ["Q2", 1],
+    ]);
+    expect(summary.selectorRepaired).toBe(1);
+  });
+
+  test("a quest id in a stint slot that contradicts matchedQuest is left to #75", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    // matchedQuest wins over a stint slot naming another quest, as in #75:
+    // the slot is dropped, and segment 2 opens a stint of Q2.
+    run(
+      database,
+      store,
+      [
+        segmentAt(1, { matchedQuest: "Q1" }),
+        segmentAt(2, { matchedStint: "Q1", matchedQuest: "Q2", newStintReason: null }),
+      ],
+      offerTwoQuests(database),
+    );
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      ["Q1", 1],
+      ["Q2", 1],
+    ]);
+  });
+
+  test("an explicit newStintReason is kept when neither segment has a quest", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    // Review r1: isSwitch false contradicts the reason, but with no quest on
+    // either side nothing says the two are one outcome, so the model's own
+    // judgement stands.
+    const { summary } = run(database, store, [
+      segmentAt(1, { what: "fix login bug" }),
+      segmentAt(2, {
+        what: "write release notes",
+        newStintReason: "different deliverable: release notes",
+      }),
+    ]);
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      [null, 1],
+      [null, 1],
+    ]);
+    expect(summary.sameWindowReuse).toBe(0);
+  });
+
+  test("an explicit newStintReason is kept when only the previous segment has a quest", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    const { summary } = run(database, store, [
+      segmentAt(1, { matchedQuest: "Q1" }),
+      segmentAt(2, { newStintReason: "a different deliverable" }),
+    ]);
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      ["Q1", 1],
+      [null, 1],
+    ]);
+    expect(summary.sameWindowReuse).toBe(0);
+  });
+
+  test("an explicit newStintReason on the previous stint's quest is discarded, and the log keeps it", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    const { logs } = run(database, store, [
+      segmentAt(1, { matchedQuest: "Q1" }),
+      segmentAt(2, { matchedQuest: "Q1", newStintReason: "part of the same brief" }),
+    ]);
+
+    expect(sessionStints(database)).toHaveLength(1);
+    expect(
+      logs.some((line) =>
+        line.includes(
+          'same outcome as segment 1, discarded newStintReason "part of the same brief"',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  test("a defaulted newStintReason with no quest on either side follows the previous stint", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    const { summary, logs } = run(database, store, [
+      segmentAt(1),
+      segmentAt(2, { newStintReason: DEFAULT_NEW_STINT_REASON }),
+    ]);
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      [null, 2],
+    ]);
+    expect(summary.sameWindowReuse).toBe(1);
+    const line = logs.find((entry) => entry.includes("same outcome as segment 1"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("discarded");
+  });
+
+  test("a proposed quest with segment 1's title but another outcome is a quest of its own", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    // Review r1: deduping by title alone folded seg 2 into "Bug fixes / fix
+    // login" and dropped its outcome and its promised commitment.
+    const { summary } = run(database, store, [
+      segmentAt(1, {
+        proposedQuest: { title: "Bug fixes", outcome: "fix login", commitment: "personal" },
+      }),
+      segmentAt(2, {
+        proposedQuest: {
+          title: "bug  FIXES",
+          outcome: "fix billing for client X",
+          commitment: "promised",
+        },
+        isSwitch: true,
+        trigger: "client X reported billing",
+      }),
+    ]);
+
+    const quests = database
+      .query(
+        "SELECT title, outcome, commitment FROM quests WHERE id != 'Q1' ORDER BY created_at, id",
+      )
+      .all();
+    expect(quests).toEqual([
+      { title: "Bug fixes", outcome: "fix login", commitment: "personal" },
+      { title: "bug  FIXES", outcome: "fix billing for client X", commitment: "promised" },
+    ]);
+    expect(summary.questsProposed).toBe(2);
+    const stints = sessionStints(database);
+    expect(stints).toHaveLength(2);
+    expect(stints[0]?.questId).not.toBe(stints[1]?.questId as string);
+  });
+
+  test("not switching onto a quest-less stint with a quest the window never offered opens a stint for it", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+    database
+      .query(
+        "INSERT INTO quests (id, owner_kind, owner_id, title, outcome, confirmed, revision, state, created_at) SELECT 'QX', 'hero', owner_id, 'Not offered', 'x', 1, 1, 'started', created_at FROM quests WHERE id = 'Q1'",
+      )
+      .run();
+
+    // questAgrees refuses: segment 1's stint may take a quest, but only one
+    // the window offered or created. Reusing it anyway turned QX into a quest
+    // conflict on the reused stint, which dropped QX silently.
+    const { summary } = run(database, store, [
+      segmentAt(1),
+      segmentAt(2, { matchedQuest: "QX", newStintReason: DEFAULT_NEW_STINT_REASON }),
+    ]);
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      [null, 1],
+      ["QX", 1],
+    ]);
+    expect(summary.sameWindowReuse).toBe(0);
+    expect(summary.doubts).toBe(0);
+  });
+
+  test("a quest attached to an earlier segment's stint is what a later segment:N names", () => {
+    const database = openDatabase(":memory:");
+    const { store } = seed(database);
+
+    // Segment 2 gives segment 1's quest-less stint Q1; segment 3, switching to
+    // a stint of its own, names segment 1's quest and must get Q1, not null.
+    const { summary } = run(database, store, [
+      segmentAt(1),
+      segmentAt(2, { matchedStint: "segment:1", matchedQuest: "Q1", newStintReason: null }),
+      segmentAt(3, {
+        matchedQuest: "segment:1",
+        newStintReason: "a second deliverable of the brief",
+        isSwitch: true,
+      }),
+    ]);
+
+    expect(sessionStints(database).map((stint) => [stint.questId, stint.traces])).toEqual([
+      ["Q1", 2],
+      ["Q1", 1],
+    ]);
+    expect(summary.questAttachedOnMatched).toBe(1);
   });
 
   test("declared mode is untouched: no segment reference is read", () => {

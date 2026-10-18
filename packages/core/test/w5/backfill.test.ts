@@ -1118,9 +1118,27 @@ describe("backfill of a window the classifier splits into several segments", () 
     ...overrides,
   });
 
-  async function run(raw: (window: ClassifierWindow) => unknown) {
+  async function run(raw: (window: ClassifierWindow) => unknown, options = { seedQuest: false }) {
     const database = openDatabase(":memory:");
     seedHero(database);
+    if (options.seedQuest) {
+      applyIncremental(
+        database,
+        new EventStore(database).append({
+          actor: "hook",
+          kind: "quest.created",
+          subject: "Q1",
+          payload: {
+            owner: { kind: "hero", id: "H1" },
+            title: "Implement tag contracts",
+            outcome: "contracts validated",
+            commitment: "promised",
+            confirmed: true,
+          },
+          at: "2026-10-01T00:00:00.000Z",
+        }),
+      );
+    }
     seedSession(database, {
       id: "e854515d",
       endedAt: "2026-10-04T01:21:55.550Z",
@@ -1143,16 +1161,23 @@ describe("backfill of a window the classifier splits into several segments", () 
   }
 
   test("segments that name the same quest without switching land on one stint", async () => {
-    const { result, stints } = await run((window) => {
-      const quest = window.openQuests?.[0]?.id ?? null;
-      return {
-        segments: [1, 2, 3, 4].map((position) => round(position, { matchedQuest: quest })),
-        sessionNote: null,
-      };
-    });
+    // The c1 response: every segment names the session's quest and explains in
+    // newStintReason that no separate stint is needed. The quest matches, so
+    // that reason is discarded (and logged) in favour of segment 1's stint.
+    const { result, stints } = await run(
+      (window) => {
+        const quest = window.openQuests?.[0]?.id ?? null;
+        return {
+          segments: [1, 2, 3, 4].map((position) => round(position, { matchedQuest: quest })),
+          sessionNote: null,
+        };
+      },
+      { seedQuest: true },
+    );
 
     expect(result.sessionsInferred).toBe(1);
     expect(stints).toHaveLength(1);
+    expect(stints[0]?.questId).toBe("Q1");
     expect(stints[0]?.traces).toBe(4);
     expect(result.sameWindowReuse).toBe(3);
   });
@@ -1169,7 +1194,7 @@ describe("backfill of a window the classifier splits into several segments", () 
         }),
         round(2, { matchedStint: "segment:1", matchedQuest: "segment:1", newStintReason: null }),
         round(3, { isSwitch: true, matchedQuest: "segment:1", newStintReason: "a second PR" }),
-        round(4, {}),
+        round(4, { newStintReason: null }),
       ],
       sessionNote: null,
     }));

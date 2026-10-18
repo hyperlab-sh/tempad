@@ -420,8 +420,22 @@ function normalizeInferredSelectors(
 /** Where each earlier segment of this window landed, and the quests it proposed. */
 interface WindowLedger {
   landed: { stintId: string; questId: string | null }[];
-  /** Quests this window created from `proposedQuest`, by normalized title. */
+  /** Quests this window created from `proposedQuest`, by `proposalKey`. */
   proposedQuests: Map<string, string>;
+}
+
+/**
+ * Two proposals are one quest when both the title and the outcome match: a
+ * generic title ("Bug fixes") proposed twice for different outcomes is two quests.
+ */
+function proposalKey(proposed: { title: string; outcome: string }): string {
+  return `${normalizeOutcome(proposed.title)}\n${normalizeOutcome(proposed.outcome)}`;
+}
+
+/** Whether a stint slot's reason is the model's own, not the one `validateResult` defaulted. */
+function explicitReason(segment: ClassifierSegment): string | null {
+  const reason = segment.newStintReason ?? null;
+  return reason === null || reason === DEFAULT_NEW_STINT_REASON ? null : reason;
 }
 
 /**
@@ -440,14 +454,23 @@ interface WindowLedger {
  *   in a stint slot, and that stint's quest in `matchedQuest`; the rest of the
  *   path then treats it like any listed id (open through the segment's end is
  *   reused, closed is continued).
- * - a `proposedQuest` whose title an earlier segment of this window already
- *   proposed becomes that quest in `matchedQuest`, not a second quest.
+ * - a quest id in a stint slot (#75's commonest mix-up) that an earlier segment
+ *   of this window landed on becomes the stint that segment landed on (the
+ *   latest one), unless `matchedQuest` names a different quest. Left to
+ *   `normalizeInferredSelectors`, it would resolve against the window's lists
+ *   only, which hold no stint this window opened, and open a second stint of
+ *   the quest or continue an older one of another session.
+ * - a `proposedQuest` whose title and outcome an earlier segment of this window
+ *   already proposed becomes that quest in `matchedQuest`, not a second quest.
  * - a segment with `isSwitch: false` ("the outcome did not change versus the
  *   previous segment") that names no stint stays on the previous segment's stint,
- *   since a stint is one outcome; only when its quest agrees: the same quest, no
- *   opinion, or a quest for a stint that has none and that this segment may
- *   attach one to. A different quest is a different outcome, whatever `isSwitch`
- *   says, and opens its own stint as before.
+ *   since a stint is one outcome. With the defaulted reason (the model named no
+ *   selector at all) its quest has to agree: the same quest, no opinion, or a
+ *   quest for a stint that has none and that this segment may attach one to.
+ *   An explicit `newStintReason` is the model's own judgement and is overridden
+ *   only when `matchedQuest` is the stint's own quest (the e854515d shape); the
+ *   discarded reason is logged. A different quest is a different outcome,
+ *   whatever `isSwitch` says, and opens its own stint as before.
  *
  * None of this reaches beyond the window: every id it hands on was resolved by
  * an earlier segment of the same window, so #75's guard against crossed and
@@ -458,8 +481,9 @@ function resolveWithinWindow(
   index: number,
   ledger: WindowLedger,
   attachable: AttachTargets,
-): { segment: ClassifierSegment; reuses: string[] } {
+): { segment: ClassifierSegment; reuses: string[]; repaired: boolean } {
   const reuses: string[] = [];
+  let repaired = false;
   // `undefined` when the value is no reference at all. A reference past the
   // segments applied so far names nothing: `validateResult` never lets one
   // through, but a hand-built result could.
@@ -484,6 +508,31 @@ function resolveWithinWindow(
     continuesStint: stintSlot(segment.continuesStint),
     matchedQuest: questSlot(segment.matchedQuest),
   };
+
+  // Only ids the model was offered can be a quest here (it never sees the id of
+  // a quest this window creates), so a hit is one an earlier segment matched.
+  const namedQuest = [rewritten.matchedStint, rewritten.continuesStint].find(
+    (id): id is string =>
+      id !== null && id !== undefined && ledger.landed.some((landed) => landed.questId === id),
+  );
+  if (
+    namedQuest !== undefined &&
+    (rewritten.matchedQuest === null || rewritten.matchedQuest === namedQuest)
+  ) {
+    let position = ledger.landed.length - 1;
+    while (ledger.landed[position]?.questId !== namedQuest) position -= 1;
+    rewritten = {
+      ...rewritten,
+      matchedStint: ledger.landed[position]?.stintId ?? null,
+      continuesStint: null,
+      matchedQuest: namedQuest,
+      newStintReason: null,
+      confidence: Math.min(rewritten.confidence, REPAIRED_CONFIDENCE_CAP),
+    };
+    reuses.push(`stint selector named quest ${namedQuest}, on segment ${position + 1}'s stint`);
+    repaired = true;
+  }
+
   if (
     rewritten.matchedStint === null &&
     rewritten.continuesStint === null &&
@@ -494,25 +543,32 @@ function resolveWithinWindow(
 
   const proposed = rewritten.proposedQuest ?? null;
   const proposedBefore =
-    proposed === null ? undefined : ledger.proposedQuests.get(normalizeOutcome(proposed.title));
+    proposed === null ? undefined : ledger.proposedQuests.get(proposalKey(proposed));
   if (rewritten.matchedQuest === null && proposedBefore !== undefined) {
     rewritten = { ...rewritten, matchedQuest: proposedBefore, proposedQuest: null };
     reuses.push(`proposed quest ${proposedBefore} again`);
   }
 
   const previous = ledger.landed[index - 1];
+  const reason = explicitReason(rewritten);
   if (
     previous !== undefined &&
     !rewritten.isSwitch &&
     rewritten.matchedStint === null &&
     rewritten.continuesStint === null &&
-    questAgrees(rewritten, previous, attachable)
+    (reason === null
+      ? questAgrees(rewritten, previous, attachable)
+      : previous.questId !== null && rewritten.matchedQuest === previous.questId)
   ) {
     rewritten = { ...rewritten, matchedStint: previous.stintId, newStintReason: null };
-    reuses.push(`same outcome as segment ${index}`);
+    reuses.push(
+      reason === null
+        ? `same outcome as segment ${index}`
+        : `same outcome as segment ${index}, discarded newStintReason ${JSON.stringify(reason)}`,
+    );
   }
 
-  return { segment: reuses.length === 0 ? segment : rewritten, reuses };
+  return { segment: reuses.length === 0 ? segment : rewritten, reuses, repaired };
 }
 
 /** Whether a segment may land on `stint` without disputing or taking its quest. */
@@ -930,7 +986,7 @@ export function applyResult(
         );
       }
       const normalized = normalizeInferredSelectors(window, within.segment);
-      if (normalized.repairs.length > 0) summary.selectorRepaired += 1;
+      if (within.repaired || normalized.repairs.length > 0) summary.selectorRepaired += 1;
       for (const repair of normalized.repairs) {
         options.log(`w5 stint selector repaired: session ${window.sessionId}, ${repair}`);
       }
@@ -972,8 +1028,8 @@ export function applyResult(
       if (stintOpened) attachableStintIds.add(stintId);
       if (questCreated && questId !== null) {
         attachableQuestIds.add(questId);
-        const title = segment.proposedQuest?.title;
-        if (title !== undefined) ledger.proposedQuests.set(normalizeOutcome(title), questId);
+        const proposed = segment.proposedQuest ?? null;
+        if (proposed !== null) ledger.proposedQuests.set(proposalKey(proposed), questId);
       }
       // A quest attached now reaches every segment that landed on the stint.
       for (const landed of ledger.landed) {
