@@ -5,6 +5,7 @@ import { normalizeOffsetTimestamp } from "../collect/github/log";
 import { IDENTITY_ALIASES_SQL } from "../intent/identity";
 import { ulidAfter } from "../intent/ids";
 import { questProjection } from "../intent/projections/quest";
+import { markStaleWindows, STALE_WINDOWS_SQL } from "../intent/projections/window";
 import { EventStore } from "../intent/store";
 import { ensureMirrorTriggers, reconcileMirrorTriggers } from "../sync/triggers";
 import { loadMigrations, type MigrationFile } from "./migration-files";
@@ -368,6 +369,25 @@ function reprojectQuests(database: Database): void {
 }
 
 /**
+ * Fills `w5_stale_windows` from the declarations already in the log, as the
+ * TypeScript half of migration 0026 (`MIGRATION_STEPS`). The table is a
+ * projection of `quest.declared` events (`markStaleWindows`, the window
+ * projection's own reducer), and a projection table starts empty, so without
+ * this an upgraded database would not know which of its windows a declaration
+ * now covers until a manual `tempad rebuild`. Events are replayed in
+ * `EventStore.read` order, the order a rebuild uses; only this table is touched
+ * (the reducer reads `events` alone), and the same `projection_state` stamp
+ * `rebuildAll` writes is not needed: nothing resumes from it.
+ */
+function populateStaleWindows(database: Database): void {
+  database.exec(STALE_WINDOWS_SQL);
+  database.exec("DELETE FROM w5_stale_windows");
+  for (const event of new EventStore(database).read({ kind: "quest.declared" })) {
+    markStaleWindows(database, event);
+  }
+}
+
+/**
  * TypeScript halves of migrations, keyed by version. `applyMigrations` runs
  * each right after that migration's SQL, inside the same transaction, so a throw
  * rolls back the SQL, the step and the version bump together. For a rewrite SQL
@@ -376,6 +396,7 @@ function reprojectQuests(database: Database): void {
 const MIGRATION_STEPS: Readonly<Record<number, (database: Database) => void>> = {
   23: normalizeWideOffsetCommitDates,
   24: reprojectQuests,
+  26: populateStaleWindows,
 };
 
 /**

@@ -184,7 +184,7 @@ describe("replay order before and after migration 0019", () => {
       const database = openDatabase(path);
       expect(
         (database.query("PRAGMA user_version").get() as { user_version: number }).user_version,
-      ).toBe(25);
+      ).toBe(26);
       rebuildAll(database);
       const after = snapshot(database);
 

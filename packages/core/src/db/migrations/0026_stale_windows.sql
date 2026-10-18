@@ -1,0 +1,17 @@
+-- Derive w5_stale_windows for declarations that predate it.
+--
+-- The window projection gained a second table, w5_stale_windows, derived from
+-- quest.declared events (a declaration covers its session from the session's
+-- start, so windows classified before it was recorded are stale and backfill
+-- re-runs them). Projection tables are created lazily and empty, so a database
+-- upgraded with existing declarations would show no stale window until someone
+-- ran tempad rebuild, and backfill would silently skip the history this is
+-- meant to repair.
+--
+-- SQL cannot fold the declarations, so this migration has no statements. Its
+-- work is the TypeScript step registered for version 26 in MIGRATION_STEPS
+-- (src/db/database.ts, populateStaleWindows), which applyMigrations runs right
+-- after this file inside the same IMMEDIATE transaction as the user_version
+-- bump: it creates the table and replays every quest.declared event through the
+-- projection's own reducer.
+SELECT 1;

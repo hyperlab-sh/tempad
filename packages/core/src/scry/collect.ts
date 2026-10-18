@@ -14,7 +14,13 @@ import {
 } from "../sync/engine";
 import { SYNCED_UPSERT_TABLES } from "../sync/tables";
 import { MIRROR_SYNC_ENABLED } from "../sync/triggers";
-import { backfillWindowMinutes, planBackfillWindows, selectBackfillSessions } from "../w5/backfill";
+import {
+  backfillSessionMode,
+  backfillWindowMinutes,
+  isPendingWindow,
+  planBackfillWindows,
+  selectBackfillSessions,
+} from "../w5/backfill";
 import { failureMessage } from "../w5/classifier-shared";
 import { compareProjectionsToReplay } from "./replay";
 import type {
@@ -576,10 +582,12 @@ function coverageCheck(input: ScryInput): CoverageResult {
   });
   const planned = planBackfillWindows(database, sessions, {
     windowMinutes: backfillWindowMinutes(w5),
+    // The same eligibility `backfill` applies, so the pending count is what a run would classify.
+    staleEligible: (sessionId) => backfillSessionMode(database, w5, sessionId) === "declared",
   });
   const inFlightAfter = new Date(now.getTime() - IN_FLIGHT_MS).toISOString();
-  const covered = planned.filter((window) => window.covered);
-  const pending = planned.filter((window) => !window.covered);
+  const covered = planned.filter((window) => !isPendingWindow(window));
+  const pending = planned.filter(isPendingWindow);
   const inFlight = pending.filter((window) => window.endedAt >= inFlightAfter);
   const stale = pending.filter((window) => window.endedAt < inFlightAfter);
 

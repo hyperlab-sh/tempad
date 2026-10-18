@@ -703,7 +703,65 @@ describe("declared quests in the window", () => {
     expect(window.activeQuests).toEqual([]);
   });
 
-  test("a declaration made after the window's end is not visible to it", () => {
+  test("a declaration whose --since starts after the window's end is not visible to it", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    const store = seedHeroAndQuest(database);
+
+    declareQuest(store, database, {
+      sessionId: "s1",
+      questId: "Q1",
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-05T09:00:00.000Z",
+      since: "2026-09-05T08:00:00.000Z",
+      heroId: "H1",
+    });
+
+    const window = buildWindow(database, {
+      sessionId: "s1",
+      sinceTs: "2026-09-04T14:30:00.000Z",
+      ...memoryInput,
+      windowEnd: "2026-09-04T15:20:00.000Z",
+    });
+
+    expect(window.activeQuests).toEqual([]);
+    expect(window.activeQuestAliases).toEqual({});
+  });
+
+  test("a window before the first declaration, inside its coverage, is a declared window with the quest, its alias and its plan", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database);
+    const store = seedHeroAndQuest(database);
+
+    declareQuest(store, database, {
+      sessionId: "s1",
+      questId: "Q1",
+      plan: ["walk order", "docs"],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-05T09:00:00.000Z",
+      heroId: "H1",
+    });
+
+    const window = buildWindow(database, {
+      sessionId: "s1",
+      mode: "declared",
+      sinceTs: "2026-09-04T14:30:00.000Z",
+      ...memoryInput,
+      windowEnd: "2026-09-04T15:20:00.000Z",
+    });
+
+    expect(window.mode).toBe("declared");
+    expect(window.activeQuests.map((quest) => quest.alias)).toEqual(["Q1"]);
+    expect(window.activeQuestAliases).toEqual({ Q1: "Q1" });
+    expect(window.planAliases).toEqual({ "P1.1": "walk order", "P1.2": "docs" });
+  });
+
+  test("a window that ends before the session's own start is not covered", () => {
     const database = openDatabase(":memory:");
     ensureTables(database);
     seedSession(database);
@@ -721,13 +779,13 @@ describe("declared quests in the window", () => {
 
     const window = buildWindow(database, {
       sessionId: "s1",
-      sinceTs: "2026-09-04T14:30:00.000Z",
+      mode: "declared",
+      sinceTs: null,
       ...memoryInput,
-      windowEnd: "2026-09-04T15:20:00.000Z",
+      windowEnd: "2026-09-04T13:55:00.000Z",
     });
 
     expect(window.activeQuests).toEqual([]);
-    expect(window.activeQuestAliases).toEqual({});
   });
 
   test("a subagent's window carries its own quest and the parent's", () => {

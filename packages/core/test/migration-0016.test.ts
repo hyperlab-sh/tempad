@@ -69,7 +69,7 @@ describe("migration 0016_impacts_session", () => {
       const database = openDatabase(dbPath);
       const version = (database.query("PRAGMA user_version;").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(25);
+      expect(version).toBe(26);
       const count = database.query("SELECT count(*) as n FROM impacts").get() as { n: number };
       expect(count.n).toBe(0);
       database.close();
