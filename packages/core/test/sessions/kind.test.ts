@@ -1051,3 +1051,67 @@ describe("session kind events: replay horizon and fact-backed replay", () => {
     copy.close();
   });
 });
+
+describe("session kind events: afterRebuild honors the replay horizon", () => {
+  test("a declaration after --until does not change the historical kind", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    // The session is a plain human session before the declaration: no rule
+    // fires, and a manual decision fixes its kind.
+    seedSession(database, {
+      id: "sub",
+      startedAt: "2026-10-01T10:00:00.000Z",
+      messages: [
+        { uuid: "m", ts: "2026-10-01T10:00:01.000Z", text: "do the work", originKind: "human" },
+      ],
+    });
+    const { applyIncremental } = require("../../src/intent/projections");
+    const set = new EventStore(database).append({
+      actor: "hero",
+      kind: "session.kind_set",
+      subject: "sub",
+      at: "2026-10-02T00:00:00.000Z",
+      payload: { kind: "human" },
+    });
+    applyIncremental(database, set);
+    // The declaration lands a day later and names a parent: the rule would
+    // reclassify the session as a subagent from the next full pass on.
+    declareQuest(new EventStore(database), database, {
+      sessionId: "sub",
+      parentSessionId: "lead",
+      newQuest: { title: "T", outcome: "O", commitment: "personal" },
+      plan: [],
+      scope: "subagent",
+      declaredBy: "hero",
+      at: "2026-10-04T00:00:00.000Z",
+      heroId: "H",
+    });
+
+    const until = "2026-10-03T00:00:00.000Z";
+    // A historical rebuild through Oct 3 must not see the Oct 4 declaration:
+    // the manual human decision held on that date, exactly as stateAsOf
+    // replays it (whose target holds only in-horizon events).
+    rebuildAll(database, { until });
+    expect(effectiveSessionKind(database, "sub")).toEqual({
+      kind: "human",
+      source: "manual",
+      confidence: 1,
+    });
+    const { stateAsOf } = require("../../src/intent/time-travel");
+    expect(effectiveSessionKind(stateAsOf(database, until), "sub")).toEqual({
+      kind: "human",
+      source: "manual",
+      confidence: 1,
+    });
+
+    // A full rebuild applies the declaration and the rule outranks the model
+    // (manual still wins here; the rule row is recomputed from the fact).
+    rebuildAll(database);
+    const asOfNow = effectiveSessionKind(database, "sub");
+    expect(asOfNow?.kind).toBe("human"); // manual still wins over rule
+    const ruleRow = database
+      .query("SELECT kind FROM session_kind WHERE session_id = 'sub' AND origin = 'rule'")
+      .get() as { kind: string } | null;
+    expect(ruleRow).toEqual({ kind: "subagent" }); // the rule now fires
+  });
+});

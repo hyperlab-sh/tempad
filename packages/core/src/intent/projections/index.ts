@@ -24,8 +24,11 @@ export interface Projection {
    * projections that derive rows from collected facts as well as events (the
    * session-kind rules): `tempad rebuild` restores their rows without a pass
    * or a model call. Must not depend on tables other projections own.
+   * `replay.until` carries the rebuild's horizon (`tempad rebuild --until`):
+   * any event-log read must be bounded by it, so a historical rebuild does
+   * not see facts its replay never applied.
    */
-  afterRebuild?: (database: Database) => void;
+  afterRebuild?: (database: Database, replay?: ProjectionReplay) => void;
 }
 
 const registry = new Map<string, Projection>();
@@ -98,7 +101,7 @@ export function rebuildAll(database: Database, options: RebuildOptions = {}): vo
         )
         .run(projection.name, last);
     }
-    for (const projection of registry.values()) projection.afterRebuild?.(database);
+    for (const projection of registry.values()) projection.afterRebuild?.(database, replay);
     options.beforeCommit?.(database);
   });
   run.immediate();

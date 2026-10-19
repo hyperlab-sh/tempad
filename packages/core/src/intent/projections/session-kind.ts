@@ -53,8 +53,8 @@ export const sessionKindProjection: Projection = {
    * events). Skipped when the target has no collector tables (a time-travel
    * in-memory database).
    */
-  afterRebuild(database: Database): void {
-    recomputeSessionKindRules(database, SESSION_KIND_CLASSIFIER_VERSION_LATEST);
+  afterRebuild(database: Database, replay?: ProjectionReplay): void {
+    recomputeSessionKindRules(database, SESSION_KIND_CLASSIFIER_VERSION_LATEST, replay);
   },
 };
 
@@ -243,7 +243,7 @@ function hasClaudeTables(database: Database): boolean {
   );
 }
 
-export function loadSessions(database: Database): SessionRecord[] {
+export function loadSessions(database: Database, replay?: ProjectionReplay): SessionRecord[] {
   const sessions = database
     .query(
       `SELECT s.id, s.entrypoint, s.title_source, s.host_slug, s.started_at, s.file_path,
@@ -262,9 +262,13 @@ export function loadSessions(database: Database): SessionRecord[] {
       `SELECT json_extract(payload, '$.session_id') AS session_id,
               json_extract(payload, '$.parent_session_id') AS parent_session_id
        FROM events
-       WHERE kind = 'quest.declared' AND json_extract(payload, '$.parent_session_id') IS NOT NULL`,
+       WHERE kind = 'quest.declared' AND json_extract(payload, '$.parent_session_id') IS NOT NULL
+         AND at <= ?`,
     )
-    .all() as { session_id: unknown; parent_session_id: unknown }[];
+    .all(replay?.until ?? "9999-12-31T23:59:59.999Z") as {
+    session_id: unknown;
+    parent_session_id: unknown;
+  }[];
   for (const row of declarations) {
     if (typeof row.session_id === "string") withParent.add(row.session_id);
     if (typeof row.parent_session_id === "string") asParent.add(row.parent_session_id);
@@ -306,6 +310,7 @@ export interface RecomputeRulesResult {
 export function recomputeSessionKindRules(
   database: Database,
   classifierVersion: number,
+  replay?: ProjectionReplay,
 ): RecomputeRulesResult {
   const oldRows = new Map(
     (
@@ -323,7 +328,7 @@ export function recomputeSessionKindRules(
   );
   let ruled = 0;
   if (hasClaudeTables(database)) {
-    for (const session of loadSessions(database)) {
+    for (const session of loadSessions(database, replay)) {
       const hit = ruleKind(session.facts);
       if (hit === null) continue;
       // set_at is the session's own started_at, not the wall clock: two hosts
