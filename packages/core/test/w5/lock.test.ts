@@ -529,3 +529,51 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
     });
   });
 });
+
+describe("handoff give-back: a third run lands during the give-back", () => {
+  /**
+   * A lock whose runner is gone, plus the clearing handoff judged abandoned. The
+   * `beforeRemoveAbandoned` hook swaps the handoff for a fresh one (another run cleared the
+   * abandoned one first and took its own), so the parked file is a live handoff that must be
+   * given back, and `afterParkAbandoned` lands after the rename, where a third run can acquire
+   * the now-absent path.
+   */
+  function thirdRunFixture(
+    takenPid: string,
+    thirdRunPid: string,
+    run: (lockPath: string, clearing: string, options: object) => void,
+  ): void {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      run(path, clearing, {
+        now: NOW,
+        isAlive: (pid: number) => pid === 4343 || pid === 4444,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, takenPid);
+        },
+        afterParkAbandoned: () => {
+          writeFileSync(clearing, thirdRunPid);
+        },
+      });
+    });
+  }
+
+  test("a third run's live handoff at the path wins; the parked one is dropped, not restored over it", () => {
+    thirdRunFixture("4343", "4444", (path, clearing, options) => {
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4444");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+
+  test("a third run's handoff whose holder is gone loses: ours is restored and theirs removed", () => {
+    thirdRunFixture("4343", String(deadPid()), (path, clearing, options) => {
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+});
