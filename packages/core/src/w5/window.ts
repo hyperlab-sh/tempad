@@ -5,6 +5,7 @@ import {
   currentDeclaredQuestForSubagent,
   latestDeclaredParentSessionId,
 } from "../intent/declarations";
+import type { SessionKind } from "../sessions/kinds";
 import { type ClassifierWindow, type DeclaredQuestSlice, planAliasPrefix } from "./classifier";
 
 export function findSessionFile(database: Database, sessionId: string): string | null {
@@ -39,6 +40,8 @@ export interface BuildWindowInput {
    * `"declared"`.
    */
   mode?: "declared" | "inferred";
+  /** Passed through to `ClassifierWindow.sessionKind` when set. */
+  sessionKind?: SessionKind;
 }
 
 interface StintRow {
@@ -438,6 +441,7 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
     project: session.project,
     messages,
     mode,
+    ...(input.sessionKind === undefined ? {} : { sessionKind: input.sessionKind }),
     activeQuests,
     activeQuestAliases,
     parentActiveQuests,

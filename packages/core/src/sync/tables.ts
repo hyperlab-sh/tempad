@@ -77,6 +77,9 @@ export const LOCAL_ONLY_TABLES: readonly string[] = [
   "w5_jobs",
   "w5_runs",
   "w5_quiet",
+  // Session kinds (src/intent/projections/session-kind.ts): rebuilt per host
+  // from events and facts, never pushed.
+  "session_kind",
   // Owned by sync itself.
   "sync_local",
   "sync_cursors",

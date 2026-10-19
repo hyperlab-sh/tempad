@@ -83,49 +83,81 @@ export class ClaudeCliClassifier implements Classifier {
     return classifyWithRetry(window, userPrompt, (prompt) => this.request(systemPrompt, prompt));
   }
 
-  private async request(systemPrompt: string, userPrompt: string): Promise<string> {
-    const argv = [
-      this.command,
-      "-p",
-      "--safe-mode",
-      "--no-session-persistence",
-      "--output-format",
-      "json",
-      "--model",
-      this.model,
-      "--tools",
-      "",
-      "--system-prompt",
-      systemPrompt,
-    ];
-
-    let result: CliSpawnResult;
-    try {
-      result = await this.spawnImpl(argv, {
+  private request(systemPrompt: string, userPrompt: string): Promise<string> {
+    return requestClaudeCli(
+      {
+        command: this.command,
+        model: this.model,
         cwd: this.cwd,
-        stdin: userPrompt,
+        spawn: this.spawnImpl,
         timeoutMs: this.timeoutMs,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`claude cli spawn failed: ${message}`);
-    }
-
-    if (result.code !== 0) {
-      throw new Error(`claude cli exited with code ${result.code}: ${result.stderr.slice(0, 200)}`);
-    }
-
-    let envelope: { result?: unknown };
-    try {
-      envelope = JSON.parse(result.stdout) as { result?: unknown };
-    } catch {
-      throw new Error(`claude cli output was not valid JSON: ${result.stdout.slice(0, 200)}`);
-    }
-
-    if (typeof envelope.result !== "string") {
-      throw new Error(`claude cli envelope had no result field: ${result.stdout.slice(0, 200)}`);
-    }
-
-    return envelope.result;
+      },
+      systemPrompt,
+      userPrompt,
+    );
   }
+}
+
+export interface ClaudeCliRequestOptions {
+  command: string;
+  model: string;
+  cwd: string;
+  spawn: CliSpawn;
+  timeoutMs: number;
+}
+
+/**
+ * One `claude -p` call in print mode with no tools and no session file, the
+ * prompt on stdin, returning the model's text from the JSON envelope. The w5
+ * classifier and the session kind classifier (`src/sessions/classifier.ts`) both
+ * go through it.
+ */
+export async function requestClaudeCli(
+  options: ClaudeCliRequestOptions,
+  systemPrompt: string,
+  userPrompt: string,
+): Promise<string> {
+  const argv = [
+    options.command,
+    "-p",
+    "--safe-mode",
+    "--no-session-persistence",
+    "--output-format",
+    "json",
+    "--model",
+    options.model,
+    "--tools",
+    "",
+    "--system-prompt",
+    systemPrompt,
+  ];
+
+  let result: CliSpawnResult;
+  try {
+    result = await options.spawn(argv, {
+      cwd: options.cwd,
+      stdin: userPrompt,
+      timeoutMs: options.timeoutMs,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`claude cli spawn failed: ${message}`);
+  }
+
+  if (result.code !== 0) {
+    throw new Error(`claude cli exited with code ${result.code}: ${result.stderr.slice(0, 200)}`);
+  }
+
+  let envelope: { result?: unknown };
+  try {
+    envelope = JSON.parse(result.stdout) as { result?: unknown };
+  } catch {
+    throw new Error(`claude cli output was not valid JSON: ${result.stdout.slice(0, 200)}`);
+  }
+
+  if (typeof envelope.result !== "string") {
+    throw new Error(`claude cli envelope had no result field: ${result.stdout.slice(0, 200)}`);
+  }
+
+  return envelope.result;
 }

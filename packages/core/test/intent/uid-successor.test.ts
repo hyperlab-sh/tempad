@@ -99,7 +99,10 @@ describe("EventStore uid successor", () => {
           console.log(event.uid);
           database.close();
         `;
-        const result = Bun.spawnSync(["bun", "-e", code], { cwd: CORE, env: process.env });
+        const result = Bun.spawnSync([process.execPath, "-e", code], {
+          cwd: CORE,
+          env: process.env,
+        });
         expect(result.exitCode).toBe(0);
         return result.stdout.toString().trim();
       };

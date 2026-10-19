@@ -610,7 +610,7 @@ describe("claimNextJob across connections", () => {
       `;
       const startAt = String(Date.now() + 1500);
       const racers = Array.from({ length: 4 }, () =>
-        Bun.spawn(["bun", "--no-env-file", "-e", script, startAt], {
+        Bun.spawn([process.execPath, "--no-env-file", "-e", script, startAt], {
           stdout: "pipe",
           stderr: "pipe",
         }),

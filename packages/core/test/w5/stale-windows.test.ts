@@ -40,6 +40,8 @@ const config: W5Config = {
   overlapMessages: 3,
   mode: "declared",
   inferenceFallback: true,
+  sessionKindModel: "haiku",
+  sessionKindBatch: 0,
   stintMinMinutes: 5,
 };
 
@@ -1071,7 +1073,8 @@ describe("a database upgraded with declarations already in it", () => {
 
     expect(
       (upgraded.query("PRAGMA user_version").get() as { user_version: number }).user_version,
-    ).toBe(26);
+      // 26 (stale windows) and 27 (session_kind) both apply on the upgrade.
+    ).toBe(27);
     expect(
       upgraded.query("SELECT session_id, from_ts, through_ts FROM w5_stale_windows").all(),
     ).toEqual([{ session_id: "s1", from_ts: null, through_ts: "2026-09-04T16:00:00.000Z" }]);

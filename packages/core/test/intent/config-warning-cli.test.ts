@@ -22,7 +22,7 @@ async function run(toml: string, args: string[]) {
   delete env.HOST_SLUG;
   delete env.TEMPAD_SYNC_TOKEN;
   const proc = Bun.spawn({
-    cmd: ["bun", "--no-env-file", CLI, ...args],
+    cmd: [process.execPath, "--no-env-file", CLI, ...args],
     cwd,
     env,
     stdout: "pipe",

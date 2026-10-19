@@ -120,7 +120,7 @@ describe("report command default output path", () => {
 
       const proc = Bun.spawn({
         cmd: [
-          "bun",
+          process.execPath,
           "run",
           join(import.meta.dir, "..", "src", "cli.ts"),
           "report",
@@ -135,7 +135,8 @@ describe("report command default output path", () => {
         stderr: "pipe",
       });
 
-      const exitCode = await proc.exited;
+      const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      if (exitCode !== 0) console.error(`report cli failed:\n${stderr}`);
       expect(exitCode).toBe(0);
 
       const outPath = join(dir, "reports", "daily-2026-09-01-2026-09-01.md");
@@ -189,10 +190,14 @@ describe("tempad sync --full", () => {
       setSyncState(database, "claude", future);
       database.close();
 
+      // The kind pass must not reach a model from a collector-only fixture:
+      // the batch is 0 (rules only) and no `claude` can be found on this PATH.
+      await Bun.write(join(dir, "tempad.toml"), "[w5]\nsession_kind_batch = 0\n");
+
       const runCli = (args: string[]) =>
         Bun.spawn({
-          cmd: ["bun", "run", join(import.meta.dir, "..", "src", "cli.ts"), ...args],
-          env: { ...process.env, TEMPAD_HOME: dir },
+          cmd: [process.execPath, "run", join(import.meta.dir, "..", "src", "cli.ts"), ...args],
+          env: { ...process.env, TEMPAD_HOME: dir, PATH: "/usr/bin:/bin" },
           stdout: "pipe",
           stderr: "pipe",
         }).exited;
@@ -593,7 +598,7 @@ describe("cli --help on every command and subcommand", () => {
   test("POSITIONAL_LIMITS has an entry for every leaf of COMMAND_TREE and for nothing else", () => {
     const { table } = documentedPaths();
     const leaves = table.filter((path) => !table.some((other) => other.startsWith(`${path} `)));
-    const expected = [...new Set([...leaves, "sync"])].sort();
+    const expected = [...new Set([...leaves, "sync", "sessions"])].sort();
     expect(Object.keys(POSITIONAL_LIMITS).sort()).toEqual(expected);
   });
 
@@ -609,10 +614,13 @@ describe("cli --help on every command and subcommand", () => {
             const path = joined.split(" ");
             const filler = Array.from({ length: POSITIONAL_LIMITS[joined] ?? 0 }, () => "x");
             // `sync`'s one positional is a source: past a flag the walk leaves it to the limit.
+            // `sessions` is runnable beside its `kind` child, so the filler rides a flag value.
             const argv =
               joined === "sync"
                 ? ["sync", "--full", "monday", "extra"]
-                : [...path, ...filler, "extra"];
+                : joined === "sessions"
+                  ? ["sessions", "--kind", "human", "extra"]
+                  : [...path, ...filler, "extra"];
             const result = await runCli(sandbox, argv);
             const usage = usageForPath(path)[1]?.trim() ?? "missing";
             if (
@@ -823,6 +831,8 @@ describe("cli --help on every command and subcommand", () => {
       ],
       init: ["init", "--home", "/tmp/x"],
       sync: ["sync", "monday", "--full"],
+      sessions: ["sessions", "--days", "7", "--kind", "human"],
+      "sessions kind": ["sessions", "kind", "s1", "--set", "human"],
       "sync monday": ["sync", "monday", "--full"],
       "sync github": ["sync", "github", "--full"],
       "sync claude": ["sync", "claude", "--full"],

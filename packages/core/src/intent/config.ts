@@ -28,6 +28,10 @@ export interface W5Config {
   overlapMessages: number;
   mode: (typeof W5_MODES)[number];
   inferenceFallback: boolean;
+  /** The model that classifies a session's kind from its first message (`src/sessions/kind.ts`). */
+  sessionKindModel: string;
+  /** How many sessions one `tempad sync` sends to that model at most; 0 sends none. */
+  sessionKindBatch: number;
 }
 
 export interface IntentConfig {
@@ -60,6 +64,8 @@ export function defaultIntentConfig(): IntentConfig {
       overlapMessages: 3,
       mode: "declared",
       inferenceFallback: true,
+      sessionKindModel: "haiku",
+      sessionKindBatch: 20,
     },
   };
 }
@@ -267,6 +273,8 @@ export function loadIntentConfig(
       overlapMessages: count("overlap_messages", config.w5.overlapMessages),
       mode: parseChoice(w5.mode, W5_MODES, config.w5.mode, "[w5].mode", reporter),
       inferenceFallback: boolean("inference_fallback", config.w5.inferenceFallback),
+      sessionKindModel: string("session_kind_model", config.w5.sessionKindModel),
+      sessionKindBatch: count("session_kind_batch", config.w5.sessionKindBatch),
     };
   }
   return config;

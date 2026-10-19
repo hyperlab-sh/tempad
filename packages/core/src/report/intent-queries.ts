@@ -12,30 +12,13 @@ import { clientCondition, type DateRange } from "./queries.ts";
  * `database` for anything intent-related when `asOf` is set.
  *
  * Traces resolve their org/project through a join to `claude_sessions` (see
- * `queryTraceIntervals`), so `claude_sessions` is copied into the as-of
- * database -- it holds no events of its own and would otherwise be empty.
+ * `queryTraceIntervals`); `stateAsOf` copies the collected session/message
+ * facts into the as-of database, so the join (and the session-kind rules)
+ * work there without a second copy here.
  */
 export function resolveIntentDatabase(database: Database, asOf: string | undefined): Database {
   if (!asOf) return database;
-  const asOfDatabase = stateAsOf(database, asOf);
-
-  const sessions = database.query("SELECT * FROM claude_sessions").all() as Record<
-    string,
-    unknown
-  >[];
-  if (sessions.length > 0) {
-    const columns = Object.keys(sessions[0] as Record<string, unknown>);
-    const insert = asOfDatabase.query(
-      `INSERT INTO claude_sessions (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
-    );
-    const insertAll = asOfDatabase.transaction(() => {
-      for (const session of sessions)
-        insert.run(...columns.map((column) => session[column] as never));
-    });
-    insertAll();
-  }
-
-  return asOfDatabase;
+  return stateAsOf(database, asOf);
 }
 
 export interface StintRow {

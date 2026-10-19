@@ -2,11 +2,33 @@ import type { Database } from "bun:sqlite";
 import type { EventRecord } from "../events";
 import { EventStore } from "../store";
 
+export interface ProjectionReplay {
+  /** Replay only events with `at <= until` (`RebuildOptions.until`). */
+  until?: string;
+}
+
 export interface Projection {
   name: string;
   tables: string[];
   createSql: string;
-  apply(database: Database, event: EventRecord): void;
+  /**
+   * `replay.until` is set during `rebuildAll` and carries the rebuild's
+   * horizon (`tempad rebuild --until`): a projection that reads the event log
+   * directly must ignore events past it, or a historical rebuild would see
+   * facts its replay never applied. Undefined during incremental apply
+   * (live, no horizon).
+   */
+  apply(database: Database, event: EventRecord, replay?: ProjectionReplay): void;
+  /**
+   * Runs inside the rebuild's transaction after the event replay, for the
+   * projections that derive rows from collected facts as well as events (the
+   * session-kind rules): `tempad rebuild` restores their rows without a pass
+   * or a model call. Must not depend on tables other projections own.
+   * `replay.until` carries the rebuild's horizon (`tempad rebuild --until`):
+   * any event-log read must be bounded by it, so a historical rebuild does
+   * not see facts its replay never applied.
+   */
+  afterRebuild?: (database: Database, replay?: ProjectionReplay) => void;
 }
 
 const registry = new Map<string, Projection>();
@@ -67,10 +89,11 @@ export function rebuildAll(database: Database, options: RebuildOptions = {}): vo
   ensureTables(database);
   const store = new EventStore(database);
   const run = database.transaction(() => {
+    const replay: ProjectionReplay = { until: options.until };
     const events = store.read({ until: options.until });
     for (const projection of registry.values()) {
       for (const table of projection.tables) database.exec(`DELETE FROM ${table}`);
-      for (const event of events) projection.apply(database, event);
+      for (const event of events) projection.apply(database, event, replay);
       const last = events.at(-1)?.id ?? 0;
       database
         .query(
@@ -78,6 +101,7 @@ export function rebuildAll(database: Database, options: RebuildOptions = {}): vo
         )
         .run(projection.name, last);
     }
+    for (const projection of registry.values()) projection.afterRebuild?.(database, replay);
     options.beforeCommit?.(database);
   });
   run.immediate();

@@ -4,6 +4,7 @@ import { type Projection, registerProjection } from "./index";
 import { partyProjection } from "./party";
 import { questProjection } from "./quest";
 import { sagaProjection } from "./saga";
+import { sessionKindProjection } from "./session-kind";
 import { stintProjection } from "./stint";
 import { windowProjection } from "./window";
 
@@ -16,6 +17,7 @@ export const ALL_PROJECTIONS: readonly Projection[] = [
   questProjection,
   stintProjection,
   windowProjection,
+  sessionKindProjection,
 ];
 
 let registered = false;

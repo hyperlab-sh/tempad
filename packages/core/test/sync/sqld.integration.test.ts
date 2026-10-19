@@ -532,7 +532,7 @@ describe.skipIf(skipReason !== null)("push sync against sqld", () => {
     );
     const run = async (args: string[], syncToken: string) => {
       const proc = Bun.spawn({
-        cmd: ["bun", join(import.meta.dir, "..", "..", "src", "cli.ts"), ...args],
+        cmd: [process.execPath, "run", join(import.meta.dir, "..", "..", "src", "cli.ts"), ...args],
         env: { ...process.env, TEMPAD_HOME: home, TEMPAD_SYNC_TOKEN: syncToken },
         stdout: "pipe",
         stderr: "pipe",

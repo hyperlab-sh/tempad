@@ -42,6 +42,8 @@ export const w5Config: W5Config = {
   overlapMessages: 3,
   mode: "declared",
   inferenceFallback: true,
+  sessionKindModel: "haiku",
+  sessionKindBatch: 20,
   stintMinMinutes: 5,
 };
 

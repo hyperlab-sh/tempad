@@ -210,7 +210,7 @@ describe("acquireLock and releaseLock", () => {
       `;
       const startAt = String(Date.now() + 1500);
       const racers = Array.from({ length: 6 }, () =>
-        Bun.spawn(["bun", "--no-env-file", "-e", script, lockPath, startAt], {
+        Bun.spawn([process.execPath, "--no-env-file", "-e", script, lockPath, startAt], {
           stdout: "pipe",
           stderr: "pipe",
         }),
@@ -435,10 +435,13 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
   async function race(script: string, args: (startAt: string) => string[]): Promise<string[]> {
     const startAt = String(Date.now() + 800);
     const racers = Array.from({ length: RACERS }, (_, index) =>
-      Bun.spawn(["bun", "--no-env-file", "-e", script, ...args(startAt), String(index)], {
-        stdout: "pipe",
-        stderr: "pipe",
-      }),
+      Bun.spawn(
+        [process.execPath, "--no-env-file", "-e", script, ...args(startAt), String(index)],
+        {
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      ),
     );
     return Promise.all(
       racers.map(async (racer) => {

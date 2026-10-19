@@ -1,3 +1,4 @@
+import type { SessionKind } from "../sessions/kinds";
 import { classifyWithRetry } from "./classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt";
 
@@ -17,6 +18,12 @@ export interface ClassifierWindow {
    * the window rather than being guessed from which optional fields are set.
    */
   mode: "declared" | "inferred";
+  /**
+   * Who started the session (`src/sessions/kind.ts`: a manual kind, else the
+   * inferred one), absent while no pass has classified it. Carried for the
+   * prompt to use later; neither prompt reads it yet.
+   */
+  sessionKind?: SessionKind;
   /**
    * Every quest this session has declared and not ended (`tempad quest declare`),
    * as of the window's reference time, each with the alias the model names it by.

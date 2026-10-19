@@ -7,7 +7,7 @@ const CLI = join(import.meta.dir, "..", "..", "src", "cli.ts");
 
 async function tempad(args: string[], home: string) {
   const proc = Bun.spawn({
-    cmd: ["bun", CLI, ...args],
+    cmd: [process.execPath, CLI, ...args],
     cwd: home,
     env: { ...process.env, HOME: home, TEMPAD_HOME: join(home, ".tempad") },
     stdout: "pipe",

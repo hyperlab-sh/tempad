@@ -44,7 +44,11 @@ describe("rebuildAll holds the write lock across its read", () => {
         database.exec("COMMIT");
         database.close();
       `;
-      const child = Bun.spawn(["bun", "-e", code], { cwd: CORE, env: process.env, stderr: "pipe" });
+      const child = Bun.spawn([process.execPath, "-e", code], {
+        cwd: CORE,
+        env: process.env,
+        stderr: "pipe",
+      });
       const deadline = Date.now() + 10_000;
       while (!existsSync(ready)) {
         if (Date.now() > deadline) throw new Error("writer process never took the lock");
