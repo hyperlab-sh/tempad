@@ -23,6 +23,7 @@ export const EVENT_KINDS = [
   "quest.branched",
   "quest.returned",
   "quest.declared",
+  "agent.spawned",
   "stint.opened",
   "stint.reworded",
   "stint.closed",

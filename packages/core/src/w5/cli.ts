@@ -12,7 +12,10 @@ import {
 } from "../config/env";
 import type { IntentConfig } from "../intent/config";
 import {
+  type ActiveDeclaredQuest,
   activeDeclaredQuests,
+  currentDeclaredQuestForSubagent,
+  latestDeclaredParentSessionId,
   sessionEverDeclared,
   sessionHasActiveDeclaration,
 } from "../intent/declarations";
@@ -171,6 +174,36 @@ function runEnqueue(args: string[], context: W5Context): number {
   return 0;
 }
 
+/**
+ * The quests the hook's `active quests:` line lists, resolved the same way
+ * `buildWindow` and `sessionHasActiveDeclaration` resolve a session: the
+ * latest declaration decides the shape. When it carries a parent id (the
+ * shape `tempad agent spawned --child --quest` and `quest declare --parent`
+ * write) the session is a subagent and its own subagent-scope quest comes
+ * first, falling back to the parent's active quests; a latest declaration
+ * with no parent makes it a plain session that folds its own session-scope
+ * declarations, even when older subagent-shaped ones exist. So a spawned
+ * agent's context line shows the quest it was spawned under, and a child
+ * reassigned later shows the new assignment rather than an older session
+ * quest.
+ */
+export function contextActiveQuests(
+  database: Database,
+  input: { sessionId: string; at: string },
+): ActiveDeclaredQuest[] {
+  const parentSessionId = latestDeclaredParentSessionId(database, input.sessionId, input.at);
+  if (parentSessionId !== null) {
+    const declared = currentDeclaredQuestForSubagent(database, {
+      sessionId: input.sessionId,
+      parentSessionId,
+      at: input.at,
+    });
+    if (declared !== null) return [{ ...declared, alias: "Q1" }];
+    return activeDeclaredQuests(database, { sessionId: parentSessionId, at: input.at });
+  }
+  return activeDeclaredQuests(database, { sessionId: input.sessionId, at: input.at });
+}
+
 function runContext(args: string[], context: W5Context): number {
   const { values } = parseArgs({
     args,
@@ -179,7 +212,7 @@ function runContext(args: string[], context: W5Context): number {
   });
   if (!values.session) return 0;
 
-  const active = activeDeclaredQuests(context.database, {
+  const active = contextActiveQuests(context.database, {
     sessionId: values.session,
     at: new Date().toISOString(),
   });
