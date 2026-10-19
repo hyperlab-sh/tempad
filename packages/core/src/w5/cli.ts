@@ -383,7 +383,7 @@ function runReview(args: string[], context: W5Context): number {
           ${kindFilter("traces.session_id")}
         ORDER BY traces.started_at ASC`,
     )
-    .all(since) as {
+    .all(since, ...kindParameters) as {
     id: string;
     stintId: string;
     doubt: string;

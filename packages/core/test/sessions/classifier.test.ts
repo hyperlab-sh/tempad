@@ -55,7 +55,7 @@ describe("buildOpenerPrompt", () => {
   });
 
   test("truncates to OPENER_MAX_CHARACTERS without splitting a surrogate pair", () => {
-    const long = "ab".repeat(OPENER_MAX_CHARACTERS) + "🚀" + "tail";
+    const long = `${"ab".repeat(OPENER_MAX_CHARACTERS)}🚀tail`;
     const fence = buildOpenerPrompt(long).split("\n");
     const body = fence[2] ?? "";
     expect(body.length).toBeLessThanOrEqual(OPENER_MAX_CHARACTERS + 2);

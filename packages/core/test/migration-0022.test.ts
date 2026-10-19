@@ -169,7 +169,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
 
   test("a fresh database has no mirror triggers: no stamps, no tombstones", () => {
     const database = openDatabase(":memory:", { hostSlug: "host-a" });
-    expect(userVersion(database)).toBe(26);
+    expect(userVersion(database)).toBe(27);
     expect(isMirrorSyncEnabled(database)).toBe(false);
     expect(installedTriggers(database)).toEqual({});
 
@@ -199,7 +199,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
       old.close();
 
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(26);
+      expect(userVersion(database)).toBe(27);
       expect(isMirrorSyncEnabled(database)).toBe(false);
       expect(installedTriggers(database)).toEqual({});
       expect(syncState(database)).toEqual({ ...before, tombstones: [] });
@@ -252,7 +252,7 @@ describe("migration 0022: mirror triggers only where sync has run", () => {
         old.close();
 
         const database = openDatabase(path, { hostSlug: "host-a" });
-        expect(userVersion(database)).toBe(26);
+        expect(userVersion(database)).toBe(27);
         expect(isMirrorSyncEnabled(database)).toBe(true);
         expect(installedTriggers(database)).toEqual(triggers);
         expect(syncState(database)).toEqual(before);
@@ -773,7 +773,7 @@ describe("migrations from 22 on apply as one transaction", () => {
 
       // The real chain still upgrades it afterwards.
       const upgraded = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(upgraded)).toBe(26);
+      expect(userVersion(upgraded)).toBe(27);
       expect(isMirrorSyncEnabled(upgraded)).toBe(true);
       expect(installedTriggers(upgraded)).toEqual(expectedTriggers());
       upgraded.close();

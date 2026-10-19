@@ -63,7 +63,6 @@ export async function refreshSessionKinds(
   database: Database,
   options: RefreshSessionKindsOptions,
 ): Promise<RefreshSessionKindsResult> {
-  const now = options.now ?? (() => new Date());
   const log = options.log ?? ((line: string) => console.error(line));
   const result: RefreshSessionKindsResult = {
     ruled: 0,
