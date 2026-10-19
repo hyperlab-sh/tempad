@@ -34,6 +34,7 @@ import {
   buildBelongsHandback,
   buildDeclarationLine,
   buildDeclareHandback,
+  buildVagueTitleLine,
   hasTempadHooks,
   hasUnstableInstall,
   installHooks,
@@ -224,11 +225,56 @@ function runContext(args: string[], context: W5Context): number {
     process.env.TEMPAD_HOOK_SOURCE,
   );
 
+  // tempad-7b2: nudge, once per session per quest, for an active quest the
+  // title-quality flag marked vague or duplicate. `w5_runs.vague_nudged` is the
+  // hook's per-session memory, so the line does not repeat on every prompt.
+  // The insert never stamps a real `last_run_at` (that column gates throttling);
+  // the epoch keeps an unread session unthrottled until `w5 run` writes its own.
+  const vagueLines: string[] = [];
+  if (active.length > 0) {
+    const flagged = new Set(
+      active
+        .map(
+          (quest) =>
+            context.database
+              .query("SELECT id FROM quests WHERE id = ? AND title_vague = 1")
+              .get(quest.questId) as { id: string } | null,
+        )
+        .filter((row): row is { id: string } => row !== null)
+        .map((row) => row.id),
+    );
+    if (flagged.size > 0) {
+      const previous = context.database
+        .query("SELECT vague_nudged FROM w5_runs WHERE session_id = ?")
+        .get(values.session) as { vague_nudged: string | null } | null;
+      let nudged: string[] = [];
+      try {
+        nudged = JSON.parse(previous?.vague_nudged ?? "[]") as string[];
+      } catch {
+        nudged = [];
+      }
+      const seen = new Set(nudged);
+      for (const quest of active) {
+        if (seen.has(quest.questId)) continue;
+        if (!flagged.has(quest.questId)) continue;
+        vagueLines.push(
+          buildVagueTitleLine({ id: quest.questId, title: quest.title, alias: quest.alias }),
+        );
+        nudged.push(quest.questId);
+      }
+      if (nudged.length > 0) {
+        context.database
+          .query(
+            "INSERT INTO w5_runs (session_id, last_run_at, vague_nudged) VALUES (?, '1970-01-01T00:00:00.000Z', ?) ON CONFLICT(session_id) DO UPDATE SET vague_nudged = excluded.vague_nudged",
+          )
+          .run(values.session, JSON.stringify(nudged));
+      }
+    }
+  }
+
   const rows = context.database
     .query(
-      `SELECT id, trace_id as traceId, session_id as sessionId, kind, state, turns_watched as turnsWatched,
-              turns_at_ask as turnsAtAsk, is_switch as isSwitch
-         FROM questions WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED} ORDER BY asked_at DESC`,
+      "SELECT id, trace_id as traceId, session_id as sessionId, kind, state, turns_watched as turnsWatched, turns_at_ask as turnsAtAsk, is_switch as isSwitch FROM questions WHERE session_id = ? AND state = 'asked' AND NOT EXISTS (SELECT 1 FROM traces WHERE traces.id = questions.trace_id AND traces.retracted_at IS NOT NULL) ORDER BY asked_at DESC",
     )
     .all(values.session) as (Omit<QuestionRow, "isSwitch"> & { isSwitch: number })[];
 
@@ -237,7 +283,8 @@ function runContext(args: string[], context: W5Context): number {
     (
       context.database
         .query(
-          `SELECT id, guess FROM questions WHERE session_id = ? AND state = 'asked' AND ${TRACE_NOT_RETRACTED}`,
+          "SELECT id, guess FROM questions WHERE session_id = ? AND state = 'asked' AND NOT EXISTS (SELECT 1 FROM traces" +
+            " WHERE traces.id = questions.trace_id AND traces.retracted_at IS NOT NULL)",
         )
         .all(values.session) as { id: string; guess: string | null }[]
     ).map((row) => [row.id, row.guess]),
@@ -251,7 +298,7 @@ function runContext(args: string[], context: W5Context): number {
     sessionId: values.session,
     guessFor: (questionId) => guesses.get(questionId) ?? null,
   });
-  const parts = [declarationLine, text].filter((part) => part.length > 0);
+  const parts = [declarationLine, ...vagueLines, text].filter((part) => part.length > 0);
   if (parts.length > 0) context.stdout(parts.join("\n"));
   return 0;
 }

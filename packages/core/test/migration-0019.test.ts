@@ -117,7 +117,7 @@ describe("migration 0019_push_sync on a pre-0019 database with data", () => {
 
       const before = Date.now();
       const database = openDatabase(path, { hostSlug: "host-a" });
-      expect(userVersion(database)).toBe(27);
+      expect(userVersion(database)).toBe(28);
       expect(database.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
       expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
 
@@ -161,7 +161,7 @@ describe("migration 0019_push_sync on a pre-0019 database with data", () => {
 
   test("a fresh database migrates straight to head (24)", () => {
     const database = openDatabase(":memory:");
-    expect(userVersion(database)).toBe(27);
+    expect(userVersion(database)).toBe(28);
     expect(database.query("SELECT COUNT(*) AS n FROM sync_local").get()).toEqual({ n: 0 });
     database.close();
   });

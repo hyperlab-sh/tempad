@@ -177,7 +177,7 @@ describe("migration 0021_normalize_commit_dates", () => {
       old.close();
 
       const database = openDatabase(path);
-      expect(userVersion(database)).toBe(27);
+      expect(userVersion(database)).toBe(28);
       const rows = new Map(snapshot(database).map((row) => [row.sha, row]));
 
       for (const original of SEEDS) {
@@ -256,7 +256,7 @@ describe("migration 0021_normalize_commit_dates", () => {
 
   test("an empty gh_commits table migrates cleanly", () => {
     const database = openDatabase(":memory:");
-    expect(userVersion(database)).toBe(27);
+    expect(userVersion(database)).toBe(28);
     expect(snapshot(database)).toEqual([]);
     database.close();
   });

@@ -8,6 +8,7 @@ import {
   DECLARE_EXISTING_QUEST_FORM,
   DECLARE_NEW_QUEST_FORM,
   handbackForm,
+  usageText,
 } from "../usage.ts";
 import type { QuestionRow } from "./questions";
 
@@ -256,6 +257,21 @@ export function buildDeclarationLine(
       ? "none"
       : active.map((quest) => `${quest.title} [${quest.alias}]`).join(", ");
   return `tempad: session ${sessionId}, active quests: ${quests}. Declare with ${questSkillReference(source)} if this prompt starts a different outcome.`;
+}
+
+/**
+ * The nudge for an active quest whose title the detector flagged (tempad-7b2).
+ * Rendered from the quest's live title, and it only suggests -- the reword is
+ * never applied for the agent. The command hint is derived from the one
+ * `quest reword` usage entry (`usageText`), with the title slot renamed to
+ * say what to put in it, so no usage synopsis is duplicated here.
+ */
+export function buildVagueTitleLine(quest: { id: string; title: string; alias: string }): string {
+  const reword = usageText("quest reword")
+    .replace(" [--outcome]", "")
+    .replace("<title>", "<specific outcome>")
+    .replace("<id>", quest.id);
+  return `Quest "${quest.title}" [${quest.alias}] has a vague title; reword it with: ${reword}`;
 }
 
 /**

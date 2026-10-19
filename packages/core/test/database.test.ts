@@ -19,7 +19,7 @@ describe("openDatabase", () => {
 
       const version = (second.query("PRAGMA user_version;").get() as { user_version: number })
         .user_version;
-      expect(version).toBe(27);
+      expect(version).toBe(28);
 
       const tableNames = (
         second.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as {

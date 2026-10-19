@@ -357,6 +357,7 @@ function reprojectQuests(database: Database): void {
     .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quests'")
     .get();
   if (!exists) return;
+  ensureQuestTitleFlagColumns(database);
   database.exec(IDENTITY_ALIASES_SQL);
   database.exec("DELETE FROM quests");
   const events = new EventStore(database).read();
@@ -366,6 +367,55 @@ function reprojectQuests(database: Database): void {
       "INSERT INTO projection_state (name, last_event_id) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET last_event_id = excluded.last_event_id",
     )
     .run(questProjection.name, events.at(-1)?.id ?? 0);
+}
+
+/**
+ * TypeScript half of migration 0028: adds `quests.title_vague`/
+ * `title_vague_reason` and `w5_runs.vague_nudged`, then populates the new
+ * derived columns by replaying the quest events in order inside this
+ * transaction (`reprojectQuests`), so a database upgraded from version 26/27
+ * carries exactly the flags a `tempad rebuild` would produce instead of the
+ * ALTER defaults (0/null) for quests already declared. The ALTERs live here,
+ * not in the SQL file, because `reprojectQuests` (step 24) may already have
+ * added the quests columns on a chain that crossed 24 before this version,
+ * and each add is conditional so both orders converge on the same schema.
+ */
+function addTitleQualityColumns(database: Database): void {
+  const quests = database
+    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'quests'")
+    .get();
+  if (quests) ensureQuestTitleFlagColumns(database);
+  const runs = database
+    .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'w5_runs'")
+    .get();
+  reprojectQuests(database);
+  if (!runs) return;
+  const columns = database.query("SELECT name FROM pragma_table_info('w5_runs')").all() as Array<{
+    name: string;
+  }>;
+  if (!columns.some((each) => each.name === "vague_nudged")) {
+    database.exec("ALTER TABLE w5_runs ADD COLUMN vague_nudged TEXT");
+  }
+}
+
+/**
+ * The quest reducer writes the title-quality flag columns (migration 0028),
+ * but `reprojectQuests` (step 24) replays quest events through it while a
+ * chain crossing 24 has not reached 0028 yet, and the reducer would insert
+ * into columns the table does not have. Added here, idempotently, when the
+ * table is missing them; 0028's ALTERs tolerate the same gap the other way.
+ */
+function ensureQuestTitleFlagColumns(database: Database): void {
+  const columns = database.query("SELECT name FROM pragma_table_info('quests')").all() as Array<{
+    name: string;
+  }>;
+  const present = new Set(columns.map((each) => each.name));
+  if (!present.has("title_vague")) {
+    database.exec("ALTER TABLE quests ADD COLUMN title_vague INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!present.has("title_vague_reason")) {
+    database.exec("ALTER TABLE quests ADD COLUMN title_vague_reason TEXT");
+  }
 }
 
 /**
@@ -397,6 +447,7 @@ const MIGRATION_STEPS: Readonly<Record<number, (database: Database) => void>> = 
   23: normalizeWideOffsetCommitDates,
   24: reprojectQuests,
   26: populateStaleWindows,
+  28: addTitleQualityColumns,
 };
 
 /**
