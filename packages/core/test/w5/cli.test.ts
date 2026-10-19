@@ -681,6 +681,91 @@ describe("w5 context", () => {
     expect(code).toBe(0);
     expect(lines.join("\n")).toContain("tempad: session s1, active quests: none.");
   });
+
+  test("a subagent declared via --parent shows its quest in the context line", async () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const store = new EventStore(database);
+    const heroId = newUlid();
+    applyIncremental(
+      database,
+      store.append({
+        actor: "hero",
+        kind: "hero.created",
+        subject: heroId,
+        payload: { name: "S" },
+      }),
+    );
+    declareQuest(store, database, {
+      sessionId: "kid1",
+      parentSessionId: "lead1",
+      newQuest: { title: "Ship l1a", outcome: "ship it", commitment: "personal" },
+      plan: ["agent spawned event"],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-07T09:00:00.000Z",
+      heroId,
+    });
+
+    const lines: string[] = [];
+    const code = await runW5Command(["context", "--session", "kid1"], {
+      database,
+      config: makeConfig(mkdtempSync(join(tmpdir(), "tempad-cli-test-"))),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => lines.push(line),
+    });
+    expect(code).toBe(0);
+    expect(lines.join("\n")).toContain("tempad: session kid1, active quests: Ship l1a [Q1]");
+  });
+
+  test("a subagent whose own quest is retracted falls back to the parent's", async () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const store = new EventStore(database);
+    const heroId = newUlid();
+    applyIncremental(
+      database,
+      store.append({
+        actor: "hero",
+        kind: "hero.created",
+        subject: heroId,
+        payload: { name: "S" },
+      }),
+    );
+    const { questId } = declareQuest(store, database, {
+      sessionId: "kid1",
+      parentSessionId: "lead1",
+      newQuest: { title: "Gone", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-07T09:00:00.000Z",
+      heroId,
+    }) as { questId: string };
+    // The subagent's own quest no longer resolves (retracted), so the line
+    // falls back to the lead session's active quests, like `buildWindow` does.
+    database
+      .query("UPDATE quests SET retracted_at = ? WHERE id = ?")
+      .run("2026-09-07T09:05:00.000Z", questId);
+    declareQuest(store, database, {
+      sessionId: "lead1",
+      newQuest: { title: "Parent quest", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "session",
+      declaredBy: "agent",
+      at: "2026-09-07T08:00:00.000Z",
+      heroId,
+    });
+
+    const lines: string[] = [];
+    await runW5Command(["context", "--session", "kid1"], {
+      database,
+      config: makeConfig(mkdtempSync(join(tmpdir(), "tempad-cli-test-"))),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => lines.push(line),
+    });
+    expect(lines.join("\n")).toContain("active quests: Parent quest [Q1]");
+  });
 });
 
 function insertStint(

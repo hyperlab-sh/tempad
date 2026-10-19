@@ -28,6 +28,7 @@ export const COMMAND_TREE: Readonly<Record<string, readonly string[]>> = {
   ],
   stint: ["list"],
   trace: ["list"],
+  agent: ["spawned"],
   impact: ["set", "list", "import"],
   answer: [],
   rebuild: [],
@@ -129,6 +130,10 @@ export const USAGE_ENTRIES: readonly UsageEntry[] = [
     text: "tempad quest list [--all] [--unconfirmed] [--side] [--as-of <iso>]",
   },
   { paths: ["stint list"], text: "tempad stint list [--open] [--quest <id>]" },
+  {
+    paths: ["agent", "agent spawned"],
+    text: 'tempad agent spawned --parent <lead session id> [--child <child session id>] --role developer|senior-dev|reviewer|mechanic|researcher|squad-leader --harness claude|pi [--model <name>] [--effort <level>] [--ref <bead id>] [--quest <quest id>] [--title "<text>"]   (records the spawn fact; with --child and a resolved quest, also declares that quest for the child in subagent scope)',
+  },
   { paths: ["trace list"], text: "tempad trace list [--since <iso>] [--stint <id>]" },
   { paths: ["impact set"], text: 'tempad impact set <ref> "<text>" [--theme <t>]' },
   {
@@ -410,6 +415,7 @@ export const POSITIONAL_LIMITS: Readonly<Record<string, number>> = {
   "quest declare": 0,
   "quest list": 0,
   "stint list": 0,
+  "agent spawned": 0,
   "trace list": 0,
   "impact set": 2,
   "impact list": 0,

@@ -12,7 +12,10 @@ import {
 } from "../config/env";
 import type { IntentConfig } from "../intent/config";
 import {
+  type ActiveDeclaredQuest,
   activeDeclaredQuests,
+  currentDeclaredQuestForSubagent,
+  latestDeclaredParentSessionId,
   sessionEverDeclared,
   sessionHasActiveDeclaration,
 } from "../intent/declarations";
@@ -171,6 +174,31 @@ function runEnqueue(args: string[], context: W5Context): number {
   return 0;
 }
 
+/**
+ * The quests the hook's `active quests:` line lists. A plain session folds its
+ * own session-scope declarations; a subagent declared with `--parent` (the
+ * shape `tempad agent spawned --child --quest` writes) resolves its own
+ * subagent-scope quest first and falls back to the parent's active quests, the
+ * same resolution `buildWindow` uses, so a spawned agent's context line shows
+ * the quest it was spawned under instead of `none`.
+ */
+export function contextActiveQuests(
+  database: Database,
+  input: { sessionId: string; at: string },
+): ActiveDeclaredQuest[] {
+  const own = activeDeclaredQuests(database, { sessionId: input.sessionId, at: input.at });
+  if (own.length > 0) return own;
+  const parentSessionId = latestDeclaredParentSessionId(database, input.sessionId, input.at);
+  if (parentSessionId === null) return [];
+  const declared = currentDeclaredQuestForSubagent(database, {
+    sessionId: input.sessionId,
+    parentSessionId,
+    at: input.at,
+  });
+  if (declared !== null) return [{ ...declared, alias: "Q1" }];
+  return activeDeclaredQuests(database, { sessionId: parentSessionId, at: input.at });
+}
+
 function runContext(args: string[], context: W5Context): number {
   const { values } = parseArgs({
     args,
@@ -179,7 +207,7 @@ function runContext(args: string[], context: W5Context): number {
   });
   if (!values.session) return 0;
 
-  const active = activeDeclaredQuests(context.database, {
+  const active = contextActiveQuests(context.database, {
     sessionId: values.session,
     at: new Date().toISOString(),
   });

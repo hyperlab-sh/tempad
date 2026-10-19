@@ -1731,6 +1731,137 @@ function runRebuildCommand(args: string[], context: IntentContext): number {
   return 0;
 }
 
+const AGENT_ROLES = [
+  "developer",
+  "senior-dev",
+  "reviewer",
+  "mechanic",
+  "researcher",
+  "squad-leader",
+] as const;
+const AGENT_HARNESSES = ["claude", "pi"] as const;
+
+export const AGENT_SPAWNED_OPTIONS = {
+  parent: { type: "string" },
+  child: { type: "string" },
+  role: { type: "string" },
+  harness: { type: "string" },
+  model: { type: "string" },
+  effort: { type: "string" },
+  ref: { type: "string" },
+  quest: { type: "string" },
+  title: { type: "string" },
+} as const;
+
+/**
+ * `tempad agent spawned`: the lead records a spawn fact, and (when the child
+ * session id is known and a quest resolves) declares that quest for the child
+ * in subagent scope, exactly as `tempad quest declare --session <child>
+ * --parent <parent> --quest <quest>` would -- same function, so one command at
+ * launch time covers both events.
+ */
+function runAgentCommand(args: string[], context: IntentContext): number {
+  const [subcommand, ...rest] = args;
+  if (subcommand !== "spawned") {
+    console.error(`usage: ${usageText("agent spawned")}`);
+    return 2;
+  }
+  const usage = `usage: ${usageText("agent spawned")}`;
+  let values: ReturnType<typeof parseArgs<{ options: typeof AGENT_SPAWNED_OPTIONS }>>["values"];
+  try {
+    ({ values } = parseArgs({ args: rest, options: AGENT_SPAWNED_OPTIONS, strict: true }));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    console.error(usage);
+    return 2;
+  }
+  if (!values.parent || !values.role || !values.harness) {
+    console.error(usage);
+    return 2;
+  }
+  if (!AGENT_ROLES.includes(values.role as (typeof AGENT_ROLES)[number])) {
+    console.error(`--role must be one of ${AGENT_ROLES.join("|")}, got ${values.role}`);
+    return 2;
+  }
+  if (!AGENT_HARNESSES.includes(values.harness as (typeof AGENT_HARNESSES)[number])) {
+    console.error(`--harness must be one of ${AGENT_HARNESSES.join("|")}, got ${values.harness}`);
+    return 2;
+  }
+  const heroId = currentHeroId(context.database);
+  if (!heroId) {
+    console.error("run `tempad hero init` first");
+    return 1;
+  }
+
+  const at = new Date().toISOString();
+  const store = new EventStore(context.database);
+
+  // Resolve the quest before writing anything, so a bad id leaves no event.
+  let questId: string | undefined;
+  if (values.quest) {
+    const resolved = resolveExistingQuest(context.database, values.quest);
+    if (!resolved) {
+      console.error(unavailableQuestMessage(context.database, values.quest));
+      return 1;
+    }
+    questId = resolved;
+  } else if (values.child) {
+    const candidates = activeDeclaredQuests(context.database, {
+      sessionId: values.parent,
+      at,
+    });
+    if (candidates.length === 1) {
+      questId = candidates[0]?.questId;
+    } else if (candidates.length > 1) {
+      // Recorded below as a plain spawn fact; the caller picks a quest and
+      // re-runs with `--quest` if it wants the declaration too.
+      context.stdout(
+        `parent session ${values.parent} has ${candidates.length} active quests: ${candidates
+          .map((quest) => `${quest.questId} (${quest.title})`)
+          .join(", ")}; pass --quest <id> to declare one for the child`,
+      );
+    }
+  }
+
+  const spawnId = newUlid();
+  const payload: Record<string, unknown> = {
+    parent_session_id: values.parent,
+    child_session_id: values.child,
+    role: values.role,
+    harness: values.harness,
+    model: values.model,
+    effort: values.effort,
+    ref: values.ref,
+    quest_id: questId,
+    title: values.title,
+    at,
+  };
+  for (const key of Object.keys(payload)) {
+    if (payload[key] === undefined) delete payload[key];
+  }
+  applyIncremental(
+    context.database,
+    store.append({ actor: "hero", kind: "agent.spawned", subject: spawnId, at, payload }),
+  );
+
+  if (values.child && questId) {
+    declareQuest(store, context.database, {
+      sessionId: values.child,
+      parentSessionId: values.parent,
+      questId,
+      plan: values.title ? [values.title] : [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at,
+      heroId,
+    });
+    context.stdout(`spawned ${spawnId}; declared ${questId} for session ${values.child}`);
+  } else {
+    context.stdout(`spawned ${spawnId}`);
+  }
+  return 0;
+}
+
 export async function runIntentCommand(args: string[], context: IntentContext): Promise<number> {
   const [command, ...rest] = args;
   try {
@@ -1752,6 +1883,8 @@ export async function runIntentCommand(args: string[], context: IntentContext): 
         return runTraceCommand(rest, context);
       case "impact":
         return runImpactCommand(rest, context);
+      case "agent":
+        return runAgentCommand(rest, context);
       case "answer":
         return runAnswerCommand(rest, context);
       case "rebuild":

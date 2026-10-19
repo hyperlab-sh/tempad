@@ -66,6 +66,7 @@ const INTENT_COMMANDS = new Set([
   "quest",
   "stint",
   "trace",
+  "agent",
   "impact",
   "answer",
   "rebuild",
