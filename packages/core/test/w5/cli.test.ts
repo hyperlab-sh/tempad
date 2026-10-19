@@ -766,6 +766,56 @@ describe("w5 context", () => {
     });
     expect(lines.join("\n")).toContain("active quests: Parent quest [Q1]");
   });
+
+  test("a later subagent assignment overrides an older session-scope quest, like buildWindow", async () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    const store = new EventStore(database);
+    const heroId = newUlid();
+    applyIncremental(
+      database,
+      store.append({
+        actor: "hero",
+        kind: "hero.created",
+        subject: heroId,
+        payload: { name: "S" },
+      }),
+    );
+    // The child declared its own quest first (session scope)...
+    declareQuest(store, database, {
+      sessionId: "kid1",
+      newQuest: { title: "Old session quest", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "session",
+      declaredBy: "hero",
+      at: "2026-09-07T09:00:00.000Z",
+      heroId,
+    });
+    // ... then the lead assigned it a subagent quest (agent spawned --child
+    // --quest, the later declaration). The hook must show the assignment, not
+    // the stale session quest -- the same resolution buildWindow uses.
+    declareQuest(store, database, {
+      sessionId: "kid1",
+      parentSessionId: "lead1",
+      newQuest: { title: "Current assigned quest", outcome: "o", commitment: "personal" },
+      plan: [],
+      scope: "subagent",
+      declaredBy: "agent",
+      at: "2026-09-07T10:00:00.000Z",
+      heroId,
+    });
+
+    const lines: string[] = [];
+    await runW5Command(["context", "--session", "kid1"], {
+      database,
+      config: makeConfig(mkdtempSync(join(tmpdir(), "tempad-cli-test-"))),
+      intentConfig: defaultIntentConfig(),
+      stdout: (line) => lines.push(line),
+    });
+    const output = lines.join("\n");
+    expect(output).toContain("active quests: Current assigned quest [Q1]");
+    expect(output).not.toContain("Old session quest");
+  });
 });
 
 function insertStint(

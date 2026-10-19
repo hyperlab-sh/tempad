@@ -1797,6 +1797,9 @@ function runAgentCommand(args: string[], context: IntentContext): number {
   const store = new EventStore(context.database);
 
   // Resolve the quest before writing anything, so a bad id leaves no event.
+  // Resolution does not depend on --child: a pi-style fact (no child id)
+  // carries the same sole-quest attribution; only the child declaration
+  // below needs a child session id.
   let questId: string | undefined;
   if (values.quest) {
     const resolved = resolveExistingQuest(context.database, values.quest);
@@ -1805,7 +1808,7 @@ function runAgentCommand(args: string[], context: IntentContext): number {
       return 1;
     }
     questId = resolved;
-  } else if (values.child) {
+  } else {
     const candidates = activeDeclaredQuests(context.database, {
       sessionId: values.parent,
       at,

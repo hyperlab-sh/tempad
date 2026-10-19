@@ -1,11 +1,15 @@
 import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { openDatabase } from "../../src/db/database";
 import { runIntentCommand } from "../../src/intent/cli";
 import { newUlid } from "../../src/intent/ids";
-import { applyIncremental, ensureTables } from "../../src/intent/projections";
+import { applyIncremental, ensureTables, rebuildAll } from "../../src/intent/projections";
 import { registerAllProjections } from "../../src/intent/projections/register";
 import { EventStore } from "../../src/intent/store";
+import { runSyncEngine } from "../../src/sync/engine";
+import { contextActiveQuests } from "../../src/w5/cli";
+import { FakeRemote, openHost, temporaryDirectory } from "../sync/helpers";
 
 registerAllProjections();
 
@@ -294,6 +298,84 @@ describe("tempad agent spawned", () => {
     expect(spawns.n).toBe(0);
   });
 
+  test("no --child: the parent's single active quest still lands on the fact", async () => {
+    const { run, database } = harness();
+    await run(["hero", "init", "S"]);
+    await run([
+      "quest",
+      "declare",
+      "--session",
+      "lead1",
+      "--new",
+      "Ship l1a",
+      "--outcome",
+      "ship it",
+    ]);
+    const code = await run([
+      "agent",
+      "spawned",
+      "--parent",
+      "lead1",
+      "--role",
+      "developer",
+      "--harness",
+      "pi",
+      "--model",
+      "glm-5.3:xhigh",
+    ]);
+    expect(code).toBe(0);
+    const parentId = database
+      .query(
+        `SELECT json_extract(payload, '$.quest_id') AS questId FROM events
+          WHERE kind = 'quest.declared' AND json_extract(payload, '$.session_id') = 'lead1'`,
+      )
+      .get() as { questId: string };
+    const payload = JSON.parse(
+      (
+        database.query("SELECT payload FROM events WHERE kind = 'agent.spawned'").get() as {
+          payload: string;
+        }
+      ).payload,
+    ) as Record<string, unknown>;
+    expect(payload.quest_id).toBe(parentId.questId);
+    // No child id, so there is nothing to declare for: the fact carries the
+    // attribution on its own.
+    const declared = database
+      .query("SELECT COUNT(*) AS n FROM events WHERE kind = 'quest.declared'")
+      .get() as { n: number };
+    expect(declared.n).toBe(1);
+  });
+
+  test("no --child and several active parent quests: fact without quest_id, candidates printed", async () => {
+    const { run, database, lines } = harness();
+    await run(["hero", "init", "S"]);
+    await run(["quest", "declare", "--session", "lead1", "--new", "Ship A", "--outcome", "a"]);
+    await run(["quest", "declare", "--session", "lead1", "--new", "Ship B", "--outcome", "b"]);
+    const code = await run([
+      "agent",
+      "spawned",
+      "--parent",
+      "lead1",
+      "--role",
+      "mechanic",
+      "--harness",
+      "pi",
+    ]);
+    expect(code).toBe(0);
+    const payload = JSON.parse(
+      (
+        database.query("SELECT payload FROM events WHERE kind = 'agent.spawned'").get() as {
+          payload: string;
+        }
+      ).payload,
+    ) as Record<string, unknown>;
+    expect("quest_id" in payload).toBe(false);
+    const output = lines.join("\n");
+    expect(output).toContain("--quest");
+    expect(output).toContain("Ship A");
+    expect(output).toContain("Ship B");
+  });
+
   test("missing required flags is a usage error", async () => {
     const { run } = harness();
     await run(["hero", "init", "S"]);
@@ -302,29 +384,92 @@ describe("tempad agent spawned", () => {
     expect(await run(["agent", "other"])).toBe(2);
   });
 
-  test("the kind round-trips through the event store (synced-append, like quest.declared)", async () => {
-    const { run, database } = harness();
-    await run(["hero", "init", "S"]);
-    await run([
-      "agent",
-      "spawned",
-      "--parent",
-      "lead1",
-      "--role",
-      "researcher",
-      "--harness",
-      "claude",
-    ]);
-    const store = new EventStore(database);
-    const events = store.read({ kind: "agent.spawned" });
-    expect(events.length).toBe(1);
-    const event = events[0];
-    if (!event) throw new Error("no event read back");
-    expect(event.uid).toBeTruthy();
-    // The store validates kinds on append, so the kind survives a pull's
-    // re-append path exactly like quest.declared does.
-    expect(() =>
-      store.append({ actor: "hero", kind: "agent.spawned", subject: newUlid(), payload: {} }),
-    ).not.toThrow();
+  test("agent.spawned and its child declaration survive push, pull and rebuild", async () => {
+    const directory = temporaryDirectory();
+    const remote = new FakeRemote();
+    const lead = openHost(directory, "host-a");
+    const follower = openHost(directory, "host-b");
+    try {
+      const context = {
+        database: lead,
+        config: {} as never,
+        intentConfig: {} as never,
+        stdout: () => {},
+      };
+      await runIntentCommand(["hero", "init", "S"], context);
+      await runIntentCommand(
+        ["quest", "declare", "--session", "lead1", "--new", "Ship l1a", "--outcome", "ship it"],
+        context,
+      );
+      expect(
+        await runIntentCommand(
+          [
+            "agent",
+            "spawned",
+            "--parent",
+            "lead1",
+            "--child",
+            "kid1",
+            "--role",
+            "developer",
+            "--harness",
+            "claude",
+            "--model",
+            "sonnet",
+            "--title",
+            "Agent spawned event",
+          ],
+          context,
+        ),
+      ).toBe(0);
+
+      await runSyncEngine(lead, remote, {
+        hostSlug: "host-a",
+        batchSize: 500,
+        push: true,
+        pull: true,
+      });
+      const pulled = await runSyncEngine(follower, remote, {
+        hostSlug: "host-b",
+        batchSize: 500,
+        push: true,
+        pull: true,
+      });
+      expect(pulled.pulled.events).toBeGreaterThan(0);
+      expect(pulled.rebuilt).toBe(true);
+
+      const spawn = follower
+        .query("SELECT uid, payload FROM events WHERE kind = 'agent.spawned'")
+        .get() as { uid: string; payload: string };
+      const original = lead
+        .query("SELECT uid, payload FROM events WHERE kind = 'agent.spawned'")
+        .get() as { uid: string; payload: string };
+      expect(spawn.uid).toBe(original.uid);
+      expect(JSON.parse(spawn.payload)).toEqual(JSON.parse(original.payload));
+
+      // The subagent declaration arrived and resolves for the child.
+      expect(
+        follower
+          .query(
+            `SELECT COUNT(*) AS n FROM events WHERE kind = 'quest.declared'
+             AND json_extract(payload, '$.session_id') = 'kid1'`,
+          )
+          .get(),
+      ).toEqual({ n: 1 });
+      expect(
+        contextActiveQuests(follower, { sessionId: "kid1", at: new Date().toISOString() }),
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ title: "Ship l1a" })]));
+
+      // Projections rebuild from the pulled events alone.
+      registerAllProjections();
+      rebuildAll(follower);
+      expect(
+        contextActiveQuests(follower, { sessionId: "kid1", at: new Date().toISOString() }),
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ title: "Ship l1a" })]));
+    } finally {
+      lead.close();
+      follower.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
