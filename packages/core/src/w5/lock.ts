@@ -332,10 +332,7 @@ function removeAbandonedHandoff(
 }
 
 /** Whether the handoff's holder is alive; null when the file names no pid (unknowable). */
-function holderAlive(
-  handoff: HandoffIdentity,
-  isAlive: (pid: number) => boolean,
-): boolean | null {
+function holderAlive(handoff: HandoffIdentity, isAlive: (pid: number) => boolean): boolean | null {
   if (!/^\d+$/.test(handoff.pidText)) return null;
   const pid = Number.parseInt(handoff.pidText, 10);
   if (pid <= 0) return null;
@@ -392,8 +389,9 @@ function giveBackHandoff(
     }
     if (holderAlive(fresh, options.isAlive) === false) {
       // The fresh handoff's holder is gone: park it aside and restore ours.
-      const freshParked = `${clearingPath}.abandoned.${process.pid}.${randomBytes(4)
-        .toString("hex")}`;
+      const freshParked = `${clearingPath}.abandoned.${process.pid}.${randomBytes(4).toString(
+        "hex",
+      )}`;
       renameSync(clearingPath, freshParked);
       try {
         renameSync(parked, clearingPath);
