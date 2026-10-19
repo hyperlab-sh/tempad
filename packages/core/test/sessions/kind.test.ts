@@ -1097,6 +1097,13 @@ describe("session kind events: afterRebuild honors the replay horizon", () => {
       source: "manual",
       confidence: 1,
     });
+    // The horizon leak the guard exists for: a rule row derived from the
+    // future declaration must not exist at all in the historical rebuild,
+    // not merely lose to the manual row.
+    const historicalRows = database
+      .query("SELECT session_id, origin, kind FROM session_kind ORDER BY origin")
+      .all() as { session_id: string; origin: string; kind: string }[];
+    expect(historicalRows).toEqual([{ session_id: "sub", origin: "manual", kind: "human" }]);
     const { stateAsOf } = require("../../src/intent/time-travel");
     expect(effectiveSessionKind(stateAsOf(database, until), "sub")).toEqual({
       kind: "human",
