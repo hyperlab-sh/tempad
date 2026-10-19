@@ -1010,7 +1010,7 @@ describe("prompt rendering per mode", () => {
     expect(text).toContain('"guess"');
     expect(text).toContain("active quests");
     expect(text).not.toContain('"matchedQuest"');
-    expect(text).not.toContain('"proposedQuest"');
+    expect(text).toContain('"proposedQuest"'); // declared: only a titled, human-triggered deviation
     expect(text).not.toContain('"questions"');
     expect(text).not.toContain("which_quest");
     expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(SYSTEM_PROMPT_BUDGET_BYTES);
