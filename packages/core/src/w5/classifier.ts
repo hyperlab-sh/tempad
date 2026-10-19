@@ -1,4 +1,5 @@
 import type { SessionKind } from "../sessions/kinds";
+import type { MessageAuthorship } from "./authorship";
 import { classifyWithRetry } from "./classifier-shared";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt";
 
@@ -9,7 +10,7 @@ export interface ClassifierWindow {
   gitBranch: string | null;
   org: string;
   project: string;
-  messages: { ts: string; role: string; text: string }[];
+  messages: { ts: string; role: string; text: string; authorship?: MessageAuthorship }[];
   /**
    * Which prompt and apply path this window is for. `"inferred"` is the
    * pre-verifier behavior, used by `[w5].mode = "inferred"` and by backfill's
@@ -20,10 +21,11 @@ export interface ClassifierWindow {
   mode: "declared" | "inferred";
   /**
    * Who started the session (`src/sessions/kind.ts`: a manual kind, else the
-   * inferred one), absent while no pass has classified it. Carried for the
-   * prompt to use later; neither prompt reads it yet.
+   * inferred one), null while no pass has classified it. Set by `buildWindow`
+   * from `effectiveSessionKind` when the caller does not pass one; the prompt
+   * reads it for the deviation rules and the lead variant.
    */
-  sessionKind?: SessionKind;
+  sessionKind?: SessionKind | null;
   /**
    * Every quest this session has declared and not ended (`tempad quest declare`),
    * as of the window's reference time, each with the alias the model names it by.
@@ -70,6 +72,8 @@ export interface ClassifierWindow {
     why: string;
     questId: string | null;
     questTitle: string | null;
+    /** The quest's `--outcome` text, so the prompt lists it next to the title. */
+    questOutcome?: string | null;
     openedAt: string;
     lastTraceEndedAt: string;
   }[];
@@ -79,14 +83,16 @@ export interface ClassifierWindow {
     why: string;
     questId: string | null;
     questTitle: string | null;
+    /** The quest's `--outcome` text, so the prompt lists it next to the title. */
+    questOutcome?: string | null;
     openedAt: string;
     lastTraceEndedAt: string;
     closedAt: string | null;
     closeReason: string | null;
   }[];
   /** Inference-mode only, like `openQuests`. */
-  recentSideQuests?: { id: string; title: string; trigger: string }[];
-  overlapMessages: { ts: string; role: string; text: string }[];
+  recentSideQuests?: { id: string; title: string; outcome?: string | null; trigger: string }[];
+  overlapMessages: { ts: string; role: string; text: string; authorship?: MessageAuthorship }[];
   previousSessionNote: string | null;
 }
 
@@ -169,7 +175,14 @@ export interface ClassifierSegment {
    */
   /** A listed quest's id, or `"segment:<n>"` for the quest that segment's stint has. */
   matchedQuest?: string | null;
-  proposedQuest?: { title: string; outcome: string; commitment: Commitment } | null;
+  /**
+   * Inference mode: a full proposal (title, outcome, commitment) that creates a
+   * quest. Declared mode: at most `{ title }`, the name of what a deviation
+   * looks like instead -- never a quest the model chooses, and dropped by
+   * `validateSegment` unless the segment is a deviation with a title and a
+   * verbatim human-authored trigger.
+   */
+  proposedQuest?: { title: string; outcome?: string; commitment?: Commitment } | null;
   questions?: LegacyQuestionKind[];
 }
 
@@ -640,7 +653,26 @@ function validateSegment(
     problems.push(`${where}.isSwitch: expected boolean`);
   }
 
-  if (segment.proposedQuest !== undefined && segment.proposedQuest !== null) {
+  if (mode === "declared") {
+    // A claimed deviation is only as good as its name and its cause: the prompt
+    // says a deviation needs a verbatim human-authored trigger and a title for
+    // what the work is instead. A proposal without either -- or on a segment
+    // that belongs -- is downgraded to a plain doubt (belongs false, guess),
+    // never a validation failure, since the doubt itself may still be real.
+    if (segment.proposedQuest !== undefined && segment.proposedQuest !== null) {
+      const proposed =
+        typeof segment.proposedQuest === "object"
+          ? (segment.proposedQuest as Record<string, unknown>)
+          : null;
+      const titled =
+        proposed !== null && typeof proposed.title === "string" && proposed.title.trim() !== "";
+      const triggered = typeof segment.trigger === "string" && segment.trigger.trim() !== "";
+      if (segment.belongs !== false || !titled || !triggered) {
+        segment.proposedQuest = null;
+        counters.selectorDefaulted += 1;
+      }
+    }
+  } else if (segment.proposedQuest !== undefined && segment.proposedQuest !== null) {
     if (typeof segment.proposedQuest !== "object") {
       problems.push(`${where}.proposedQuest: expected object or null`);
     } else {
@@ -789,7 +821,9 @@ export class AnthropicClassifier implements Classifier {
 
   async classify(window: ClassifierWindow): Promise<ClassifierResult> {
     // The window's mode decides which schema the model is asked to fill in.
-    const systemPrompt = buildSystemPrompt(window.mode);
+    const systemPrompt = buildSystemPrompt(window.mode, {
+      sessionKind: window.sessionKind ?? null,
+    });
     const userPrompt = buildUserPrompt(window);
     return classifyWithRetry(window, userPrompt, (prompt) => this.request(systemPrompt, prompt));
   }

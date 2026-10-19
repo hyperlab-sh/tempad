@@ -158,6 +158,7 @@ describe("window builder", () => {
         why: "ship",
         questId: "Q1",
         questTitle: "Ship marko-ui",
+        questOutcome: "86 components",
         openedAt: "2026-09-04T14:00:00.000Z",
         lastTraceEndedAt: "2026-09-04T14:30:00.000Z",
       },
@@ -212,6 +213,7 @@ describe("window builder", () => {
         why: "ship it",
         questId: "Q1",
         questTitle: "Ship marko-ui",
+        questOutcome: "86 components",
         openedAt: "2026-09-04T10:00:00.000Z",
         lastTraceEndedAt: "2026-09-04T11:00:00.000Z",
         closedAt: "2026-09-04T11:00:00.000Z",
@@ -264,7 +266,12 @@ describe("window builder", () => {
     });
 
     expect(window.recentSideQuests).toEqual([
-      { id: "Q2", title: "Compare Astryx", trigger: "what does Astryx do for agents?" },
+      {
+        id: "Q2",
+        title: "Compare Astryx",
+        outcome: "see what they claim",
+        trigger: "what does Astryx do for agents?",
+      },
     ]);
   });
 
@@ -306,7 +313,7 @@ describe("window builder", () => {
     });
 
     expect(window.recentSideQuests).toEqual([
-      { id: "Q3", title: "Silence the hook", trigger: "the hook prints noise" },
+      { id: "Q3", title: "Silence the hook", outcome: null, trigger: "the hook prints noise" },
     ]);
   });
 

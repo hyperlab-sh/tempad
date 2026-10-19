@@ -5,7 +5,9 @@ import {
   currentDeclaredQuestForSubagent,
   latestDeclaredParentSessionId,
 } from "../intent/declarations";
+import { effectiveSessionKind } from "../sessions/kind";
 import type { SessionKind } from "../sessions/kinds";
+import { messageAuthorship } from "./authorship";
 import { type ClassifierWindow, type DeclaredQuestSlice, planAliasPrefix } from "./classifier";
 
 export function findSessionFile(database: Database, sessionId: string): string | null {
@@ -50,6 +52,7 @@ interface StintRow {
   why: string;
   questId: string | null;
   questTitle: string | null;
+  questOutcome?: string | null;
   openedAt: string;
   lastTraceEndedAt: string;
 }
@@ -89,6 +92,7 @@ const ACTIVITY_SLICE_SELECT = `
          latest.why as why,
          stints.quest_id as questId,
          quests.title as questTitle,
+         quests.outcome as questOutcome,
          stints.opened_at as openedAt,
          latest.ended_at as lastTraceEndedAt,
          stints.closed_at as closedAt,
@@ -121,6 +125,27 @@ function toAliasedSlices(
   return { quests, aliases };
 }
 
+interface WindowMessageRow {
+  ts: string;
+  role: string;
+  originKind: string | null;
+  text: string;
+}
+
+/** Labels each message with who authored it (human, agent, tool). */
+function withAuthorship(message: WindowMessageRow) {
+  return {
+    ts: message.ts,
+    role: message.role,
+    text: message.text,
+    authorship: messageAuthorship({
+      role: message.role,
+      originKind: message.originKind,
+      text: message.text,
+    }),
+  };
+}
+
 export function buildWindow(database: Database, input: BuildWindowInput): ClassifierWindow {
   const session = database
     .query(
@@ -143,22 +168,24 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
     input.sinceTs !== null
       ? (database
           .query(
-            `SELECT ts, role, text_preview as text FROM claude_messages
+            `SELECT ts, role, origin_kind as originKind, text_preview as text FROM claude_messages
              WHERE session_id = ? AND ts > ? AND text_preview IS NOT NULL
              ORDER BY ts ASC`,
           )
-          .all(input.sessionId, input.sinceTs) as { ts: string; role: string; text: string }[])
+          .all(input.sessionId, input.sinceTs) as WindowMessageRow[])
       : (
           database
             .query(
-              `SELECT ts, role, text_preview as text FROM claude_messages
+              `SELECT ts, role, origin_kind as originKind, text_preview as text FROM claude_messages
              WHERE session_id = ? AND text_preview IS NOT NULL
              ORDER BY ts DESC LIMIT ?`,
             )
-            .all(input.sessionId, input.maxMessages) as { ts: string; role: string; text: string }[]
+            .all(input.sessionId, input.maxMessages) as WindowMessageRow[]
         ).reverse();
 
-  const messages = input.sinceTs !== null ? messageRows.slice(-input.maxMessages) : messageRows;
+  const messages = (
+    input.sinceTs !== null ? messageRows.slice(-input.maxMessages) : messageRows
+  ).map(withAuthorship);
 
   const mode = input.mode ?? "declared";
 
@@ -315,7 +342,7 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
     mode === "inferred"
       ? (database
           .query(
-            `SELECT quests.id as id, quests.title as title, quests.trigger as trigger
+            `SELECT quests.id as id, quests.title as title, quests.outcome as outcome, quests.trigger as trigger
          FROM quests
         WHERE quests.branched_at IS NOT NULL
           AND quests.trigger IS NOT NULL
@@ -327,7 +354,12 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
         ORDER BY quests.branched_at DESC
         LIMIT 3`,
           )
-          .all(session.org) as { id: string; title: string; trigger: string }[])
+          .all(session.org) as {
+          id: string;
+          title: string;
+          outcome: string | null;
+          trigger: string;
+        }[])
       : undefined;
 
   // Only a window with a cut has messages "before" it. A whole-session window
@@ -339,16 +371,14 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
       : (
           database
             .query(
-              `SELECT ts, role, text_preview as text FROM claude_messages
+              `SELECT ts, role, origin_kind as originKind, text_preview as text FROM claude_messages
                 WHERE session_id = ? AND ts <= ? AND text_preview IS NOT NULL
                 ORDER BY ts DESC LIMIT ?`,
             )
-            .all(input.sessionId, input.sinceTs, input.overlapMessages) as {
-            ts: string;
-            role: string;
-            text: string;
-          }[]
-        ).reverse();
+            .all(input.sessionId, input.sinceTs, input.overlapMessages) as WindowMessageRow[]
+        )
+          .reverse()
+          .map(withAuthorship);
 
   const runRow = database
     .query("SELECT session_note FROM w5_runs WHERE session_id = ?")
@@ -441,7 +471,7 @@ export function buildWindow(database: Database, input: BuildWindowInput): Classi
     project: session.project,
     messages,
     mode,
-    ...(input.sessionKind === undefined ? {} : { sessionKind: input.sessionKind }),
+    sessionKind: input.sessionKind ?? effectiveSessionKind(database, input.sessionId)?.kind ?? null,
     activeQuests,
     activeQuestAliases,
     parentActiveQuests,
