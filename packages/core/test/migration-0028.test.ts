@@ -36,6 +36,8 @@ function buildVersion26Database(): void {
   ensureTables(old);
   const store = new EventStore(old);
   const at = "2026-09-07T09:00:00.000Z";
+  const questId = newUlid();
+  const rewordTarget = newUlid();
   const events = [
     store.append({
       actor: "hero",
@@ -46,7 +48,7 @@ function buildVersion26Database(): void {
     store.append({
       actor: "hero",
       kind: "quest.created",
-      subject: newUlid(),
+      subject: questId,
       payload: { owner: { kind: "hero", id: HERO }, title: "fix stuff", outcome: "x" },
       at,
     }),
@@ -64,7 +66,7 @@ function buildVersion26Database(): void {
     store.append({
       actor: "hero",
       kind: "quest.created",
-      subject: newUlid(),
+      subject: rewordTarget,
       payload: {
         owner: { kind: "hero", id: HERO },
         title: "Ship the sync engine v2", // distinct title; the reword below creates the duplicate
@@ -75,7 +77,7 @@ function buildVersion26Database(): void {
     store.append({
       actor: "hero",
       kind: "quest.reworded",
-      subject: store.read().at(-1)!.subject,
+      subject: rewordTarget,
       payload: { title: "Ship the sync engine" },
       at,
     }),
