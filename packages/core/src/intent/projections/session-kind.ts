@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { isSessionKind, SESSION_KINDS, type SessionKind } from "../../sessions/kinds";
 import type { EventRecord } from "../events";
-import type { Projection } from "./index";
+import type { Projection, ProjectionReplay } from "./index";
 
 /**
  * The kind of every Claude session (human, lead, subagent, automated) is a
@@ -41,9 +41,9 @@ export const sessionKindProjection: Projection = {
   name: "session_kind",
   tables: ["session_kind"],
   createSql: SESSION_KIND_SQL,
-  apply(database: Database, event: EventRecord): void {
+  apply(database: Database, event: EventRecord, replay?: ProjectionReplay): void {
     if (event.uid === null) return; // not orderable against replayed rows
-    if (event.kind === "session.kind_set") applySet(database, event);
+    if (event.kind === "session.kind_set") applySet(database, event, replay);
     else if (event.kind === "session.kind_inferred") applyInferred(database, event);
   },
   /**
@@ -88,7 +88,7 @@ function upsertOrdered(
     .run(event.subject, origin, kind, source, confidence, classifierVersion, event.at, event.uid);
 }
 
-function applySet(database: Database, event: EventRecord): void {
+function applySet(database: Database, event: EventRecord, replay?: ProjectionReplay): void {
   const kind = event.payload.kind;
   if (kind === null) {
     // A clear removes only the manual decision, and only when it is not older
@@ -106,17 +106,16 @@ function applySet(database: Database, event: EventRecord): void {
   // A set older than a later clear must not resurrect the manual decision
   // once the clear has deleted its row. The event log is the only witness,
   // so the guard reads it: no later kind-less `session.kind_set` may exist.
-  // (Rebuild replays in uid order with the log already in place, so the same
-  // guard converges.)
+  // The guard is bounded by the replay horizon (`tempad rebuild --until`): a
+  // clear past the requested date was never applied, so the set it would
+  // undo still holds in that historical rebuild (and matches `stateAsOf`,
+  // whose target only ever holds in-horizon events). A live apply has no
+  // horizon, so the bound is the end of time.
   const laterClear = database
     .query(
-      `SELECT 1 FROM events
-       WHERE kind = 'session.kind_set' AND subject = ?
-         AND (at, uid) > (?, ?)
-         AND json_extract(payload, '$.kind') IS NULL
-       LIMIT 1`,
+      "SELECT 1 FROM events WHERE kind = 'session.kind_set' AND subject = ? AND (at, uid) > (?, ?) AND json_extract(payload, '$.kind') IS NULL AND at <= ? LIMIT 1",
     )
-    .get(event.subject, event.at, event.uid);
+    .get(event.subject, event.at, event.uid, replay?.until ?? "9999-12-31T23:59:59.999Z");
   if (laterClear !== null) return;
   upsertOrdered(database, event, "manual", kind, "manual", 1, 1);
 }

@@ -944,3 +944,110 @@ describe("session kind events: ordering and replay", () => {
     expect(effectiveSessionKind(database, "s1")?.kind).toBe("human");
   });
 });
+
+describe("session kind events: replay horizon and fact-backed replay", () => {
+  function appendAt(
+    database: ReturnType<typeof openDatabase>,
+    input: {
+      kind: "session.kind_set" | "session.kind_inferred";
+      sessionId: string;
+      at: string;
+      payload: Record<string, unknown>;
+    },
+  ): void {
+    const { applyIncremental } = require("../../src/intent/projections");
+    const event = new EventStore(database).append({
+      actor: "hero",
+      kind: input.kind,
+      subject: input.sessionId,
+      at: input.at,
+      payload: input.payload,
+    });
+    applyIncremental(database, event);
+  }
+
+  test("a rebuild --until between a manual set and its later clear keeps the set", () => {
+    const database = openDatabase(":memory:");
+    ensureTables(database);
+    seedSession(database, {
+      id: "s1",
+      startedAt: "2026-10-02T10:00:00.000Z",
+      messages: [
+        {
+          uuid: "m",
+          ts: "2026-10-02T10:00:01.000Z",
+          text: "You are the reviewer",
+          originKind: "human",
+        },
+      ],
+    });
+    appendAt(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-03T00:00:00.000Z",
+      payload: { kind: "human" },
+    });
+    appendAt(database, {
+      kind: "session.kind_set",
+      sessionId: "s1",
+      at: "2026-10-04T00:00:00.000Z",
+      payload: { kind: null },
+    });
+
+    const until = "2026-10-03T23:59:59.999Z";
+    // A historical rebuild through Oct 3 must not see the Oct 4 clear: the
+    // manual decision held on that date, exactly as stateAsOf replays it.
+    rebuildAll(database, { until });
+    expect(effectiveSessionKind(database, "s1")).toEqual({
+      kind: "human",
+      source: "manual",
+      confidence: 1,
+    });
+    const { stateAsOf } = require("../../src/intent/time-travel");
+    const asOf = stateAsOf(database, until);
+    expect(effectiveSessionKind(asOf, "s1")).toEqual({
+      kind: "human",
+      source: "manual",
+      confidence: 1,
+    });
+
+    // A full rebuild applies the clear and falls back to the rule.
+    rebuildAll(database);
+    expect(effectiveSessionKind(database, "s1")).toEqual({
+      kind: "subagent",
+      source: "rule:you-are",
+      confidence: 0.9,
+    });
+  });
+
+  test("a populated schema-26 copy upgrades to 27 and replays equal", () => {
+    const directory = mkdtempSync(join(tmpdir(), "tempad-kind-replay-"));
+    const source = openDatabase(join(directory, "v26.db"), { upToVersion: 26 });
+    seedSession(source, {
+      id: "s1",
+      startedAt: "2026-10-02T10:00:00.000Z",
+      messages: [
+        {
+          uuid: "m",
+          ts: "2026-10-02T10:00:01.000Z",
+          text: "You are the reviewer",
+          originKind: "human",
+        },
+      ],
+    });
+    const copyPath = join(directory, "copy.db");
+    source.exec(`VACUUM INTO '${copyPath.replace(/'/g, "''")}'`);
+    source.close();
+
+    const copy = openDatabase(copyPath);
+    rebuildAll(copy);
+    expect(effectiveSessionKind(copy, "s1")).toEqual({
+      kind: "subagent",
+      source: "rule:you-are",
+      confidence: 0.9,
+    });
+    const { compareProjectionsToReplay } = require("../../src/scry/replay");
+    expect(compareProjectionsToReplay(copy)).toEqual([]);
+    copy.close();
+  });
+});
