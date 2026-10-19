@@ -650,3 +650,30 @@ describe("sweep of parked handoff files a crashed clear left behind", () => {
     });
   });
 });
+
+describe("handoff give-back: a filesystem without hard links", () => {
+  test("an EPERM link falls back to rename and does not throw", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const eperm = () => {
+        const error = new Error("link not permitted") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      };
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        isAlive: (pid: number) => pid === 4343,
+        givebackLink: eperm,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, "4343"); // a live handoff that must be given back
+        },
+      });
+      expect(outcome).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+});

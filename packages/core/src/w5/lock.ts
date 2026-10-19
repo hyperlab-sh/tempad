@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   linkSync,
   openSync,
   readdirSync,
@@ -119,6 +120,8 @@ export interface ClearStaleLockOptions extends LockCheckOptions {
   beforeRemoveAbandoned?: () => void;
   /** After the judged handoff has been parked aside, before it is given back. */
   afterParkAbandoned?: (parked: string) => void;
+  /** Replaces `linkSync` in the give-back (tests only). */
+  givebackLink?: (parked: string, clearingPath: string) => void;
 }
 
 export type ClearOutcome =
@@ -179,6 +182,7 @@ export function tryClearStaleLock(
     options.beforeRemoveAbandoned?.();
     removeAbandonedHandoff(clearingPath, abandoned, {
       isAlive: options.isAlive ?? pidIsAlive,
+      link: options.givebackLink,
       afterPark: options.afterParkAbandoned,
     });
     if (!acquireLock(clearingPath)) return "contended";
@@ -291,6 +295,7 @@ function sweepAbandonedHandoffs(lockPath: string, isAlive: (pid: number) => bool
 
 interface HandoffRemovalOptions {
   isAlive: (pid: number) => boolean;
+  link?: (parked: string, clearingPath: string) => void;
   afterPark?: (parked: string) => void;
 }
 
@@ -348,7 +353,10 @@ function holderAlive(
  * handoff whose holder is gone loses. When both holders are alive the fresh file at the path
  * wins — it is the newer act, and the displaced holder's `releaseLock` refuses on a pid
  * mismatch, so it can never remove the survivor's handoff; the job claim (`holdsClaim`,
- * `src/w5/jobs.ts`) keeps that residue correct.
+ * `src/w5/jobs.ts`) keeps that residue correct. A filesystem that refuses `link` outright
+ * (EPERM, no hard links) falls back to renaming the parked file back, but only while the path is
+ * still absent — never over a handoff with a holder of its own — and only if that too fails does
+ * the give-back throw.
  */
 function giveBackHandoff(
   clearingPath: string,
@@ -357,12 +365,20 @@ function giveBackHandoff(
   options: HandoffRemovalOptions,
 ): void {
   if (holderAlive(taken, options.isAlive) === false) return; // the holder is gone: drop, do not restore
-  const link = (from: string, to: string) => linkSync(from, to);
+  const link = options.link ?? ((from: string, to: string) => linkSync(from, to));
   try {
     link(parked, clearingPath);
     return;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      // No hard links here (or not permitted): rename back, but never over a path that filled in
+      // between the failed link and now — that file has a holder of its own.
+      if (!existsSync(clearingPath)) {
+        renameSync(parked, clearingPath);
+        return;
+      }
+      // The path filled in between: fall through and decide against the fresh handoff.
+    }
     const fresh = handoffIdentity(clearingPath);
     if (fresh === null) {
       // Vanished again before it could be read: try the link once more and let it go either way;
