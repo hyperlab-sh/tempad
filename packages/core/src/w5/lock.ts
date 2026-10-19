@@ -3,6 +3,7 @@ import {
   closeSync,
   linkSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -10,6 +11,7 @@ import {
   utimesSync,
   writeSync,
 } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 /** A lock older than this whose runner is gone (or unknown) is cleared. */
 export const STALE_LOCK_MINUTES = 30;
@@ -146,6 +148,10 @@ export type ClearOutcome =
  * if it is the one that was judged abandoned (`removeAbandonedHandoff`), so a second run judging
  * the same abandoned handoff cannot delete the fresh one the first run took; what remains needs
  * a crash inside the critical section plus a third run inside the microseconds of the give-back.
+ * A crash between parking the judged handoff and the give-back leaves a
+ * `<lock>.clearing.abandoned.<pid>.<hex>` file behind; every run sweeps those older than
+ * `CLEARING_STALE_MS` whose parker is dead (`sweepAbandonedHandoffs`), so they never outlive the
+ * pid they name.
  * `releaseLock` unlinks by path after reading the pid, so a holder past the hold ceiling
  * releasing at the very moment it is cleared can still take down the lock a third run just
  * acquired; that needs a runner that held the lock for over six hours and is harmless to
@@ -157,6 +163,10 @@ export function tryClearStaleLock(
   log: (line: string) => void,
   options: ClearStaleLockOptions = {},
 ): ClearOutcome {
+  const swept = sweepAbandonedHandoffs(lockPath, options.isAlive ?? pidIsAlive);
+  if (swept > 0) {
+    log(`${options.name ?? "w5.lock"}: removed ${swept} handoff file(s) left by a crashed clear`);
+  }
   if (!checkLock(lockPath, options).stale) return "not-stale";
   options.afterJudgedStale?.();
 
@@ -237,6 +247,46 @@ function abandonedHandoff(
   if (clearer <= 0) return ageMs > CLEARING_STALE_MS ? seen : null;
   if (clearer !== process.pid && !isAlive(clearer)) return seen;
   return ageMs > STALE_LOCK_MINUTES * 60_000 ? seen : null;
+}
+
+/** The suffix every parked handoff file carries, `.abandoned.<pid>.<hex>`. */
+const ABANDONED_SUFFIX = ".abandoned";
+
+/**
+ * Removes `<lock>.clearing.abandoned.*` files left by a run that crashed between parking a
+ * handoff and the give-back or the delete. A parked file is swept only when it is older than
+ * `CLEARING_STALE_MS` and the pid in its name (the run that parked it) is dead: a live run may
+ * be mid-give-back with its file parked right now, and its own `finally` removes it. The sweep
+ * runs before the stale check so the files go even when the lock itself is not stale yet.
+ */
+function sweepAbandonedHandoffs(lockPath: string, isAlive: (pid: number) => boolean): number {
+  const prefix = `${basename(lockPath)}.clearing${ABANDONED_SUFFIX}.`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dirname(lockPath));
+  } catch {
+    return 0; // no directory (yet): nothing to sweep
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    const path = join(dirname(lockPath), entry);
+    try {
+      if (Date.now() - statSync(path).mtimeMs <= CLEARING_STALE_MS) continue;
+    } catch {
+      continue; // gone already
+    }
+    const pidText = entry.slice(prefix.length).split(".")[0] ?? "";
+    const pid = /^\d+$/.test(pidText) ? Number.parseInt(pidText, 10) : 0;
+    if (pid > 0 && (pid === process.pid || isAlive(pid))) continue;
+    try {
+      unlinkSync(path);
+      removed += 1;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return removed;
 }
 
 interface HandoffRemovalOptions {

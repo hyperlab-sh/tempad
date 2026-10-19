@@ -599,3 +599,54 @@ describe("handoff give-back: the holder released while its handoff was parked", 
     });
   });
 });
+
+describe("sweep of parked handoff files a crashed clear left behind", () => {
+  function parkedPath(lockPath: string, pid: string, salt = "aabbccdd"): string {
+    return `${clearingPathFor(lockPath)}.abandoned.${pid}.${salt}`;
+  }
+
+  test("an old parked file with a dead parker is swept even when the lock is not stale", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const orphan = parkedPath(path, String(deadPid()));
+      writeFileSync(orphan, String(deadPid()));
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(orphan, old, old);
+      const lines: string[] = [];
+      expect(tryClearStaleLock(path, (line) => lines.push(line), { now: NOW })).toBe("not-stale");
+      expect(existsSync(orphan)).toBe(false);
+      expect(existsSync(path)).toBe(true);
+      expect(lines.join("\n")).toContain("handoff file(s) left by a crashed clear");
+    });
+  });
+
+  test("a parked file with a live parker or a fresh mtime stays", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const liveParker = parkedPath(path, "4343");
+      writeFileSync(liveParker, "4343");
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(liveParker, old, old);
+
+      const fresh = parkedPath(path, String(deadPid()), "11223344");
+      writeFileSync(fresh, String(deadPid()));
+
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: (pid) => pid === 4343 })).toBe(
+        "not-stale",
+      );
+      expect(existsSync(liveParker)).toBe(true);
+      expect(existsSync(fresh)).toBe(true);
+    });
+  });
+
+  test("another lock's parked files are not touched", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const other = join(dirname(path), "sync.lock.clearing.abandoned.999.ffee");
+      writeFileSync(other, "999");
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(other, old, old);
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe(
+        "not-stale",
+      );
+      expect(existsSync(other)).toBe(true);
+    });
+  });
+});
