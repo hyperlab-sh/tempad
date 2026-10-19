@@ -288,19 +288,25 @@ function holderAlive(
 }
 
 /**
- * Restores a parked handoff that turned out not to be the abandoned one. Between the rename that
- * parked it and the `link` that gives it back, a third run can create a fresh handoff at the
- * path, so the link hits EEXIST: the path holds one file, and the handoff whose holder is gone
- * loses. When both holders are alive the fresh file at the path wins — it is the newer act, and
- * the displaced holder's `releaseLock` refuses on a pid mismatch, so it can never remove the
- * survivor's handoff; the job claim (`holdsClaim`, `src/w5/jobs.ts`) keeps that residue correct.
+ * Restores a parked handoff that turned out not to be the abandoned one. Before the link, the
+ * parked holder is re-checked: one that released or died while its file was parked is dropped
+ * instead of restored, so the path does not read contended for a holder that no longer exists
+ * (a live holder that merely released cannot be told from one still inside the critical section,
+ * so liveness is the test; its restored file would be bounded by the stale rules like any
+ * other). Between the rename that parked it and the `link` that gives it back, a third run can
+ * create a fresh handoff at the path, so the link hits EEXIST: the path holds one file, and the
+ * handoff whose holder is gone loses. When both holders are alive the fresh file at the path
+ * wins — it is the newer act, and the displaced holder's `releaseLock` refuses on a pid
+ * mismatch, so it can never remove the survivor's handoff; the job claim (`holdsClaim`,
+ * `src/w5/jobs.ts`) keeps that residue correct.
  */
 function giveBackHandoff(
   clearingPath: string,
   parked: string,
-  _taken: HandoffIdentity,
+  taken: HandoffIdentity,
   options: HandoffRemovalOptions,
 ): void {
+  if (holderAlive(taken, options.isAlive) === false) return; // the holder is gone: drop, do not restore
   const link = (from: string, to: string) => linkSync(from, to);
   try {
     link(parked, clearingPath);

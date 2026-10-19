@@ -577,3 +577,25 @@ describe("handoff give-back: a third run lands during the give-back", () => {
     });
   });
 });
+
+describe("handoff give-back: the holder released while its handoff was parked", () => {
+  test("a holder gone during the clearing window is not restored: the lock reads free", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        isAlive: () => false,
+        beforeRemoveAbandoned: () => {
+          // another run took a fresh handoff, whose holder then died (or released) while parked
+          rmSync(clearing);
+          writeFileSync(clearing, String(deadPid()));
+        },
+      });
+      expect(outcome).toBe("cleared");
+      expect(existsSync(clearing)).toBe(false); // released with its holder: no give-back
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+});
