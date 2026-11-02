@@ -119,7 +119,7 @@ and `applyResult` consume, in a fixed field order:
 
 Anything not on this list (stint ids opened by the same window, say) cannot
 change the answer by construction, so it must not be in the hash — otherwise
-the memo never hits. The hash is defined over the *inputs*; the memo key adds
+the memo never hits. The hash is defined over the _inputs_; the memo key adds
 `input_hash` and `classifier_version` so a prompt or model change invalidates
 everything without touching the rows.
 
@@ -161,7 +161,7 @@ human confirmation. "Events are the only thing that crosses hosts" holds.**
   as a mirror, but only the owning host's w5 pass classifies them — that is
   already true via the `host_slug` filter in `backfill.ts`). So the natural
   owner of the cache row and of the derived rows is that host.
-- A second host receives all facts (mirrors + events) and can *recompute* the
+- A second host receives all facts (mirrors + events) and can _recompute_ the
   derived tables only if it also holds cache rows — which, under this
   recommendation, it does not. What it sees instead: quests created by
   inference are absent until confirmed (confirmation is an event and syncs);
@@ -171,11 +171,11 @@ human confirmation. "Events are the only thing that crosses hosts" holds.**
 
 The alternatives, and what they break:
 
-| Option | Second host gets | What breaks |
-|---|---|---|
-| A. host-local cache (recommended) | facts + human events only | inferred stints/traces/quests invisible off-host until confirmed; reports per-host |
-| B. cache as its own sync channel (synced-upsert table, last-writer-wins) | everything | breaks "only events cross hosts": a new table class in `sync/tables.ts`, tombstones for cache rows, and two hosts classifying the same session (backup restored, reinstalled host slug) overwrite each other's memos with no merge story |
-| C. derived on each host by re-running the oracle | everything, eventually | every host pays full classification cost for every session; the claude-cli backend uses the operator's subscription per host; answers can differ per host, so "derived" is not deterministic across hosts — it is a second opinion, not a projection |
+| Option                                                                   | Second host gets          | What breaks                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. host-local cache (recommended)                                        | facts + human events only | inferred stints/traces/quests invisible off-host until confirmed; reports per-host                                                                                                                                                                   |
+| B. cache as its own sync channel (synced-upsert table, last-writer-wins) | everything                | breaks "only events cross hosts": a new table class in `sync/tables.ts`, tombstones for cache rows, and two hosts classifying the same session (backup restored, reinstalled host slug) overwrite each other's memos with no merge story             |
+| C. derived on each host by re-running the oracle                         | everything, eventually    | every host pays full classification cost for every session; the claude-cli backend uses the operator's subscription per host; answers can differ per host, so "derived" is not deterministic across hosts — it is a second opinion, not a projection |
 
 B and C buy cross-host inferred minutes at the cost of either a second sync
 truth or N× classification spend. Inferred output is disposable by premise;
@@ -194,17 +194,17 @@ re-run lazily on the next trigger in their own session, or on a
 `classifier_version` bump. Defense: sessions are the unit of human attention,
 windows are cheap to re-run (memo hits), and a global cascade would re-run
 thousands of windows for a quest title edit — the exact "bulk retract"
-failure mode PR #83 removed. A merge changes what a window *should have
-matched*; under the projection model that is a display staleness, not a data
+failure mode PR #83 removed. A merge changes what a window _should have
+matched_; under the projection model that is a display staleness, not a data
 corruption, because nothing is a fact until confirmed.
 
-| Trigger | Invalidated | Re-run when | Cost |
-|---|---|---|---|
-| new messages in the session | windows whose `ended_at` could extend; next window | live hook / next backfill | one oracle call (memo miss) |
-| `quest.declared` on the session | every window before the declaration's coverage start (`w5_stale_windows` logic, `projections/window.ts`) | next backfill run picks stale windows | forward-in-session re-runs; memo may hit if hash unchanged (declarations are in the hash, so it misses — correct) |
-| `question.answered` / `stint.assigned` | windows overlapping the protected span | next backfill or explicit `w5 rerun --session` | protected rows pinned; only remainder rewritten |
-| quest merged / retracted / ended / reworded (candidate change) | this session's windows naming the quest; *other* sessions' windows naming it stay stale, tolerated | lazy: their own next trigger, or version bump | none until touched |
-| `classifier_version` bump | all windows (new memo key) | next backfill over the range | full reclassification; the old memo rows remain for diffing |
+| Trigger                                                        | Invalidated                                                                                              | Re-run when                                    | Cost                                                                                                              |
+| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| new messages in the session                                    | windows whose `ended_at` could extend; next window                                                       | live hook / next backfill                      | one oracle call (memo miss)                                                                                       |
+| `quest.declared` on the session                                | every window before the declaration's coverage start (`w5_stale_windows` logic, `projections/window.ts`) | next backfill run picks stale windows          | forward-in-session re-runs; memo may hit if hash unchanged (declarations are in the hash, so it misses — correct) |
+| `question.answered` / `stint.assigned`                         | windows overlapping the protected span                                                                   | next backfill or explicit `w5 rerun --session` | protected rows pinned; only remainder rewritten                                                                   |
+| quest merged / retracted / ended / reworded (candidate change) | this session's windows naming the quest; _other_ sessions' windows naming it stay stale, tolerated       | lazy: their own next trigger, or version bump  | none until touched                                                                                                |
+| `classifier_version` bump                                      | all windows (new memo key)                                                                               | next backfill over the range                   | full reclassification; the old memo rows remain for diffing                                                       |
 
 Worked examples, one per trigger:
 
@@ -220,7 +220,7 @@ Worked examples, one per trigger:
    they were derived rows, with zero `retracted` events.
 3. **Human correction.** `tempad answer --belongs <question>` pins the stint
    and its traces; the overlapping window re-runs on next backfill and its
-   cache row is *added* under a new hash, but the deterministic pass keeps
+   cache row is _added_ under a new hash, but the deterministic pass keeps
    the pinned rows and merges the new segments around them.
 4. **Candidate change.** Quest A is merged into B. This session's windows
    that named A re-run and land on B. A different session's window that
