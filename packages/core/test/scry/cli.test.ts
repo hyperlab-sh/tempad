@@ -70,7 +70,9 @@ describe("tempad scry (process)", () => {
   test("a failed check exits 1; recommendations alone exit 0", async () => {
     const home = await makeHealthyHome();
     homes.push(home);
-    seedSession(home.database, { id: "old", endedAt: ago(3 * DAY) });
+    // The spawned CLI reads the real clock, not the fixture's pinned NOW: an "old" session
+    // must be inside its `backfill_days` window measured from today or it never counts.
+    seedSession(home.database, { id: "old", endedAt: ago(3 * DAY, new Date()) });
     const withRecommendation = await tempad(["scry", "--json"], { TEMPAD_HOME: home.directory });
     expect(withRecommendation.code).toBe(0);
     expect(
@@ -154,7 +156,9 @@ describe("help", () => {
     // A report that exercises every section: stale collector, failed jobs, pending windows, broken projection, sync on.
     const home = await makeHealthyHome({ toml: '[sync]\nurl = "libsql://example.invalid"\n' });
     homes.push(home);
-    seedSession(home.database, { id: "old", endedAt: ago(3 * DAY) });
+    // The spawned CLI reads the real clock, not the fixture's pinned NOW: an "old" session
+    // must be inside its `backfill_days` window measured from today or it never counts.
+    seedSession(home.database, { id: "old", endedAt: ago(3 * DAY, new Date()) });
     insertFailedJob(
       home.database,
       "unknown claude session: 11111111-2222-3333-4444-555555555555",
