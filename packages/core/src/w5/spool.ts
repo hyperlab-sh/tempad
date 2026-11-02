@@ -94,7 +94,7 @@ export function drainSpool(
         else result.merged += 1;
       }
     });
-    apply();
+    apply.immediate();
     try {
       unlinkSync(path);
     } catch (error) {
