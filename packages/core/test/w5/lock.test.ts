@@ -529,3 +529,151 @@ describe("racing processes over a stale lock: exactly one takes it", () => {
     });
   });
 });
+
+describe("handoff give-back: a third run lands during the give-back", () => {
+  /**
+   * A lock whose runner is gone, plus the clearing handoff judged abandoned. The
+   * `beforeRemoveAbandoned` hook swaps the handoff for a fresh one (another run cleared the
+   * abandoned one first and took its own), so the parked file is a live handoff that must be
+   * given back, and `afterParkAbandoned` lands after the rename, where a third run can acquire
+   * the now-absent path.
+   */
+  function thirdRunFixture(
+    takenPid: string,
+    thirdRunPid: string,
+    run: (lockPath: string, clearing: string, options: object) => void,
+  ): void {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      run(path, clearing, {
+        now: NOW,
+        isAlive: (pid: number) => pid === 4343 || pid === 4444,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, takenPid);
+        },
+        afterParkAbandoned: () => {
+          writeFileSync(clearing, thirdRunPid);
+        },
+      });
+    });
+  }
+
+  test("a third run's live handoff at the path wins; the parked one is dropped, not restored over it", () => {
+    thirdRunFixture("4343", "4444", (path, clearing, options) => {
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4444");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+
+  test("a third run's handoff whose holder is gone loses: ours is restored and theirs removed", () => {
+    thirdRunFixture("4343", String(deadPid()), (path, clearing, options) => {
+      expect(tryClearStaleLock(path, () => {}, options)).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+});
+
+describe("handoff give-back: the holder released while its handoff was parked", () => {
+  test("a holder gone during the clearing window is not restored: the lock reads free", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        isAlive: () => false,
+        beforeRemoveAbandoned: () => {
+          // another run took a fresh handoff, whose holder then died (or released) while parked
+          rmSync(clearing);
+          writeFileSync(clearing, String(deadPid()));
+        },
+      });
+      expect(outcome).toBe("cleared");
+      expect(existsSync(clearing)).toBe(false); // released with its holder: no give-back
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+});
+
+describe("sweep of parked handoff files a crashed clear left behind", () => {
+  function parkedPath(lockPath: string, pid: string, salt = "aabbccdd"): string {
+    return `${clearingPathFor(lockPath)}.abandoned.${pid}.${salt}`;
+  }
+
+  test("an old parked file with a dead parker is swept even when the lock is not stale", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const orphan = parkedPath(path, String(deadPid()));
+      writeFileSync(orphan, String(deadPid()));
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(orphan, old, old);
+      const lines: string[] = [];
+      expect(tryClearStaleLock(path, (line) => lines.push(line), { now: NOW })).toBe("not-stale");
+      expect(existsSync(orphan)).toBe(false);
+      expect(existsSync(path)).toBe(true);
+      expect(lines.join("\n")).toContain("handoff file(s) left by a crashed clear");
+    });
+  });
+
+  test("a parked file with a live parker or a fresh mtime stays", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const liveParker = parkedPath(path, "4343");
+      writeFileSync(liveParker, "4343");
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(liveParker, old, old);
+
+      const fresh = parkedPath(path, String(deadPid()), "11223344");
+      writeFileSync(fresh, String(deadPid()));
+
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: (pid) => pid === 4343 })).toBe(
+        "not-stale",
+      );
+      expect(existsSync(liveParker)).toBe(true);
+      expect(existsSync(fresh)).toBe(true);
+    });
+  });
+
+  test("another lock's parked files are not touched", () => {
+    withLock(String(process.pid), 0, (path) => {
+      const other = join(dirname(path), "sync.lock.clearing.abandoned.999.ffee");
+      writeFileSync(other, "999");
+      const old = new Date(Date.now() - CLEARING_STALE_MS - 1_000);
+      utimesSync(other, old, old);
+      expect(tryClearStaleLock(path, () => {}, { now: NOW, isAlive: () => false })).toBe(
+        "not-stale",
+      );
+      expect(existsSync(other)).toBe(true);
+    });
+  });
+});
+
+describe("handoff give-back: a filesystem without hard links", () => {
+  test("an EPERM link falls back to rename and does not throw", () => {
+    withLock(String(deadPid()), STALE_LOCK_MINUTES + 5, (path) => {
+      const clearing = clearingPathFor(path);
+      writeFileSync(clearing, String(deadPid()));
+      utimesSync(clearing, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+      const eperm = () => {
+        const error = new Error("link not permitted") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      };
+      const outcome = tryClearStaleLock(path, () => {}, {
+        now: NOW,
+        isAlive: (pid: number) => pid === 4343,
+        givebackLink: eperm,
+        beforeRemoveAbandoned: () => {
+          rmSync(clearing);
+          writeFileSync(clearing, "4343"); // a live handoff that must be given back
+        },
+      });
+      expect(outcome).toBe("contended");
+      expect(readFileSync(clearing, "utf8")).toBe("4343");
+      expect(readdirSync(dirname(path)).sort()).toEqual(["w5.lock", "w5.lock.clearing"]);
+    });
+  });
+});

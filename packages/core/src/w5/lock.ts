@@ -1,8 +1,10 @@
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   linkSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -10,6 +12,7 @@ import {
   utimesSync,
   writeSync,
 } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 /** A lock older than this whose runner is gone (or unknown) is cleared. */
 export const STALE_LOCK_MINUTES = 30;
@@ -115,6 +118,10 @@ export interface ClearStaleLockOptions extends LockCheckOptions {
   beforeUnlink?: () => void;
   /** Between judging a handoff abandoned and removing it. */
   beforeRemoveAbandoned?: () => void;
+  /** After the judged handoff has been parked aside, before it is given back. */
+  afterParkAbandoned?: (parked: string) => void;
+  /** Replaces `linkSync` in the give-back (tests only). */
+  givebackLink?: (parked: string, clearingPath: string) => void;
 }
 
 export type ClearOutcome =
@@ -144,6 +151,10 @@ export type ClearOutcome =
  * if it is the one that was judged abandoned (`removeAbandonedHandoff`), so a second run judging
  * the same abandoned handoff cannot delete the fresh one the first run took; what remains needs
  * a crash inside the critical section plus a third run inside the microseconds of the give-back.
+ * A crash between parking the judged handoff and the give-back leaves a
+ * `<lock>.clearing.abandoned.<pid>.<hex>` file behind; every run sweeps those older than
+ * `CLEARING_STALE_MS` whose parker is dead (`sweepAbandonedHandoffs`), so they never outlive the
+ * pid they name.
  * `releaseLock` unlinks by path after reading the pid, so a holder past the hold ceiling
  * releasing at the very moment it is cleared can still take down the lock a third run just
  * acquired; that needs a runner that held the lock for over six hours and is harmless to
@@ -155,6 +166,10 @@ export function tryClearStaleLock(
   log: (line: string) => void,
   options: ClearStaleLockOptions = {},
 ): ClearOutcome {
+  const swept = sweepAbandonedHandoffs(lockPath, options.isAlive ?? pidIsAlive);
+  if (swept > 0) {
+    log(`${options.name ?? "w5.lock"}: removed ${swept} handoff file(s) left by a crashed clear`);
+  }
   if (!checkLock(lockPath, options).stale) return "not-stale";
   options.afterJudgedStale?.();
 
@@ -165,7 +180,11 @@ export function tryClearStaleLock(
     const abandoned = abandonedHandoff(clearingPath, options.isAlive ?? pidIsAlive);
     if (abandoned === null) return "contended";
     options.beforeRemoveAbandoned?.();
-    removeAbandonedHandoff(clearingPath, abandoned);
+    removeAbandonedHandoff(clearingPath, abandoned, {
+      isAlive: options.isAlive ?? pidIsAlive,
+      link: options.givebackLink,
+      afterPark: options.afterParkAbandoned,
+    });
     if (!acquireLock(clearingPath)) return "contended";
   }
   try {
@@ -234,15 +253,65 @@ function abandonedHandoff(
   return ageMs > STALE_LOCK_MINUTES * 60_000 ? seen : null;
 }
 
+/** The suffix every parked handoff file carries, `.abandoned.<pid>.<hex>`. */
+const ABANDONED_SUFFIX = ".abandoned";
+
+/**
+ * Removes `<lock>.clearing.abandoned.*` files left by a run that crashed between parking a
+ * handoff and the give-back or the delete. A parked file is swept only when it is older than
+ * `CLEARING_STALE_MS` and the pid in its name (the run that parked it) is dead: a live run may
+ * be mid-give-back with its file parked right now, and its own `finally` removes it. The sweep
+ * runs before the stale check so the files go even when the lock itself is not stale yet.
+ */
+function sweepAbandonedHandoffs(lockPath: string, isAlive: (pid: number) => boolean): number {
+  const prefix = `${basename(lockPath)}.clearing${ABANDONED_SUFFIX}.`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dirname(lockPath));
+  } catch {
+    return 0; // no directory (yet): nothing to sweep
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    const path = join(dirname(lockPath), entry);
+    try {
+      if (Date.now() - statSync(path).mtimeMs <= CLEARING_STALE_MS) continue;
+    } catch {
+      continue; // gone already
+    }
+    const pidText = entry.slice(prefix.length).split(".")[0] ?? "";
+    const pid = /^\d+$/.test(pidText) ? Number.parseInt(pidText, 10) : 0;
+    if (pid > 0 && (pid === process.pid || isAlive(pid))) continue;
+    try {
+      unlinkSync(path);
+      removed += 1;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return removed;
+}
+
+interface HandoffRemovalOptions {
+  isAlive: (pid: number) => boolean;
+  link?: (parked: string, clearingPath: string) => void;
+  afterPark?: (parked: string) => void;
+}
+
 /**
  * Removes the handoff that was judged abandoned, and only that one. Two runs can judge the same
  * abandoned handoff: the first removes it and takes a fresh one, and a plain unlink by the second
  * would delete that live handoff, after which both clear the lock. So the file at the path is
  * renamed to a unique name (atomic, and it keeps the inode and mtime), compared with what was
- * judged, and deleted only if it is the same; a handoff that is not (the fresh one) is given back
- * with `link`, which fails rather than replace one a third run has created since.
+ * judged, and deleted only if it is the same; a handoff that is not (the fresh one) is given
+ * back by `giveBackHandoff`.
  */
-function removeAbandonedHandoff(clearingPath: string, judged: HandoffIdentity): void {
+function removeAbandonedHandoff(
+  clearingPath: string,
+  judged: HandoffIdentity,
+  options: HandoffRemovalOptions,
+): void {
   const parked = `${clearingPath}.abandoned.${process.pid}.${randomBytes(4).toString("hex")}`;
   try {
     renameSync(clearingPath, parked);
@@ -250,17 +319,91 @@ function removeAbandonedHandoff(clearingPath: string, judged: HandoffIdentity): 
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
   }
+  options.afterPark?.(parked);
   try {
     const taken = handoffIdentity(parked);
+    // gone already (nothing to give back) or the abandoned one itself: deleted below
     if (taken !== null && !sameHandoff(taken, judged)) {
-      try {
-        linkSync(parked, clearingPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
+      giveBackHandoff(clearingPath, parked, taken, options);
     }
   } finally {
     removeIfPresent(parked);
+  }
+}
+
+/** Whether the handoff's holder is alive; null when the file names no pid (unknowable). */
+function holderAlive(handoff: HandoffIdentity, isAlive: (pid: number) => boolean): boolean | null {
+  if (!/^\d+$/.test(handoff.pidText)) return null;
+  const pid = Number.parseInt(handoff.pidText, 10);
+  if (pid <= 0) return null;
+  return pid === process.pid || isAlive(pid);
+}
+
+/**
+ * Restores a parked handoff that turned out not to be the abandoned one. Before the link, the
+ * parked holder is re-checked: one that released or died while its file was parked is dropped
+ * instead of restored, so the path does not read contended for a holder that no longer exists
+ * (a live holder that merely released cannot be told from one still inside the critical section,
+ * so liveness is the test; its restored file would be bounded by the stale rules like any
+ * other). Between the rename that parked it and the `link` that gives it back, a third run can
+ * create a fresh handoff at the path, so the link hits EEXIST: the path holds one file, and the
+ * handoff whose holder is gone loses. When both holders are alive the fresh file at the path
+ * wins — it is the newer act, and the displaced holder's `releaseLock` refuses on a pid
+ * mismatch, so it can never remove the survivor's handoff; the job claim (`holdsClaim`,
+ * `src/w5/jobs.ts`) keeps that residue correct. A filesystem that refuses `link` outright
+ * (EPERM, no hard links) falls back to renaming the parked file back, but only while the path is
+ * still absent — never over a handoff with a holder of its own — and only if that too fails does
+ * the give-back throw.
+ */
+function giveBackHandoff(
+  clearingPath: string,
+  parked: string,
+  taken: HandoffIdentity,
+  options: HandoffRemovalOptions,
+): void {
+  if (holderAlive(taken, options.isAlive) === false) return; // the holder is gone: drop, do not restore
+  const link = options.link ?? ((from: string, to: string) => linkSync(from, to));
+  try {
+    link(parked, clearingPath);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      // No hard links here (or not permitted): rename back, but never over a path that filled in
+      // between the failed link and now — that file has a holder of its own.
+      if (!existsSync(clearingPath)) {
+        renameSync(parked, clearingPath);
+        return;
+      }
+      // The path filled in between: fall through and decide against the fresh handoff.
+    }
+    const fresh = handoffIdentity(clearingPath);
+    if (fresh === null) {
+      // Vanished again before it could be read: try the link once more and let it go either way;
+      // whoever holds the path now was not observable, and the next run re-judges what is there.
+      try {
+        link(parked, clearingPath);
+      } catch {
+        // the path filled again: nothing restorable to decide against
+      }
+      return;
+    }
+    if (holderAlive(fresh, options.isAlive) === false) {
+      // The fresh handoff's holder is gone: park it aside and restore ours.
+      const freshParked = `${clearingPath}.abandoned.${process.pid}.${randomBytes(4).toString(
+        "hex",
+      )}`;
+      renameSync(clearingPath, freshParked);
+      try {
+        renameSync(parked, clearingPath);
+      } catch {
+        // The path filled again mid-swap; freshParked is removed below either way.
+      } finally {
+        removeIfPresent(freshParked);
+      }
+      return;
+    }
+    // Both holders alive (or the fresh one unknowable): the file at the path stays, ours is
+    // dropped by the caller's finally.
   }
 }
 
