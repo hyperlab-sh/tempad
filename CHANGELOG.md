@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
 ### Added
 
 - w5 verifier prompt hardening. The declared system prompt now states the maneuvers that are **never a deviation** (tests/waiting, rebase/merge, code review, agent check-ins, clarifying questions, reading files, release chores), requires a claimed deviation (`belongs: false` with `proposedQuest`) to quote the human message that caused it in `trigger` verbatim, and downgrades any proposal without a human trigger to a doubt (`guess` set, `proposedQuest` null); subagent and automated sessions are told they never deviate. `proposedQuest` in declared mode is at most `{"title": string}` (the outcome/commitment fields are inference-only): `validateSegment` silently drops a proposal that lacks a title, a trigger, or rides on a `belongs: true` segment, counting `selectorDefaulted`, instead of failing the window. The prompt renders a **lead variant** paragraph (`buildSystemPrompt(mode, { sessionKind })`, filled from `ClassifierWindow.sessionKind`, which `buildWindow` resolves through `effectiveSessionKind` unless the caller passed one): coordinating other agents serves the declared quest. The user prompt labels every message with its authorship (`role/human|agent|tool`, `src/w5/authorship.ts`, computed by `buildWindow` from `claude_messages.origin_kind` and machine-marker prefixes), adds a `session kind:` line, and shows each stint's quest outcome (`quest <title> — <outcome ?? "no outcome">`) plus side-quest outcomes in inference mode. All variants stay within the 2560-byte budget.
