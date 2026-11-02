@@ -212,8 +212,10 @@ function resolveQuest(
     questId: createQuest(store, database, {
       heroId,
       title: proposedQuest.title,
-      outcome: proposedQuest.outcome,
-      commitment: proposedQuest.commitment,
+      // The inference validator guarantees outcome and commitment as strings;
+      // the optional spellings exist for the declared mode, which never proposes.
+      outcome: proposedQuest.outcome ?? proposedQuest.title,
+      commitment: proposedQuest.commitment ?? "exploratory",
       confirmed: false,
     }),
     questCreated: true,
@@ -286,8 +288,8 @@ function reuseStint(
     const questId = createQuest(store, database, {
       heroId,
       title: proposedQuest.title,
-      outcome: proposedQuest.outcome,
-      commitment: proposedQuest.commitment,
+      outcome: proposedQuest.outcome ?? proposedQuest.title,
+      commitment: proposedQuest.commitment ?? "exploratory",
       confirmed: false,
     });
     assignStint(store, database, stintId, questId, "hook");
@@ -436,8 +438,8 @@ interface WindowLedger {
  * Two proposals are one quest when both the title and the outcome match: a
  * generic title ("Bug fixes") proposed twice for different outcomes is two quests.
  */
-function proposalKey(proposed: { title: string; outcome: string }): string {
-  return `${normalizeOutcome(proposed.title)}\n${normalizeOutcome(proposed.outcome)}`;
+function proposalKey(proposed: { title: string; outcome?: string }): string {
+  return `${normalizeOutcome(proposed.title)}\n${normalizeOutcome(proposed.outcome ?? "")}`;
 }
 
 /** Whether a stint slot's reason is the model's own, not the one `validateResult` defaulted. */

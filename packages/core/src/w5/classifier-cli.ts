@@ -78,7 +78,9 @@ export class ClaudeCliClassifier implements Classifier {
 
   async classify(window: ClassifierWindow): Promise<ClassifierResult> {
     // The window's mode decides which schema the model is asked to fill in.
-    const systemPrompt = buildSystemPrompt(window.mode);
+    const systemPrompt = buildSystemPrompt(window.mode, {
+      sessionKind: window.sessionKind ?? null,
+    });
     const userPrompt = buildUserPrompt(window);
     return classifyWithRetry(window, userPrompt, (prompt) => this.request(systemPrompt, prompt));
   }
