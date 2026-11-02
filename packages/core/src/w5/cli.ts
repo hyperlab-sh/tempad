@@ -48,6 +48,7 @@ import { enqueueJob } from "./jobs";
 import { acquireLock, clearStaleLock, releaseLock, touchLock } from "./lock";
 import { type QuestionRow, TRACE_NOT_RETRACTED } from "./questions";
 import { drain } from "./runner";
+import { drainSpool, spoolPending } from "./spool";
 
 export interface SpawnOptions {
   cmd: string[];
@@ -215,6 +216,19 @@ function runContext(args: string[], context: W5Context): number {
   });
   if (!values.session) return 0;
 
+  // The stop hook only spools its requests (it must not start bun); this runs on
+  // every prompt, so it is what starts the runner that turns them into jobs.
+  try {
+    if (spoolPending(context.config.home)) {
+      const lockPath = lockPathFor(context.config);
+      clearStaleLock(lockPath, (line) => log(context.config, line));
+      if (!existsSync(lockPath)) spawnDetachedRun(context);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(context.config, `spool run failed to start: ${message}`);
+  }
+
   const active = contextActiveQuests(context.database, {
     sessionId: values.session,
     at: new Date().toISOString(),
@@ -330,16 +344,27 @@ async function runRun(args: string[], context: W5Context): Promise<number> {
 
   try {
     const classifier = buildClassifier(context.config, context.intentConfig);
-    const count = await drain(
-      context.database,
-      requireFields("tempad w5 run", context.config, W5_RUN_NEEDS),
-      context.intentConfig.w5,
-      classifier,
-      {
+    const needs = requireFields("tempad w5 run", context.config, W5_RUN_NEEDS);
+    let count = 0;
+    // Hooks keep appending while jobs classify (minutes), so drain again until a
+    // pass finds the spool empty; the last request cannot be left behind a lock
+    // this runner still holds.
+    do {
+      const drained = drainSpool(context.database, context.config.home, {
+        throttleMinutes: context.intentConfig.w5.throttleMinutes,
+        log: (line) => log(context.config, line),
+      });
+      if (drained.enqueued + drained.merged + drained.malformed > 0) {
+        log(
+          context.config,
+          `spool: enqueued=${drained.enqueued} merged=${drained.merged} malformed=${drained.malformed}`,
+        );
+      }
+      count += await drain(context.database, needs, context.intentConfig.w5, classifier, {
         log: (line) => log(context.config, line),
         beforeJob: () => touchLock(lockPath),
-      },
-    );
+      });
+    } while (spoolPending(context.config.home));
     context.stdout(`w5: ran ${count} job(s)`);
   } finally {
     releaseLock(lockPath);

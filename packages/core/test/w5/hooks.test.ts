@@ -46,6 +46,21 @@ function hookEnv(dir: string, extra: Record<string, string> = {}): Record<string
   };
 }
 
+const spoolFile = (dir: string): string => join(dir, "w5-spool");
+
+/** The spool lines w5-stop.sh appended, split into [time, session, kind, forced]. */
+function spooled(dir: string): string[][] {
+  return readFileSync(spoolFile(dir), "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => line.split("\t"));
+}
+
+/** w5-stop.sh only spools; w5-prompt.sh calls the CLI. */
+function hookRan(script: string, dir: string, argvLog: string): boolean {
+  return existsSync(script === "w5-stop.sh" ? spoolFile(dir) : argvLog);
+}
+
 function writeFakeCli(path: string, argvLog: string, body = ""): void {
   writeFileSync(path, `#!/bin/sh\necho "$@" >> "${argvLog}"\n${body}`);
   chmodSync(path, 0o755);
@@ -235,114 +250,87 @@ describe("buildDeclarationLine", () => {
 });
 
 describe("w5-stop.sh", () => {
-  test("forwards session id and forces on non-Stop events", async () => {
+  const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/;
+
+  async function runStop(dir: string, hookEventName: string, extra: Record<string, string> = {}) {
+    return runScript(
+      "w5-stop.sh",
+      { session_id: "s1", hook_event_name: hookEventName },
+      hookEnv(dir, extra),
+    );
+  }
+
+  test("appends one spool line per event: Stop plain, PreCompact forced, SessionEnd forced session_end", async () => {
     const dir = configuredHome();
     try {
-      const fakeTempad = join(dir, "tempad");
+      for (const event of ["Stop", "PreCompact", "SessionEnd"]) {
+        expect(await runStop(dir, event)).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      }
+
+      const lines = spooled(dir);
+      expect(lines.map(([, session, kind, forced]) => [session, kind, forced])).toEqual([
+        ["s1", "classify", "0"],
+        ["s1", "classify", "1"],
+        ["s1", "session_end", "1"],
+      ]);
+      for (const [time] of lines) expect(time).toMatch(ISO_TIME);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("never starts the CLI: it spools with TEMPAD_BIN set, and with no CLI at all, and logs nothing", async () => {
+    const dir = configuredHome();
+    try {
       const argvLog = join(dir, "argv.log");
-      writeFileSync(fakeTempad, `#!/bin/sh\necho "$@" >> "${argvLog}"\n`);
-      chmodSync(fakeTempad, 0o755);
-
-      const scriptPath = join(import.meta.dir, "../../hooks/w5-stop.sh");
-
-      const runHook = async (hookEventName: string) => {
-        const proc = Bun.spawn({
-          cmd: ["bash", scriptPath],
-          env: hookEnv(dir, { TEMPAD_BIN: fakeTempad }),
-          stdin: new Response(JSON.stringify({ session_id: "s1", hook_event_name: hookEventName })),
-          stdout: "ignore",
-          stderr: "ignore",
-        });
-        await proc.exited;
-      };
-
-      await runHook("Stop");
-      await runHook("PreCompact");
-
-      const argv = readFileSync(argvLog, "utf8").trim().split("\n");
-      expect(argv[0]).toBe("w5 enqueue --session s1 --kind classify");
-      expect(argv[1]).toBe("w5 enqueue --session s1 --forced --kind classify");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("the CLI it starts inherits none of tempad's secrets, but everything else", async () => {
-    const dir = configuredHome();
-    try {
       const fakeTempad = join(dir, "tempad");
-      const envDump = join(dir, "env.dump");
-      writeFileSync(fakeTempad, `#!/bin/sh\nenv > "${envDump}"\n`);
-      chmodSync(fakeTempad, 0o755);
-      const result = await runScript(
-        "w5-stop.sh",
-        { session_id: "s1", hook_event_name: "Stop" },
-        hookEnv(dir, {
-          TEMPAD_BIN: fakeTempad,
-          TEMPAD_SYNC_TOKEN: "sync-secret-jwt",
-          MONDAY_API_TOKEN: "monday-secret",
-          GH_TOKEN: "github-secret",
-          ANTHROPIC_API_KEY: "sk-ant-passes-through",
-        }),
-      );
-      expect(result.exitCode).toBe(0);
-      const seen = readFileSync(envDump, "utf8");
-      expect(seen).not.toContain("sync-secret-jwt");
-      expect(seen).not.toContain("monday-secret");
-      expect(seen).not.toContain("github-secret");
-      expect(seen).toContain("ANTHROPIC_API_KEY=sk-ant-passes-through");
-      expect(seen).toContain(`TEMPAD_HOME=${dir}`);
+      writeFakeCli(fakeTempad, argvLog);
+
+      await runStop(dir, "Stop", { TEMPAD_BIN: fakeTempad });
+      const result = await runStop(dir, "SessionEnd");
+
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(existsSync(argvLog)).toBe(false);
+      expect(spooled(dir)).toHaveLength(2);
+      expect(existsSync(join(dir, "logs", "w5.log"))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("forwards SessionEnd as --kind session_end and Stop as --kind classify", async () => {
+  test("a spool that cannot be written logs one line and still exits 0 silently", async () => {
     const dir = configuredHome();
     try {
-      const fakeTempad = join(dir, "tempad");
-      const argvLog = join(dir, "argv.log");
-      writeFileSync(fakeTempad, `#!/bin/sh\necho "$@" >> "${argvLog}"\n`);
-      chmodSync(fakeTempad, 0o755);
+      mkdirSync(spoolFile(dir));
 
-      const scriptPath = join(import.meta.dir, "../../hooks/w5-stop.sh");
+      const result = await runStop(dir, "Stop");
 
-      const spawnHookAndCaptureArgv = async (hookEventName: string) => {
-        const proc = Bun.spawn({
-          cmd: ["bash", scriptPath],
-          env: hookEnv(dir, { TEMPAD_BIN: fakeTempad }),
-          stdin: new Response(JSON.stringify({ session_id: "s1", hook_event_name: hookEventName })),
-          stdout: "ignore",
-          stderr: "ignore",
-        });
-        await proc.exited;
-      };
-
-      await spawnHookAndCaptureArgv("Stop");
-      await spawnHookAndCaptureArgv("SessionEnd");
-
-      const argv = readFileSync(argvLog, "utf8").trim().split("\n");
-      expect(argv[0]).toBe("w5 enqueue --session s1 --kind classify");
-      expect(argv[1]).toBe("w5 enqueue --session s1 --forced --kind session_end");
+      expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      expect(readFileSync(join(dir, "logs", "w5.log"), "utf8")).toContain("could not append");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("logs and exits 0 when nothing can resolve the CLI (no TEMPAD_BIN, no tempad, no bun)", async () => {
+  test("concurrent hooks never interleave a line", async () => {
     const dir = configuredHome();
     try {
-      const result = await runScript(
-        "w5-stop.sh",
-        { session_id: "s1", hook_event_name: "Stop" },
-        hookEnv(dir),
+      await Promise.all(
+        Array.from({ length: 24 }, (_, index) =>
+          runScript(
+            "w5-stop.sh",
+            { session_id: `s${index}`, hook_event_name: "Stop" },
+            hookEnv(dir),
+          ),
+        ),
       );
 
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toBe("");
-      const logContent = readFileSync(join(dir, "logs", "w5.log"), "utf8");
-      expect(logContent).toContain("no tempad CLI found");
+      const lines = spooled(dir);
+      expect(lines).toHaveLength(24);
+      expect(lines.map(([, session]) => session).sort()).toEqual(
+        Array.from({ length: 24 }, (_, index) => `s${index}`).sort(),
+      );
+      for (const line of lines) expect(line).toHaveLength(4);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -376,6 +364,7 @@ describe("w5-stop.sh / w5-prompt.sh injection safety", () => {
       expect(exitCode).toBe(0);
       expect(existsSync(canaryFile)).toBe(false);
       expect(existsSync(argvLog)).toBe(false);
+      expect(existsSync(spoolFile(dir))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -398,31 +387,6 @@ describe("w5-stop.sh / w5-prompt.sh injection safety", () => {
       await proc.exited;
 
       expect(existsSync(canaryFile)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test("multi-word TEMPAD_BIN (bun /path/cli.ts style) still works without eval", async () => {
-    const dir = configuredHome();
-    try {
-      const fakeTempad = join(dir, "fake-bun");
-      const argvLog = join(dir, "argv.log");
-      writeFileSync(fakeTempad, `#!/bin/sh\nshift\necho "$@" >> "${argvLog}"\n`);
-      chmodSync(fakeTempad, 0o755);
-
-      const scriptPath = join(import.meta.dir, "../../hooks/w5-stop.sh");
-      const proc = Bun.spawn({
-        cmd: ["bash", scriptPath],
-        env: hookEnv(dir, { TEMPAD_BIN: `${fakeTempad} /some/cli.ts` }),
-        stdin: new Response(JSON.stringify({ session_id: "s1", hook_event_name: "Stop" })),
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      await proc.exited;
-
-      const argv = readFileSync(argvLog, "utf8").trim();
-      expect(argv).toBe("w5 enqueue --session s1 --kind classify");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -567,7 +531,9 @@ describe("hook scripts: configuration and stand-down", () => {
 
       await runScript("w5-stop.sh", stopPayload, hookEnv(dir, { TEMPAD_BIN: fakeCli }));
 
-      expect(readFileSync(argvLog, "utf8").trim()).toBe("w5 enqueue --session s1 --kind classify");
+      expect(spooled(dir).map(([, session, kind]) => [session, kind])).toEqual([
+        ["s1", "classify"],
+      ]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -599,7 +565,7 @@ describe("hook scripts: configuration and stand-down", () => {
         );
 
         expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-        expect(existsSync(argvLog)).toBe(false);
+        expect(hookRan(script, dir, argvLog)).toBe(false);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -620,7 +586,7 @@ describe("hook scripts: configuration and stand-down", () => {
         );
 
         expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-        expect(existsSync(argvLog)).toBe(false);
+        expect(hookRan(script, dir, argvLog)).toBe(false);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -636,7 +602,7 @@ describe("hook scripts: configuration and stand-down", () => {
 
         await runScript(script, stopPayload, hookEnv(dir, { TEMPAD_BIN: fakeCli }));
 
-        expect(existsSync(argvLog)).toBe(true);
+        expect(hookRan(script, dir, argvLog)).toBe(true);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -655,22 +621,22 @@ describe("hook scripts: configuration and stand-down", () => {
       const env = hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" });
       const withoutConfigDir = await runScript("w5-stop.sh", stopPayload, env);
       expect(withoutConfigDir.exitCode).toBe(0);
-      expect(existsSync(argvLog)).toBe(true);
-      rmSync(argvLog);
+      expect(existsSync(spoolFile(dir))).toBe(true);
+      rmSync(spoolFile(dir));
 
       const result = await runScript("w5-stop.sh", stopPayload, {
         ...env,
         CLAUDE_CONFIG_DIR: configDirectory,
       });
       expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-      expect(existsSync(argvLog)).toBe(false);
+      expect(existsSync(spoolFile(dir))).toBe(false);
 
       // Legacy invocation is never affected by it.
       await runScript("w5-stop.sh", stopPayload, {
         ...hookEnv(dir, { TEMPAD_BIN: fakeCli }),
         CLAUDE_CONFIG_DIR: configDirectory,
       });
-      expect(existsSync(argvLog)).toBe(true);
+      expect(existsSync(spoolFile(dir))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -692,7 +658,7 @@ describe("hook scripts: configuration and stand-down", () => {
         CLAUDE_CONFIG_DIR: configDirectory,
       });
       expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-      expect(existsSync(argvLog)).toBe(true);
+      expect(existsSync(spoolFile(dir))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -711,7 +677,7 @@ describe("hook scripts: configuration and stand-down", () => {
         CLAUDE_CONFIG_DIR: "",
       });
       expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-      expect(existsSync(argvLog)).toBe(false);
+      expect(existsSync(spoolFile(dir))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -735,18 +701,19 @@ describe("hook scripts: configuration and stand-down", () => {
 
       const result = await runScript("w5-stop.sh", stopPayload, env);
       expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-      expect(readFileSync(argvLog, "utf8").trim()).toBe("w5 enqueue --session s1 --kind classify");
+      expect(readFileSync(join(fakeHome, ".tempad-work", "w5-spool"), "utf8")).toContain(
+        "\ts1\tclassify\t0\n",
+      );
 
       // A bare ~ is the home directory itself.
-      rmSync(argvLog);
       writeFileSync(join(fakeHome, ".env"), "");
       await runScript("w5-stop.sh", stopPayload, { ...env, TEMPAD_HOME: "~" });
-      expect(existsSync(argvLog)).toBe(true);
+      expect(existsSync(join(fakeHome, "w5-spool"))).toBe(true);
 
       // A literal directory named "~" in the working directory is not what ~/ means.
-      rmSync(argvLog);
       await runScript("w5-stop.sh", stopPayload, { ...env, TEMPAD_HOME: "~other" });
-      expect(existsSync(argvLog)).toBe(false);
+      expect(existsSync(join(fakeHome, "other", "w5-spool"))).toBe(false);
+      expect(existsSync(join(parent, "w5-spool"))).toBe(false);
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
@@ -771,7 +738,7 @@ describe("hook scripts: configuration and stand-down", () => {
         hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" }),
       );
 
-      expect(existsSync(argvLog)).toBe(true);
+      expect(existsSync(spoolFile(dir))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -793,7 +760,7 @@ describe("hook scripts: configuration and stand-down", () => {
         hookEnv(dir, { TEMPAD_BIN: fakeCli, TEMPAD_HOOK_SOURCE: "plugin" }),
       );
 
-      expect(existsSync(argvLog)).toBe(false);
+      expect(existsSync(spoolFile(dir))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -812,13 +779,13 @@ describe("hook scripts: CLI resolution", () => {
       writeFakeCli(join(binDirectory, "tempad"), argvLog);
 
       const result = await runScript(
-        "w5-stop.sh",
+        "w5-prompt.sh",
         stopPayload,
         hookEnv(dir, { PATH: `${binDirectory}:${SYSTEM_PATH}` }),
       );
 
       expect(result).toEqual({ exitCode: 0, stdout: "", stderr: "" });
-      expect(readFileSync(argvLog, "utf8").trim()).toBe("w5 enqueue --session s1 --kind classify");
+      expect(readFileSync(argvLog, "utf8").trim()).toBe("w5 context --session s1");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -833,13 +800,13 @@ describe("hook scripts: CLI resolution", () => {
       writeFakeCli(join(binDirectory, "bun"), argvLog);
 
       await runScript(
-        "w5-stop.sh",
+        "w5-prompt.sh",
         { session_id: "s1", hook_event_name: "SessionEnd" },
         hookEnv(dir, { PATH: `${binDirectory}:${SYSTEM_PATH}` }),
       );
 
       expect(readFileSync(argvLog, "utf8").trim()).toBe(
-        "x @hyperlab.sh/tempad w5 enqueue --session s1 --forced --kind session_end",
+        "x @hyperlab.sh/tempad w5 context --session s1",
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -861,14 +828,14 @@ describe("hook scripts: CLI resolution", () => {
       const pathEnv = { PATH: `${binDirectory}:${SYSTEM_PATH}` };
 
       await runScript(
-        "w5-stop.sh",
+        "w5-prompt.sh",
         stopPayload,
         hookEnv(dir, { ...pathEnv, TEMPAD_BIN: explicit }),
       );
       expect(existsSync(explicitLog)).toBe(true);
       expect(existsSync(pathLog)).toBe(false);
 
-      await runScript("w5-stop.sh", stopPayload, hookEnv(dir, pathEnv));
+      await runScript("w5-prompt.sh", stopPayload, hookEnv(dir, pathEnv));
       expect(existsSync(pathLog)).toBe(true);
       expect(existsSync(bunLog)).toBe(false);
     } finally {
@@ -889,7 +856,7 @@ describe("hook scripts: CLI resolution", () => {
     }
   });
 
-  test("CLI stderr goes to w5.log, never to the hook's stderr (both scripts)", async () => {
+  test("CLI stderr goes to w5.log, never to the hook's stderr (the stop script no longer calls the CLI)", async () => {
     const dir = configuredHome();
     try {
       const fakeCli = join(dir, "tempad");
@@ -912,7 +879,7 @@ describe("hook scripts: CLI resolution", () => {
       expect(prompt.stderr).toBe("");
       expect(
         readFileSync(join(dir, "logs", "w5.log"), "utf8").match(/boom from cli/g),
-      ).toHaveLength(2);
+      ).toHaveLength(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

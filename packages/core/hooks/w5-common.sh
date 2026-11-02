@@ -63,10 +63,26 @@ w5_legacy_hook_installed() {
   return 1
 }
 
+# Spool of enqueue requests written by w5-stop.sh and drained by `tempad w5 run`
+# (SPOOL_FILE in src/w5/spool.ts). The hook only appends, so it never starts bun.
+W5_SPOOL_FILE="$TEMPAD_HOME_DIR/w5-spool"
+
+# Append one enqueue request: `<iso time>\t<session id>\t<kind>\t<0|1 forced>`. The
+# session id was validated by w5_gate (no tab or newline), and one short line
+# written with O_APPEND is atomic, so concurrent hooks never interleave.
+w5_spool_enqueue() {
+  local kind="$1" forced="$2"
+  # The brace group's own 2>/dev/null comes first: a failed `>>` open is reported
+  # before a redirection written after it takes effect.
+  { printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$session_id" "$kind" "$forced" \
+      >> "$W5_SPOOL_FILE"; } 2>/dev/null || w5_log "w5-stop.sh: could not append to $W5_SPOOL_FILE"
+}
+
 # Common gate for both scripts. $1 = script name. Exits 0 for every case where
-# the hook should do nothing; otherwise sets the `_bin` array to the CLI argv.
+# the hook should do nothing. Sets the `_bin` array to the CLI argv unless $2 is
+# "no-cli" (w5-stop.sh only spools and needs no CLI).
 w5_gate() {
-  local script="$1"
+  local script="$1" cli="${2:-cli}"
 
   case "$session_id" in
     "" ) exit 0 ;;
@@ -92,6 +108,8 @@ w5_gate() {
   if [ "${TEMPAD_HOOK_SOURCE:-}" = "plugin" ] && w5_legacy_hook_installed; then
     exit 0
   fi
+
+  [ "$cli" = "no-cli" ] && return 0
 
   if [ -n "${TEMPAD_BIN:-}" ]; then
     # shellcheck disable=SC2206
