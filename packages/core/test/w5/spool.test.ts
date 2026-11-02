@@ -47,6 +47,62 @@ const options = (logged: string[] = []) => ({
 });
 
 describe("drainSpool", () => {
+  test("holds the write lock from the start, so a writer that commits mid-drain cannot snapshot-fail it", () => {
+    // `enqueueJob` reads before it writes. In a deferred transaction, a commit by another
+    // connection between that read and the first write makes SQLite answer the write with
+    // SQLITE_BUSY_SNAPSHOT, which `busy_timeout` cannot wait out: the real `w5 run` died
+    // at the drain on every pass once a second session's `w5 context` or the hourly sync
+    // wrote during it. The drain must take the write lock up front (IMMEDIATE) instead.
+    const home = makeHome();
+    try {
+      const path = join(home, "tempad.db");
+      const database = openDatabase(path);
+      ensureTables(database);
+      // Line 1 is throttled: `enqueueJob` reads `w5_runs` and writes nothing, so the
+      // transaction holds a read snapshot but no write lock yet.
+      database
+        .query("INSERT INTO w5_runs (session_id, last_run_at) VALUES ('throttled', ?)")
+        .run(T0);
+      // The other connection gives up at once instead of waiting out the lock.
+      const other = openDatabase(path, { busyTimeoutMs: 0 });
+      const writer = { outcome: null as "committed" | "locked-out" | null };
+      const log = (line: string) => {
+        if (!line.startsWith("spool: skipping malformed")) return;
+        // Line 2 (malformed) is logged after line 1's read and before line 3's write:
+        // this is the moment a concurrent writer commits.
+        try {
+          other
+            .query(
+              "INSERT INTO w5_jobs (session_id, kind, forced, requested_at, state) VALUES ('other', 'classify', 0, ?, 'queued')",
+            )
+            .run(T1);
+          writer.outcome = "committed";
+        } catch (error) {
+          if ((error as { code?: string }).code !== "SQLITE_BUSY") throw error;
+          writer.outcome = "locked-out";
+        }
+      };
+      writeSpool(home, [`${T0}\tthrottled\tclassify\t0`, "garbage", `${T1}\tfresh\tclassify\t0`]);
+
+      const result = drainSpool(database, home, { throttleMinutes: 60, log });
+
+      expect(writer.outcome).toBe("locked-out");
+      expect(result).toEqual({ enqueued: 1, merged: 1, malformed: 1 });
+      expect(
+        (
+          database.query("SELECT session_id FROM w5_jobs ORDER BY id").all() as {
+            session_id: string;
+          }[]
+        ).map((row) => row.session_id),
+      ).toEqual(["fresh"]);
+      expect(spoolPending(home)).toBe(false);
+      other.close();
+      database.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("turns each request into a job at the time the hook recorded and removes the spool", () => {
     const home = makeHome();
     try {

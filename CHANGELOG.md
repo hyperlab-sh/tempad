@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `tempad w5 run` no longer dies at the spool drain with `SQLITE_BUSY_SNAPSHOT` when another connection (a second session's `w5 context`, the hourly `tempad sync`) commits while it drains. `drainSpool` opened a deferred transaction and `enqueueJob` reads before it writes, so a commit between that read and the first write made every write fail, and `busy_timeout` cannot wait out a stale snapshot; since 0.4.0 shipped, no run got past the drain while another writer was active and the spool only grew. The replay now runs as an IMMEDIATE transaction, taking the write lock up front like every other w5 write path.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added
